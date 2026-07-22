@@ -6,14 +6,14 @@ import sys
 # ==========================
 RUN_TRACKER = True
 RUN_ANALYZER = True
-RUN_TRADER = True
+RUN_TRADER = False
 
 # ==========================
 # Show logs for each script
 # ==========================
-SHOW_TRACKER_LOGS = True
+SHOW_TRACKER_LOGS = False
 SHOW_ANALYZER_LOGS = True
-SHOW_TRADER_LOGS = True
+SHOW_TRADER_LOGS = False
 
 processes = []
 
