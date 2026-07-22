@@ -1,0 +1,2 @@
+SUPABASE_URL = "https://gcmoppkkplzztiayvbdk.supabase.co"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImdjbW9wcGtrcGx6enRpYXl2YmRrIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzE2MTg5MTMsImV4cCI6MjA4NzE5NDkxM30.ZSgnOL471BMBIeDMlOp-RhuXGLk51rqDNektdoYHmC4"

@@ -1,0 +1,365 @@
+import sys
+import time
+import logging
+import threading
+import traceback
+
+import analyzer as base
+
+MIN_ROI_PCT = 0.1
+CHECK_INTERVAL_SEC = 60
+POLL_INTERVAL_SEC = 60
+MAX_WITHDRAW_RETRIES = 3
+WITHDRAW_RETRY_DELAY = 5
+
+# Force line-buffered/unbuffered stdout so log lines show up immediately in
+# CI runners (GitHub Actions et al. buffer output when it's not a real TTY).
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except AttributeError:
+    pass
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[logging.FileHandler("trader_execution.log"), logging.StreamHandler(sys.stdout)],
+    force=True,
+)
+log = logging.getLogger()
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+def load_pending_trade():
+    sb = base._get_supabase_cached()
+    try:
+        rows = sb.table("trade_coins").select("*").eq("status", "pending").order("updated_at").limit(1).execute()
+        return rows.data[0] if rows.data else None
+    except Exception as e:
+        log.error(f"load_pending_trade failed: {str(e)[:200]}")
+        return None
+
+def update_trade_status(trade_id, status, error_msg=None):
+    sb = base._get_supabase_cached()
+    updates = {"status": status}
+    if error_msg:
+        updates["error_message"] = error_msg
+    try:
+        sb.table("trade_coins").update(updates).eq("id", trade_id).execute()
+    except Exception as e:
+        log.error(f"update_trade_status failed: {str(e)[:200]}")
+
+def delete_trade_coin(trade_id):
+    base.delete_trade_coin(trade_id)
+
+def update_bot_state(holder_exchange):
+    sb = base._get_supabase_cached()
+    try:
+        sb.table("bot_state").update({"holds_usdt": holder_exchange.lower()}).eq("id", 1).execute()
+        log.info(f"bot_state updated: holds_usdt = {holder_exchange.lower()}")
+    except Exception as e:
+        log.error(f"update_bot_state failed: {str(e)[:200]}")
+
+def get_balance(exchange_name, currency="USDT", wallet_type="spot"):
+    ex = base.ensure_exchange(exchange_name)
+    if ex is None:
+        raise RuntimeError(f"Cannot initialize {exchange_name}")
+    try:
+        bal = ex.fetch_balance(params={"type": wallet_type}) if wallet_type else ex.fetch_balance()
+    except Exception as e:
+        raise RuntimeError(f"fetch_balance failed for {exchange_name}: {str(e)[:200]}")
+    free = bal.get('free', {})
+    total = bal.get('total', {})
+    if currency in free:
+        return free[currency]
+    if currency in total:
+        return total[currency]
+    if currency == "USDT":
+        usdt = base._extract_usdt(bal)
+        if usdt and usdt[0] is not None:
+            return usdt[0]
+    return 0.0
+
+def withdraw_funds(exchange_name, currency, amount, address, network, params=None):
+    ex = base.ensure_exchange(exchange_name)
+    if ex is None:
+        raise RuntimeError(f"Cannot initialize {exchange_name}")
+    params = params or {}
+    if network:
+        params["network"] = network
+        if hasattr(ex, 'options'):
+            ex.options['defaultNetwork'] = network
+    try:
+        resp = ex.withdraw(currency, amount, address, params=params)
+        log.info(f"Withdrawal initiated: {amount} {currency} from {exchange_name} to {address} via {network}")
+        return resp
+    except Exception as e:
+        raise RuntimeError(f"Withdrawal failed on {exchange_name}: {str(e)[:300]}")
+
+def wait_for_deposit(exchange_name, currency, baseline_balance, wallet_type="spot",
+                     poll_interval=POLL_INTERVAL_SEC, timeout=None, min_increase=1e-9):
+    start = time.time()
+    while True:
+        try:
+            bal = get_balance(exchange_name, currency, wallet_type)
+        except Exception as e:
+            log.warning(f"Balance check failed for {exchange_name}: {e} – retrying in {poll_interval}s")
+            time.sleep(poll_interval)
+            continue
+        if bal >= baseline_balance + min_increase:
+            log.info(f"Deposit confirmed on {exchange_name}: {bal:.6f} {currency} available "
+                     f"(baseline was {baseline_balance:.6f})")
+            return bal
+        log.info(f"Waiting for deposit on {exchange_name}: current {bal:.6f}, baseline {baseline_balance:.6f}")
+        if timeout and (time.time() - start) > timeout:
+            raise TimeoutError(f"Deposit not confirmed after {timeout}s on {exchange_name}")
+        time.sleep(poll_interval)
+
+def market_buy(exchange_name, symbol, amount_usdt, price=None, params=None):
+    ex = base.ensure_exchange(exchange_name)
+    if ex is None:
+        raise RuntimeError(f"Cannot initialize {exchange_name}")
+    params = params or {}
+    ex_params = base.EXTRA_PARAMS.get(exchange_name, {})
+    params.update(ex_params)
+    try:
+        if ex.has.get('createMarketBuyOrderWithCost'):
+            order = ex.create_market_buy_order_with_cost(symbol, amount_usdt, params=params)
+            log.info(f"Market buy (cost-based) executed on {exchange_name}: spent {amount_usdt:.4f} USDT "
+                     f"on {symbol} – order {order.get('id')}")
+            return order
+
+        if not price or price <= 0:
+            raise RuntimeError(
+                f"{exchange_name} has no cost-based market buy support and no reference price was given"
+            )
+        base_amount = amount_usdt / price
+        try:
+            base_amount = float(ex.amount_to_precision(symbol, base_amount))
+        except Exception:
+            pass
+        order = ex.create_order(symbol, 'market', 'buy', base_amount, price=None, params=params)
+        log.info(f"Market buy executed on {exchange_name}: {base_amount:.8f} {symbol.split('/')[0]} "
+                 f"(~{amount_usdt:.4f} USDT @ {price}) – order {order.get('id')}")
+        return order
+    except Exception as e:
+        raise RuntimeError(f"Market buy failed on {exchange_name}: {str(e)[:300]}")
+
+def market_sell(exchange_name, symbol, amount_base, params=None):
+    ex = base.ensure_exchange(exchange_name)
+    if ex is None:
+        raise RuntimeError(f"Cannot initialize {exchange_name}")
+    params = params or {}
+    ex_params = base.EXTRA_PARAMS.get(exchange_name, {})
+    params.update(ex_params)
+    try:
+        order = ex.create_market_sell_order(symbol, amount_base, params=params)
+        log.info(f"Market sell executed on {exchange_name}: {amount_base} of {symbol} – order {order.get('id')}")
+        return order
+    except Exception as e:
+        raise RuntimeError(f"Market sell failed on {exchange_name}: {str(e)[:300]}")
+
+def get_withdrawal_fee(exchange_name, currency, network):
+    currencies = base.get_currencies(exchange_name)
+    cur = currencies.get(currency)
+    if not cur:
+        return 0.0
+    networks = cur.get('networks') or {}
+    for code, data in networks.items():
+        if base.normalize_network(code) == base.normalize_network(network):
+            fee = base._to_float(data.get('fee'))
+            if fee is not None:
+                return fee
+    return 0.0
+
+def execute_trade(trade):
+    trade_id = trade["id"]
+    pair = trade["pair"]
+    buy_ex = trade["buy_ex"]
+    sell_ex = trade["sell_ex"]
+    capital_holder = trade.get("usdt_holder") or base.load_bot_state().get("holds_usdt")
+    if not capital_holder:
+        raise ValueError("No USDT holder specified")
+    log.info(f"Starting execution for {pair}: {buy_ex} -> {sell_ex}, holder = {capital_holder}")
+
+    usdt_balance = get_balance(capital_holder, "USDT", "spot")
+    if usdt_balance <= 0:
+        raise RuntimeError(f"No USDT available on {capital_holder} (balance: {usdt_balance})")
+
+    usdt_dest_address = trade.get("usdt_d_address")
+    if not usdt_dest_address:
+        raise RuntimeError("USDT destination address missing")
+
+    usdt_transfer_fee_str = trade.get("usdt_transfer_fee")
+    usdt_network = None
+    if usdt_transfer_fee_str:
+        net, _ = base.parse_usdt_transfer_fee(usdt_transfer_fee_str)
+        usdt_network = net
+    if not usdt_network:
+        raise RuntimeError("USDT network not found in trade row")
+
+    usdt_baseline_on_buy_ex = get_balance(buy_ex, "USDT", "spot")
+
+    log.info(f"Initiating USDT withdrawal: {usdt_balance:.4f} USDT from {capital_holder} -> {buy_ex} via {usdt_network}")
+    for attempt in range(1, MAX_WITHDRAW_RETRIES + 1):
+        try:
+            withdraw_funds(capital_holder, "USDT", usdt_balance, usdt_dest_address, usdt_network)
+            break
+        except Exception as e:
+            log.warning(f"Withdrawal attempt {attempt} failed: {e}")
+            if attempt == MAX_WITHDRAW_RETRIES:
+                raise RuntimeError(f"All withdrawal attempts failed: {e}")
+            time.sleep(WITHDRAW_RETRY_DELAY * attempt)
+
+    log.info(f"Waiting for USDT deposit on {buy_ex} (baseline {usdt_baseline_on_buy_ex:.4f})")
+    deposited = wait_for_deposit(buy_ex, "USDT", usdt_baseline_on_buy_ex, wallet_type="spot")
+
+    capital = deposited
+    depth = base.check_live_depth(buy_ex, sell_ex, pair, capital)
+    if not depth["ok"]:
+        raise RuntimeError(f"Revalidation depth check failed: {depth.get('reason')}")
+
+    profit = base.recalc_profit(
+        trade, buy_ex, sell_ex, pair, capital,
+        depth["buy_price"], depth["sell_price"]
+    )
+    if profit is None or profit["net_pnl"] <= 0:
+        raise RuntimeError(f"Revalidation shows non-positive profit: {profit['net_pnl'] if profit else 'N/A'}")
+    if profit["roi_pct"] < MIN_ROI_PCT:
+        raise RuntimeError(f"Revalidation ROI {profit['roi_pct']:.2f}% below {MIN_ROI_PCT}%")
+
+    log.info(f"Executing market buy on {buy_ex} for {pair} with {capital:.4f} USDT")
+    buy_order = market_buy(buy_ex, pair, capital, depth["buy_price"])
+    base_currency = pair.split('/')[0]
+    filled_amount = buy_order.get('filled', 0) or (buy_order.get('amount', 0) if buy_order.get('amount') else 0)
+    if filled_amount <= 0:
+        filled_amount = capital / depth["buy_price"]
+    log.info(f"Bought {filled_amount:.6f} {base_currency}")
+
+    token_dest_address = trade.get("coin_d_address")
+    if not token_dest_address:
+        raise RuntimeError("Token destination address missing")
+    token_network = trade.get("coin_wd_network")
+    if not token_network:
+        raise RuntimeError("Token withdrawal network missing")
+
+    token_balance = get_balance(buy_ex, base_currency, "spot")
+    if token_balance <= 0:
+        raise RuntimeError(f"No {base_currency} balance on {buy_ex} after buy")
+
+    token_baseline_on_sell_ex = get_balance(sell_ex, base_currency, "spot")
+
+    log.info(f"Withdrawing {token_balance:.6f} {base_currency} from {buy_ex} to {sell_ex} via {token_network}")
+    for attempt in range(1, MAX_WITHDRAW_RETRIES + 1):
+        try:
+            withdraw_funds(buy_ex, base_currency, token_balance, token_dest_address, token_network)
+            break
+        except Exception as e:
+            log.warning(f"Token withdrawal attempt {attempt} failed: {e}")
+            if attempt == MAX_WITHDRAW_RETRIES:
+                raise RuntimeError(f"All token withdrawal attempts failed: {e}")
+            time.sleep(WITHDRAW_RETRY_DELAY * attempt)
+
+    log.info(f"Waiting for {base_currency} deposit on {sell_ex} (baseline {token_baseline_on_sell_ex:.6f})")
+    deposited_token = wait_for_deposit(sell_ex, base_currency, token_baseline_on_sell_ex, wallet_type="spot")
+
+    min_profit = base.MIN_STORE_PROFIT_USD
+    while True:
+        current_token_balance = get_balance(sell_ex, base_currency, "spot")
+        if current_token_balance <= 0:
+            log.warning("Token balance on sell_ex is zero, waiting for deposit...")
+            time.sleep(POLL_INTERVAL_SEC)
+            continue
+
+        depth = base.check_live_depth(buy_ex, sell_ex, pair, capital)
+        if not depth["ok"]:
+            log.warning(f"Depth check failed during monitoring: {depth.get('reason')}")
+            time.sleep(POLL_INTERVAL_SEC)
+            continue
+
+        sell_price = depth["sell_price"]
+        gross_usdt = current_token_balance * sell_price
+        sell_fee_rate = base.get_trading_fee_rate(sell_ex, pair)
+        sell_fee_usd = gross_usdt * sell_fee_rate
+        net_pnl = gross_usdt - sell_fee_usd - capital
+        roi = (net_pnl / capital) * 100 if capital else 0
+
+        log.info(f"Current sell eval: balance {current_token_balance:.6f}, sell price {sell_price:.8f}, "
+                 f"gross {gross_usdt:.4f}, net profit {net_pnl:.4f} USDT, ROI {roi:.2f}%")
+
+        if net_pnl >= min_profit:
+            log.info(f"Net profit {net_pnl:.4f} >= min {min_profit}, executing market sell on {sell_ex}")
+            market_sell(sell_ex, pair, current_token_balance)
+            break
+        time.sleep(POLL_INTERVAL_SEC)
+
+    update_bot_state(sell_ex)
+    update_trade_status(trade_id, "completed")
+    log.info(f"Trade {pair} completed successfully. USDT now on {sell_ex}")
+
+def execution_worker():
+    while True:
+        try:
+            trade = load_pending_trade()
+            if not trade:
+                time.sleep(CHECK_INTERVAL_SEC)
+                continue
+            update_trade_status(trade["id"], "executing")
+            try:
+                execute_trade(trade)
+            except Exception as e:
+                log.error(f"Trade execution failed for {trade.get('pair')}: {e}")
+                log.error(traceback.format_exc())
+                update_trade_status(trade["id"], "failed", error_msg=str(e)[:500])
+        except Exception as e:
+            log.error(f"Execution worker unexpected error: {e}")
+            time.sleep(CHECK_INTERVAL_SEC)
+
+def run_once():
+    rows = base.load_all_trade_coins()
+    total = len(rows)
+    log.info("-" * 40)
+    log.info("Trader evaluation loop")
+    log.info("-" * 40)
+    log.info(f"Loaded {total} trade opportunities.")
+    if total == 0:
+        log.info("Finished.")
+        return
+
+    for row in rows:
+        status = row.get("status")
+        if status in ("executing", "completed"):
+            continue
+        result = evaluate_trade(row)
+        print_trade_report(result)
+        if result['valid']:
+            if row.get("id"):
+                update_trade_status(row["id"], "pending")
+            else:
+                if result.get('profit'):
+                    log.warning("New trade not saved (implement save with status).")
+            log.info("Keeping opportunity (marked pending).")
+        else:
+            if row.get("id"):
+                delete_trade_coin(row["id"])
+            log.info("Deleted invalid opportunity.")
+        log.info("")
+
+def main():
+    base.set_exchange_mode('trader')
+    exec_thread = threading.Thread(target=execution_worker, daemon=True)
+    exec_thread.start()
+    while True:
+        try:
+            run_once()
+        except Exception as e:
+            log.error(f"run_once error: {str(e)[:300]}")
+        log.info("")
+        log.info(f"Next evaluation in {CHECK_INTERVAL_SEC}s...")
+        time.sleep(CHECK_INTERVAL_SEC)
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        log.info("trader.py stopped.")

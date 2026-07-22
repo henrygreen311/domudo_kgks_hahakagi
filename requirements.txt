@@ -1,0 +1,6 @@
+httpx[http2]
+supabase
+asyncio
+ccxt
+brotli
+requests
