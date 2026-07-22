@@ -517,6 +517,31 @@ def _to_float(val):
         return None
 
 
+def _extract_usdt(bal):
+    """
+    Fallback USDT balance extraction for exchanges whose ccxt balance
+    response doesn't expose 'USDT' directly under bal['free']/bal['total']
+    (e.g. a nested per-currency dict, or a differently-cased key).
+    Returns (amount, source) or (None, None) if nothing usable is found.
+    """
+    if not isinstance(bal, dict):
+        return None, None
+    for key in ('USDT', 'usdt'):
+        entry = bal.get(key)
+        if isinstance(entry, dict):
+            for sub in ('free', 'total'):
+                val = entry.get(sub)
+                if val is not None:
+                    return _to_float(val), f"{key}.{sub}"
+    for section in ('free', 'total'):
+        d = bal.get(section)
+        if isinstance(d, dict):
+            for k, v in d.items():
+                if isinstance(k, str) and k.upper() == 'USDT' and v is not None:
+                    return _to_float(v), f"{section}[{k}]"
+    return None, None
+
+
 # ---------------------------------------------------------------------------
 # Deposit / arrival time estimation
 # ---------------------------------------------------------------------------
@@ -1126,6 +1151,21 @@ def save_trade_coin(r, profit):
         log.warning(f"  WARNING  saving trade_coins ({pair}): {str(e)[:150]}")
 
 
+def parse_usdt_transfer_fee(value):
+    """
+    Inverse of the 'NETWORK/FEE' string save_trade_coin writes into
+    trade_coins.usdt_transfer_fee (e.g. 'TRX/1.0000'). Returns
+    (network, fee_usd) or (None, None) if it can't be parsed.
+    """
+    if not value:
+        return None, None
+    try:
+        network, fee_str = value.rsplit('/', 1)
+        return network.strip(), float(fee_str)
+    except (ValueError, TypeError):
+        return None, None
+
+
 def load_all_trade_coins():
     sb = _get_supabase_cached()
     try:
@@ -1192,6 +1232,25 @@ def _fetch_order_book_safe(exchange_name, venue, symbol):
         f"(failed all {DEPTH_FETCH_RETRIES} attempts): {err_summary}"
     )
     return None
+
+
+def get_sell_side_price(exchange_name, symbol, target_usd):
+    """
+    Realistic average sell price for `target_usd` worth of `symbol` on
+    `exchange_name`, walking the live bid side of the order book (reuses
+    the same primitives check_depth uses for its sell leg). Returns
+    (price, filled_ok) — filled_ok is False if the book couldn't fully
+    absorb target_usd at the walked levels.
+    """
+    venue = ensure_exchange(exchange_name)
+    if venue is None:
+        return None, False
+    ob = _fetch_order_book_safe(exchange_name, venue, symbol)
+    if ob is None:
+        return None, False
+    bids = _sort_book_side(ob.get('bids', []) or [], 'bids')
+    price, _, filled_ok = walk_book(bids, target_usd)
+    return price, filled_ok
 
 
 def check_depth(r):
@@ -1261,7 +1320,7 @@ def load_exchange_config() -> dict:
         return {}
     cfg = {}
     for row in rows.data or []:
-        name = row.get("exchange_name")
+        name = (row.get("exchange_name") or "").strip().lower()
         if not name:
             continue
         cfg[name] = {
@@ -1359,7 +1418,7 @@ def is_network_whitelisted(addresses_cfg, exchange_name, network_code):
 
 
 def validate_withdrawal_whitelist(sender_ex, destination_ex, network_norm, exchange_cfg, addresses):
-    sender_cfg = exchange_cfg.get(sender_ex) or {}
+    sender_cfg = exchange_cfg.get((sender_ex or "").strip().lower()) or {}
     if not sender_cfg.get('requires_withdrawal_whitelist'):
         return True, f"{sender_ex} does not require a withdrawal whitelist"
 
@@ -1461,8 +1520,8 @@ def plan_usdt_transfer(holder_ex, buy_ex, exchange_cfg):
     if holder_ex == buy_ex:
         return {'ok': True, 'network': None, 'fee_usdt': 0.0}
 
-    holder_cfg = exchange_cfg.get(holder_ex)
-    buy_cfg    = exchange_cfg.get(buy_ex)
+    holder_cfg = exchange_cfg.get((holder_ex or "").strip().lower())
+    buy_cfg    = exchange_cfg.get((buy_ex or "").strip().lower())
     if not holder_cfg:
         return {'ok': False, 'reason': f"{holder_ex} (holds USDT) has no exchange_config row"}
     if not buy_cfg:
@@ -2008,8 +2067,8 @@ def worker1_loop():
                 if not (symbol and buy_ex and sell_ex):
                     continue
 
-                buy_cfg = exchange_cfg.get(buy_ex, {})
-                sell_cfg = exchange_cfg.get(sell_ex, {})
+                buy_cfg = exchange_cfg.get((buy_ex or "").strip().lower(), {})
+                sell_cfg = exchange_cfg.get((sell_ex or "").strip().lower(), {})
                 if buy_cfg.get('is_disabled') or sell_cfg.get('is_disabled'):
                     disabled = buy_ex if buy_cfg.get('is_disabled') else sell_ex
                     log.info(f"[worker1] 🗑️  {symbol}: {disabled} is disabled in exchange_config — removing")
