@@ -1067,12 +1067,17 @@ def save_trade_coin(r, profit):
     usdt_holder  = profit.get('usdt_transfer_from')
     usdt_network = profit.get('usdt_transfer_network')
     usdt_fee     = profit.get('usdt_transfer_fee_usd')
+    # trade_coins.usdt_transfer_fee is NOT NULL in Supabase, so when no
+    # transfer is needed (capital already on buy_ex) we store '' rather than
+    # None — trader.py's parse_usdt_transfer_fee() and this file's own
+    # missing-field check both treat '' as "no value" identically to None,
+    # so behavior is unchanged; this just satisfies the DB constraint.
     usdt_transfer_fee = (
         f"{usdt_network}/{usdt_fee:.4f}"
-        if usdt_network and usdt_fee is not None else None
+        if usdt_network and usdt_fee is not None else ''
     )
 
-    usdt_d_address = profit.get('usdt_dest_address')
+    usdt_d_address = profit.get('usdt_dest_address') or ''
     coin_d_address = profit.get('coin_dest_address')
 
     buy_fee  = profit.get('buy_fee_usd')
