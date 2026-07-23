@@ -8,7 +8,7 @@ import requests
 from datetime import datetime
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlencode
 
 
 PROXY_BASE_SCAN = "https://arb-bot.infinityfree.io/proxy.php"
@@ -49,7 +49,7 @@ MIN_STORE_PROFIT_USD = 0.001
 DEFAULT_TAKER_FEE = 0.001
 
 
-MAX_TRANSFER_TIME_SEC = 15 * 60
+MAX_TRANSFER_TIME_SEC = 5 * 60
 
 
 NETWORK_BLOCK_TIME_SEC = {
@@ -216,9 +216,36 @@ def route_through_proxy(ex, mode):
         request_headers = dict(headers or {})
         request_headers.update(_PROXY_HEADERS)
         request_headers['X-Proxy-Target-Host'] = parsed.netloc
+
+        # --- LBank fix ---------------------------------------------------
+        # ccxt's LBank signer (lbank/lbank2) sends timestamp, signature_method,
+        # and echostr as plain HTTP headers rather than as query/body params
+        # (unlike every other exchange here, which authenticates via query
+        # string, body params, or dash-named headers). Many shared-hosting
+        # reverse proxies (InfinityFree's stack included) silently drop any
+        # inbound header whose *name* contains an underscore — this is
+        # standard Nginx/FastCGI behavior (`underscores_in_headers off`).
+        # "signature_method" has an underscore, so it — and often its
+        # neighbors — never reach trade_proxy.php, and LBank correctly
+        # rejects the request with error_code 10202. Query strings aren't
+        # subject to that stripping, so we duplicate the three values there
+        # as a belt-and-braces fix, on top of leaving them in the headers.
+        extra_qs = {}
+        if exchange_key in ('lbank', 'lbank2') and headers:
+            for key in ('timestamp', 'signature_method', 'echostr'):
+                val = headers.get(key)
+                if val is not None:
+                    extra_qs[key] = val
+        # -------------------------------------------------------------------
+
         new_url = f"{proxy_base}/{exchange_key}{parsed.path}"
+        query_parts = []
         if parsed.query:
-            new_url += f"?{parsed.query}"
+            query_parts.append(parsed.query)
+        if extra_qs:
+            query_parts.append(urlencode(extra_qs))
+        if query_parts:
+            new_url += "?" + "&".join(query_parts)
 
         def do_request():
             resp = _proxy_session.request(
