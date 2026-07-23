@@ -10,38 +10,35 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
 
-# ---------------------------------------------------------------------------
-# Proxy configuration – two separate endpoints
-# ---------------------------------------------------------------------------
 
-PROXY_BASE_SCAN = "https://arb-bot.infinityfree.io/proxy.php"      # for scanner (tracker.py style)
-PROXY_BASE_TRADE = "https://trade.infinityfree.io/trade_proxy.php" # for trader (restricted keys, full proxy)
+PROXY_BASE_SCAN = "https://arb-bot.infinityfree.io/proxy.php"
+PROXY_BASE_TRADE = "https://trade.infinityfree.io/trade_proxy.php"
 
-# Which exchanges are proxied for each mode
-PROXY_EXCHANGES_SCAN = {'Bybit', 'KuCoin'}          # only these two via arb-bot
-PROXY_EXCHANGES_TRADE = {                           # all exchanges via trade proxy
+
+PROXY_EXCHANGES_SCAN = {'Bybit', 'KuCoin'}
+PROXY_EXCHANGES_TRADE = {
     'Bybit', 'Bitget', 'MEXC', 'BingX', 'KuCoin',
     'CoinEx', 'BitMart', 'OKX', 'LBank',
 }
 PROXY_EXCHANGE_IDS_SCAN = {name.lower() for name in PROXY_EXCHANGES_SCAN}
 PROXY_EXCHANGE_IDS_TRADE = {name.lower() for name in PROXY_EXCHANGES_TRADE}
 
-# Headers for both proxies (InfinityFree bot‑check)
+
 _PROXY_HEADERS = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://arb-bot.infinityfree.io/",   # common referer (works for both)
+    "Referer": "https://arb-bot.infinityfree.io/",
     "Upgrade-Insecure-Requests": "1",
     "Cache-Control": "max-age=0",
 }
 
-# Shared session for proxied requests
+
 _proxy_session = requests.Session()
 
-# Timeouts
-TIMEOUT_MS = 10_000           # direct / non‑proxied
-PROXY_TIMEOUT_MS = 20_000     # proxied (may be slower)
+
+TIMEOUT_MS = 10_000
+PROXY_TIMEOUT_MS = 20_000
 
 RETRY_ATTEMPTS = 1
 RETRY_DELAY = 1
@@ -51,24 +48,16 @@ DEPTH_CHECK_USD = 1000
 MIN_STORE_PROFIT_USD = 0.001
 DEFAULT_TAKER_FEE = 0.001
 
-# ---------------------------------------------------------------------------
-# Deposit / arrival time limits
-# ---------------------------------------------------------------------------
-# If the coin transfer (buy_ex withdrawal -> sell_ex deposit) is estimated to
-# take longer than this, the pair is dropped: a slow transfer gives the price
-# time to move against us before the tokens actually land on the sell side.
-MAX_TRANSFER_TIME_SEC = 5 * 60  # 5 minutes
 
-# Rough average block times (seconds), used ONLY as a fallback to convert a
-# raw confirmation count (e.g. Bybit's "confirmation": "50") into an estimated
-# duration when the exchange doesn't give us an explicit time. These are
-# approximations — tune them if a particular network is consistently off.
+MAX_TRANSFER_TIME_SEC = 5 * 60
+
+
 NETWORK_BLOCK_TIME_SEC = {
     'ETH': 12, 'BSC': 3, 'TRX': 3, 'MATIC': 2, 'ARB': 0.3, 'OP': 2,
     'SOL': 0.4, 'AVAX': 2, 'BTC': 600, 'BASE': 2, 'TON': 5, 'APT': 0.25,
     'SUI': 3, 'XRP': 4, 'DOGE': 60, 'LTC': 150, 'ZKSYNC': 1, 'BTC-LN': 1,
 }
-DEFAULT_BLOCK_TIME_SEC = 15  # used when the network isn't in the table above
+DEFAULT_BLOCK_TIME_SEC = 15
 
 ORDER_BOOK_LIMIT = 50
 ORDER_BOOK_LIMIT_OVERRIDES = {'KuCoin': 100}
@@ -83,16 +72,10 @@ WORKER1_INTERVAL_SEC = 5 * 60
 FAIL_STREAK_LIMIT     = 3
 ROW_PROCESS_MAX_WORKERS = 20
 
-try:
-    import sys as _sys
-    _sys.stdout.reconfigure(line_buffering=True)
-except AttributeError:
-    pass
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(message)s",
-    handlers=[logging.FileHandler("trader.log"), logging.StreamHandler(_sys.stdout)],
+    handlers=[logging.FileHandler("trader.log"), logging.StreamHandler()]
 )
 log = logging.getLogger()
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -110,10 +93,6 @@ def with_retries(fn, label):
                 time.sleep(RETRY_DELAY)
     raise last_err
 
-
-# ---------------------------------------------------------------------------
-# Supabase credentials – load both general and restricted
-# ---------------------------------------------------------------------------
 
 def _load_db_config() -> dict:
     import os
@@ -200,10 +179,6 @@ CREDENTIALS_SCAN = load_credentials('scanner')
 CREDENTIALS_TRADE = load_credentials('trader')
 
 
-# ---------------------------------------------------------------------------
-# Thread‑local exchange mode – determines which pool to use
-# ---------------------------------------------------------------------------
-
 _exchange_mode = threading.local()
 
 def set_exchange_mode(mode):
@@ -211,12 +186,8 @@ def set_exchange_mode(mode):
     _exchange_mode.mode = mode
 
 def get_exchange_mode():
-    return getattr(_exchange_mode, 'mode', 'scanner')  # default to scanner
+    return getattr(_exchange_mode, 'mode', 'scanner')
 
-
-# ---------------------------------------------------------------------------
-# Exchange factory – builds the correct ccxt instance based on mode
-# ---------------------------------------------------------------------------
 
 def route_through_proxy(ex, mode):
     """
@@ -265,7 +236,7 @@ def route_through_proxy(ex, mode):
             except ValueError:
                 return resp.text
 
-        # One retry as in tracker.py
+
         try:
             return do_request()
         except Exception:
@@ -287,9 +258,9 @@ def build_exchange(name, mode):
         proxied = name_lower in PROXY_EXCHANGE_IDS_SCAN
         creds = CREDENTIALS_SCAN.get(name_lower, {})
         timeout = PROXY_TIMEOUT_MS if proxied else TIMEOUT_MS
-        # For KuCoin, we need to call set_markets after construction if proxied
+
     else:
-        proxied = name_lower in PROXY_EXCHANGE_IDS_TRADE  # always true for all exchanges in our list
+        proxied = name_lower in PROXY_EXCHANGE_IDS_TRADE
         creds = CREDENTIALS_TRADE.get(name_lower, {})
         timeout = PROXY_TIMEOUT_MS if proxied else TIMEOUT_MS
 
@@ -307,7 +278,7 @@ def build_exchange(name, mode):
     if creds.get('uid'):
         cfg['uid'] = creds['uid']
 
-    # Instantiate the exchange class
+
     exchange_class = getattr(ccxt, name_lower, None)
     if exchange_class is None:
         raise ValueError(f"Unsupported exchange: {name}")
@@ -315,11 +286,11 @@ def build_exchange(name, mode):
 
     if proxied:
         ex = route_through_proxy(ex, mode)
-        # KuCoin needs explicit markets load after proxy
+
         if name_lower == 'kucoin':
             ex.set_markets(ex.fetch_markets())
 
-    # For non‑proxied exchanges, load markets now
+
     if not proxied:
         try:
             ex.load_markets()
@@ -330,10 +301,6 @@ def build_exchange(name, mode):
 
     return ex
 
-
-# ---------------------------------------------------------------------------
-# Exchange cache per mode
-# ---------------------------------------------------------------------------
 
 EXCHANGES_CACHE = {'scanner': {}, 'trader': {}}
 
@@ -352,10 +319,6 @@ def ensure_exchange(name):
     cache[name] = ex
     return ex
 
-
-# ---------------------------------------------------------------------------
-# Currency / network helpers (unchanged – they call ensure_exchange)
-# ---------------------------------------------------------------------------
 
 def _clean_networks_dict(networks):
     if not isinstance(networks, dict):
@@ -517,39 +480,6 @@ def _to_float(val):
         return None
 
 
-def _extract_usdt(bal):
-    """
-    Fallback USDT balance extraction for exchanges whose ccxt balance
-    response doesn't expose 'USDT' directly under bal['free']/bal['total']
-    (e.g. a nested per-currency dict, or a differently-cased key).
-    Returns (amount, source) or (None, None) if nothing usable is found.
-    """
-    if not isinstance(bal, dict):
-        return None, None
-    for key in ('USDT', 'usdt'):
-        entry = bal.get(key)
-        if isinstance(entry, dict):
-            for sub in ('free', 'total'):
-                val = entry.get(sub)
-                if val is not None:
-                    return _to_float(val), f"{key}.{sub}"
-    for section in ('free', 'total'):
-        d = bal.get(section)
-        if isinstance(d, dict):
-            for k, v in d.items():
-                if isinstance(k, str) and k.upper() == 'USDT' and v is not None:
-                    return _to_float(v), f"{section}[{k}]"
-    return None, None
-
-
-# ---------------------------------------------------------------------------
-# Deposit / arrival time estimation
-# ---------------------------------------------------------------------------
-# Exchanges report this very differently — some give an explicit human string
-# ("1min 2s", "4 mins"), some a plain number of confirmations (Bybit-style,
-# e.g. "confirmation": "50" or "500"). We try the explicit-time keys first,
-# and fall back to confirmations x approximate block time.
-
 _TIME_TEXT_RE = re.compile(
     r'(?:(?P<hours>\d+(?:\.\d+)?)\s*h(?:ou)?rs?)?\s*'
     r'(?:(?P<mins>\d+(?:\.\d+)?)\s*m(?:in)?s?)?\s*'
@@ -576,9 +506,8 @@ def _parse_time_text_to_seconds(value):
     if value is None:
         return None
     if isinstance(value, (int, float)):
-        # A bare number under one of the "time" keys is ambiguous across
-        # exchanges; treated as minutes, which matches what we've seen most
-        # commonly (e.g. Binance-style estimatedArrivalTime).
+
+
         return float(value) * 60 if value > 0 else None
     text = str(value).strip()
     if not text:
@@ -611,7 +540,7 @@ def _extract_time_estimate(network_data, network_norm):
     info = network_data.get('info')
     info = info if isinstance(info, dict) else {}
 
-    # 1) explicit time text/number (e.g. "1min 2s", "4 mins")
+
     for source in (network_data, info):
         if not isinstance(source, dict):
             continue
@@ -621,7 +550,7 @@ def _extract_time_estimate(network_data, network_norm):
             if seconds is not None:
                 return seconds, f"{key}={val!r}"
 
-    # 2) confirmation count -> approximate using per-network block time
+
     for source in (network_data, info):
         if not isinstance(source, dict):
             continue
@@ -722,10 +651,6 @@ def other_deposit_blocks(base, norm_key, exclude, all_prices):
             blocked_others.append((ex, code))
     return blocked_others
 
-
-# ---------------------------------------------------------------------------
-# Metadata check – identical to tracker.py
-# ---------------------------------------------------------------------------
 
 def check_metadata(r):
     """Confirms name/network/contract match for the given pair."""
@@ -899,7 +824,7 @@ def check_metadata(r):
         r['contract_sell']  = contract_matches[0][4]
         r['contract_match'] = True
 
-    r['alt_route'] = None  # not used in trader.py
+    r['alt_route'] = None
 
     if common:
         norm_key, buy_code, buy_data, sell_code, sell_data = min(
@@ -914,10 +839,7 @@ def check_metadata(r):
         r['withdrawal_fee']        = _to_float(buy_data.get('fee'))
         r['withdrawal_min_tokens'] = _to_float(((buy_data.get('limits') or {}).get('withdraw') or {}).get('min'))
 
-        # Estimated arrival time for the coin transfer: withdrawal side
-        # (buy_ex processing/confirmations) + deposit side (sell_ex
-        # confirmations before crediting). Either half may be missing
-        # depending on what the exchange reports.
+
         withdraw_secs, withdraw_desc = _extract_time_estimate(buy_data, r['withdrawal_network_norm'])
         deposit_secs,  deposit_desc  = _extract_time_estimate(sell_data, r['withdrawal_network_norm'])
         r['transfer_withdraw_seconds'] = withdraw_secs
@@ -1000,26 +922,23 @@ def calc_arb_profit(capital_usd, buy_price, sell_price, fee_tokens=None,
     tokens_bought = capital_usd / buy_price
     buy_fee_usd   = capital_usd * buy_taker_rate
 
+    gas_tokens       = fee_tokens if fee_tokens is not None else 0.0
+    tokens_remaining = tokens_bought - gas_tokens
+
     min_withdrawal_met = (
-        tokens_bought >= min_withdrawal_tokens
+        tokens_remaining >= min_withdrawal_tokens
         if min_withdrawal_tokens is not None and min_withdrawal_tokens > 0
         else True
     )
 
-    # Only the on-chain gas/withdrawal fee (in tokens) reduces the token amount.
-    gas_tokens       = fee_tokens if fee_tokens is not None else 0.0
-    tokens_remaining = tokens_bought - gas_tokens
 
-    # Total received is the gross USDT from selling the remaining tokens —
-    # trading fees are NOT netted out of this figure anymore.
     gross_sell_usd = tokens_remaining * sell_price if tokens_remaining > 0 else 0.0
     sell_fee_usd   = gross_sell_usd * sell_taker_rate
     total_received = gross_sell_usd
 
     total_cost = capital_usd
-    # Buy trading fee, sell trading fee (and, if applicable, the USDT transfer
-    # fee added later in _verify_full) are deducted from Net P&L directly,
-    # not from the token amounts or Total received.
+
+
     net_pnl    = total_received - total_cost - buy_fee_usd - sell_fee_usd
     roi_pct    = (net_pnl / capital_usd) * 100 if capital_usd else 0.0
 
@@ -1066,16 +985,6 @@ def log_profit_block(profit):
     log.info(f"       PROFIT Net P&L {profit['net_pnl']:+.4f} USDT")
     log.info(f"       PROFIT ROI {profit['roi_pct']:+.2f}%")
 
-
-# ---------------------------------------------------------------------------
-# Order book depth check (same as tracker.py)
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# trade_coins table — filtered, ready-to-trade snapshot
-# ---------------------------------------------------------------------------
-# Only the fields below are stored. If ANY of them can't be resolved for a
-# given pair, the pair is skipped entirely — nothing partial gets saved.
 
 TRADE_COINS_REQUIRED_FIELDS = (
     'pair', 'exchange', 'coin_wd_network', 'arrival_time', 'usdt_holder',
@@ -1151,40 +1060,6 @@ def save_trade_coin(r, profit):
         log.warning(f"  WARNING  saving trade_coins ({pair}): {str(e)[:150]}")
 
 
-def parse_usdt_transfer_fee(value):
-    """
-    Inverse of the 'NETWORK/FEE' string save_trade_coin writes into
-    trade_coins.usdt_transfer_fee (e.g. 'TRX/1.0000'). Returns
-    (network, fee_usd) or (None, None) if it can't be parsed.
-    """
-    if not value:
-        return None, None
-    try:
-        network, fee_str = value.rsplit('/', 1)
-        return network.strip(), float(fee_str)
-    except (ValueError, TypeError):
-        return None, None
-
-
-def load_all_trade_coins():
-    sb = _get_supabase_cached()
-    try:
-        rows = sb.table("trade_coins").select("*").execute()
-        return rows.data or []
-    except Exception as e:
-        log.warning(f"  WARNING  trade_coins fetch: {str(e)[:200]}")
-        return []
-
-
-def delete_trade_coin(row_id):
-    sb = _get_supabase_cached()
-    try:
-        sb.table("trade_coins").delete().eq("id", row_id).execute()
-        log.info(f"       DELETE ✅ trade_coins row {row_id} removed")
-    except Exception as e:
-        log.warning(f"  WARNING  trade_coins delete for {row_id}: {str(e)[:200]}")
-
-
 def _sort_book_side(levels, side):
     if not levels:
         return []
@@ -1234,25 +1109,6 @@ def _fetch_order_book_safe(exchange_name, venue, symbol):
     return None
 
 
-def get_sell_side_price(exchange_name, symbol, target_usd):
-    """
-    Realistic average sell price for `target_usd` worth of `symbol` on
-    `exchange_name`, walking the live bid side of the order book (reuses
-    the same primitives check_depth uses for its sell leg). Returns
-    (price, filled_ok) — filled_ok is False if the book couldn't fully
-    absorb target_usd at the walked levels.
-    """
-    venue = ensure_exchange(exchange_name)
-    if venue is None:
-        return None, False
-    ob = _fetch_order_book_safe(exchange_name, venue, symbol)
-    if ob is None:
-        return None, False
-    bids = _sort_book_side(ob.get('bids', []) or [], 'bids')
-    price, _, filled_ok = walk_book(bids, target_usd)
-    return price, filled_ok
-
-
 def check_depth(r):
     buy_ex, sell_ex, symbol = r['buy_ex'], r['sell_ex'], r['symbol']
     buy_venue  = ensure_exchange(buy_ex)
@@ -1284,10 +1140,6 @@ def check_depth(r):
     return r
 
 
-# ---------------------------------------------------------------------------
-# arb_coins table access (unchanged)
-# ---------------------------------------------------------------------------
-
 def fetch_arb_coins_rows():
     try:
         sb = _get_supabase_cached()
@@ -1306,10 +1158,6 @@ def delete_arb_coin(symbol):
     except Exception as e:
         log.warning(f"  WARNING  arb_coins delete for {symbol}: {str(e)[:200]}")
 
-
-# ---------------------------------------------------------------------------
-# exchange_config / bot_state / addresses (used by Worker2)
-# ---------------------------------------------------------------------------
 
 def load_exchange_config() -> dict:
     try:
@@ -1418,7 +1266,7 @@ def is_network_whitelisted(addresses_cfg, exchange_name, network_code):
 
 
 def validate_withdrawal_whitelist(sender_ex, destination_ex, network_norm, exchange_cfg, addresses):
-    sender_cfg = exchange_cfg.get((sender_ex or "").strip().lower()) or {}
+    sender_cfg = exchange_cfg.get(sender_ex.lower()) or {}
     if not sender_cfg.get('requires_withdrawal_whitelist'):
         return True, f"{sender_ex} does not require a withdrawal whitelist"
 
@@ -1520,27 +1368,27 @@ def plan_usdt_transfer(holder_ex, buy_ex, exchange_cfg):
     if holder_ex == buy_ex:
         return {'ok': True, 'network': None, 'fee_usdt': 0.0}
 
-    holder_cfg = exchange_cfg.get((holder_ex or "").strip().lower())
-    buy_cfg    = exchange_cfg.get((buy_ex or "").strip().lower())
+    holder_cfg = exchange_cfg.get(holder_ex.lower())
+    buy_cfg    = exchange_cfg.get(buy_ex.lower())
     if not holder_cfg:
         return {'ok': False, 'reason': f"{holder_ex} (holds USDT) has no exchange_config row"}
     if not buy_cfg:
         return {'ok': False, 'reason': f"{buy_ex} (buy side) has no exchange_config row"}
 
-    # --- Step 1: configured withdrawal networks for the source (holder) exchange ---
+
     configured_source_networks = {normalize_network(n) for n in holder_cfg['usdt_withdrawal_networks']}
     configured_source_networks.discard(None)
     if not configured_source_networks:
         return {'ok': False, 'reason': f"{holder_ex} has no usdt_withdrawal_networks configured"}
 
-    # --- Step 2: actual USDT withdrawal networks from the source exchange API ---
+
     source_networks_raw = get_usdt_network_data(holder_ex)
     if not source_networks_raw:
         return {'ok': False, 'reason': f"{holder_ex}: could not retrieve USDT network data from the exchange API"}
     source_withdraw_by_norm = _networks_by_norm(source_networks_raw, 'withdraw')
     live_source_networks = set(source_withdraw_by_norm.keys())
 
-    # --- Step 3: intersect configured networks with what the API confirms is live ---
+
     valid_source_networks = configured_source_networks & live_source_networks
     if not valid_source_networks:
         return {
@@ -1553,14 +1401,14 @@ def plan_usdt_transfer(holder_ex, buy_ex, exchange_cfg):
             ),
         }
 
-    # --- Step 4: actual USDT deposit networks from the destination exchange API ---
+
     dest_networks_raw = get_usdt_network_data(buy_ex)
     if not dest_networks_raw:
         return {'ok': False, 'reason': f"{buy_ex}: could not retrieve USDT network data from the exchange API"}
     dest_deposit_by_norm = _networks_by_norm(dest_networks_raw, 'deposit')
     live_dest_networks = set(dest_deposit_by_norm.keys())
 
-    # --- Step 5: intersection -> valid for withdrawal on source AND deposit on destination ---
+
     common = valid_source_networks & live_dest_networks
     if not common:
         return {
@@ -1572,7 +1420,7 @@ def plan_usdt_transfer(holder_ex, buy_ex, exchange_cfg):
             ),
         }
 
-    # --- Step 6: gather withdrawal fee for every matching network on the source exchange ---
+
     candidates = []
     for norm_key in common:
         for code, data in source_withdraw_by_norm.get(norm_key, []):
@@ -1604,14 +1452,10 @@ def plan_usdt_transfer(holder_ex, buy_ex, exchange_cfg):
             ),
         }
 
-    # --- Step 7: select the lowest-fee network among those within the cap ---
+
     _, network_code, fee = min(within_cap, key=lambda c: c[2])
     return {'ok': True, 'network': network_code, 'fee_usdt': fee}
 
-
-# ---------------------------------------------------------------------------
-# Ticker fetching – uses current thread's mode
-# ---------------------------------------------------------------------------
 
 EXTRA_PARAMS = {'Bybit': {'category': 'spot'}}
 
@@ -1659,10 +1503,6 @@ def fetch_tickers_grouped(needed):
                 log.warning(f"  WARNING  batched ticker fetch for {exchange_name}: {str(e)[:200]}")
     return results
 
-
-# ---------------------------------------------------------------------------
-# Seed result structure (shared)
-# ---------------------------------------------------------------------------
 
 def _seed_result(symbol, buy_ex, buy_data, sell_ex, sell_data):
     buy_price, sell_price = buy_data['ask'], sell_data['bid']
@@ -1721,10 +1561,6 @@ def _seed_result(symbol, buy_ex, buy_data, sell_ex, sell_data):
         'corrected_sell_depth_price': None,
     }
 
-
-# ---------------------------------------------------------------------------
-# Lightweight verification for Worker1 (depth + metadata + profit)
-# ---------------------------------------------------------------------------
 
 def _check_transfer_time(r):
     """
@@ -1786,10 +1622,6 @@ def verify_pair_light(symbol, buy_ex_name, sell_ex_name, buy_data, sell_data):
         return {'ok': False, 'reason': f"unexpected error: {str(e)[:150]}", 'r': None, 'profit': None}
 
 
-# ---------------------------------------------------------------------------
-# Full verification for Worker2 (includes whitelist, USDT, addresses)
-# ---------------------------------------------------------------------------
-
 def _verify_full(symbol, buy_ex_name, sell_ex_name, buy_data, sell_data,
                  exchange_cfg, addresses, holder_ex):
     try:
@@ -1809,21 +1641,21 @@ def _verify_full(symbol, buy_ex_name, sell_ex_name, buy_data, sell_data,
         if slow:
             return slow
 
-        # ----- USDT transfer planning -----
+
         if not holder_ex:
             return {'ok': False, 'reason': 'bot_state.holds_usdt is not set — cannot validate the USDT transfer', 'r': r, 'profit': None}
         usdt_plan = plan_usdt_transfer(holder_ex, buy_ex_name, exchange_cfg)
         if not usdt_plan['ok']:
-            # If no viable USDT network, delete the pair immediately
+
             return {
                 'ok': False,
                 'reason': usdt_plan['reason'],
                 'r': r,
                 'profit': None,
-                'delete': True,   # <-- FIX: delete the pair from arb_coins
+                'delete': True,
             }
 
-        # ----- Whitelist validation for USDT leg -----
+
         if usdt_plan['network'] is not None:
             ok1, reason1 = validate_withdrawal_whitelist(
                 holder_ex, buy_ex_name, normalize_network(usdt_plan['network']), exchange_cfg, addresses
@@ -1835,7 +1667,7 @@ def _verify_full(symbol, buy_ex_name, sell_ex_name, buy_data, sell_data,
                     'r': r, 'profit': None, 'delete': True,
                 }
 
-        # ----- Whitelist validation for coin transfer leg -----
+
         network_norm = r.get('withdrawal_network_norm')
         if network_norm:
             ok2, reason2 = validate_withdrawal_whitelist(buy_ex_name, sell_ex_name, network_norm, exchange_cfg, addresses)
@@ -1846,7 +1678,7 @@ def _verify_full(symbol, buy_ex_name, sell_ex_name, buy_data, sell_data,
                     'r': r, 'profit': None, 'delete': True,
                 }
 
-        # ----- Compute profit -----
+
         buy_fee_rate  = get_trading_fee_rate(buy_ex_name,  symbol)
         sell_fee_rate = get_trading_fee_rate(sell_ex_name, symbol)
         profit = calc_arb_profit(
@@ -1859,7 +1691,7 @@ def _verify_full(symbol, buy_ex_name, sell_ex_name, buy_data, sell_data,
         if not profit:
             return {'ok': False, 'reason': 'profit calc failed (bad price data)', 'r': r, 'profit': None}
 
-        # Apply USDT transfer fee if any
+
         if usdt_plan and usdt_plan['network'] is not None:
             profit['usdt_transfer_fee_usd'] = usdt_plan['fee_usdt']
             profit['usdt_transfer_network'] = usdt_plan['network']
@@ -1873,7 +1705,7 @@ def _verify_full(symbol, buy_ex_name, sell_ex_name, buy_data, sell_data,
             profit['usdt_transfer_from']    = holder_ex
             profit['usdt_transfer_to']      = buy_ex_name
 
-        # Retrieve deposit addresses for logging (if available)
+
         if usdt_plan['network']:
             buy_addresses = addresses.get(buy_ex_name)
             if buy_addresses:
@@ -1887,10 +1719,7 @@ def _verify_full(symbol, buy_ex_name, sell_ex_name, buy_data, sell_data,
                 if col:
                     profit['coin_dest_address'] = sell_addresses.get(col)
 
-        # ----- Require both destination addresses when a transfer leg is needed -----
-        # If a USDT transfer is required but we couldn't resolve where it lands,
-        # or the coin transfer destination address is missing, the pair can't be
-        # safely traded — drop it from arb_coins.
+
         if usdt_plan['network'] is not None and not profit.get('usdt_dest_address'):
             return {
                 'ok': False,
@@ -1921,7 +1750,7 @@ def _verify_full(symbol, buy_ex_name, sell_ex_name, buy_data, sell_data,
 
 def reverify_pair(symbol, buy_ex_name, sell_ex_name):
     """Worker2: one‑off full verification using the trader pool."""
-    # Temporarily switch to trader mode for this call
+
     old_mode = get_exchange_mode()
     set_exchange_mode('trader')
     try:
@@ -1933,12 +1762,8 @@ def reverify_pair(symbol, buy_ex_name, sell_ex_name):
         return _verify_full(symbol, buy_ex_name, sell_ex_name, buy_data, sell_data,
                             exchange_cfg, addresses, holder_ex)
     finally:
-        set_exchange_mode(old_mode)   # restore
+        set_exchange_mode(old_mode)
 
-
-# ---------------------------------------------------------------------------
-# Logging for Worker2 (extended)
-# ---------------------------------------------------------------------------
 
 def print_pair_report_full(r, profit):
     log.info(f"{r['symbol']}  |  gap {r['gap_pct']:.2f}%  |  {r['n_exchanges']} exchanges")
@@ -1975,7 +1800,7 @@ def print_pair_report_full(r, profit):
             )
         else:
             log.info(f"       ARRIVAL  unknown (exchange returned no confirmation/arrival data)")
-        # USDT transfer details
+
         if profit and profit.get('usdt_transfer_from'):
             if profit.get('usdt_transfer_network') is None:
                 log.info(f"       USDT   already on {profit['usdt_transfer_from']} — no transfer needed")
@@ -1986,13 +1811,13 @@ def print_pair_report_full(r, profit):
                     f"via {profit['usdt_transfer_network']}  fee ${profit['usdt_transfer_fee_usd']:.4f}"
                 )
                 log.info(f"               destination address: {dest_addr}")
-        # Coin transfer details
+
         if profit and profit.get('coin_dest_address'):
             log.info(f"       COIN   deposit address on {r['sell_ex']}: {profit['coin_dest_address']}")
-        # Profit block (already includes USDT fee deduction)
+
         if profit:
             log_profit_block(profit)
-        # Save the filtered snapshot to trade_coins (skips if anything required is missing)
+
         save_trade_coin(r, profit)
     else:
         log.info(f"       VERIFY  ❌ transfer network no longer valid (verified={r['verified']})")
@@ -2003,10 +1828,6 @@ def print_pair_report_full(r, profit):
         log.info(f"       META   {r['sell_meta_summary']}")
     log.info("")
 
-
-# ---------------------------------------------------------------------------
-# Worker1 <-> Worker2 handoff
-# ---------------------------------------------------------------------------
 
 class ActiveTrade:
     def __init__(self):
@@ -2042,13 +1863,9 @@ active_trade = ActiveTrade()
 fail_streaks = defaultdict(int)
 
 
-# ---------------------------------------------------------------------------
-# Worker1 loop (lightweight scanner – uses scanner mode)
-# ---------------------------------------------------------------------------
-
 def worker1_loop():
     log.info(f"[worker1] started — scanning arb_coins every {WORKER1_INTERVAL_SEC}s (scanner mode)")
-    set_exchange_mode('scanner')   # ensure we use scanner pool
+    set_exchange_mode('scanner')
     while True:
         try:
             rows = fetch_arb_coins_rows()
@@ -2057,7 +1874,7 @@ def worker1_loop():
                 time.sleep(WORKER1_INTERVAL_SEC)
                 continue
 
-            # --- Pre-filter: remove rows that violate is_disabled or buy_only ---
+
             exchange_cfg = load_exchange_config()
             rows_to_keep = []
             for row in rows:
@@ -2067,8 +1884,8 @@ def worker1_loop():
                 if not (symbol and buy_ex and sell_ex):
                     continue
 
-                buy_cfg = exchange_cfg.get((buy_ex or "").strip().lower(), {})
-                sell_cfg = exchange_cfg.get((sell_ex or "").strip().lower(), {})
+                buy_cfg = exchange_cfg.get(buy_ex.lower(), {})
+                sell_cfg = exchange_cfg.get(sell_ex.lower(), {})
                 if buy_cfg.get('is_disabled') or sell_cfg.get('is_disabled'):
                     disabled = buy_ex if buy_cfg.get('is_disabled') else sell_ex
                     log.info(f"[worker1] 🗑️  {symbol}: {disabled} is disabled in exchange_config — removing")
@@ -2088,7 +1905,7 @@ def worker1_loop():
                 time.sleep(WORKER1_INTERVAL_SEC)
                 continue
 
-            # --- Batched ticker fetching (uses scanner mode) ---
+
             needed = defaultdict(set)
             for row in rows_to_keep:
                 symbol, buy_ex, sell_ex = row.get('symbol'), row.get('buy_exchange'), row.get('sell_exchange')
@@ -2096,7 +1913,7 @@ def worker1_loop():
                 needed[sell_ex].add(symbol)
             ticker_map = fetch_tickers_grouped(needed)
 
-            # --- Lightweight verification (depth + metadata + profit) ---
+
             outcomes = []
             with ThreadPoolExecutor(max_workers=min(len(rows_to_keep), ROW_PROCESS_MAX_WORKERS)) as pool:
                 futures = {}
@@ -2117,7 +1934,7 @@ def worker1_loop():
                     if result:
                         outcomes.append((row.get('symbol'), row.get('buy_exchange'), row.get('sell_exchange'), result))
 
-            # --- Apply state changes ---
+
             for symbol, buy_ex, sell_ex, check in outcomes:
                 if check['ok']:
                     fail_streaks.pop(symbol, None)
@@ -2157,13 +1974,9 @@ def worker1_loop():
         time.sleep(WORKER1_INTERVAL_SEC)
 
 
-# ---------------------------------------------------------------------------
-# Worker2 loop (full verifier – uses trader mode)
-# ---------------------------------------------------------------------------
-
 def worker2_loop():
     log.info("[worker2] started — waits idle, runs once each time worker1 hands off a new pair (trader mode)")
-    # Set mode to trader for this whole thread
+
     set_exchange_mode('trader')
     while True:
         try:
@@ -2183,14 +1996,10 @@ def worker2_loop():
                 continue
 
             print_pair_report_full(check['r'], check['profit'])
-            # NEXT STAGE: execute the buy/sell here (not yet wired)
+
         except Exception as e:
             log.error(f"[worker2] unexpected error: {e}")
 
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 
 def main():
     log.info("trader.py — Stage 2: worker1 (lightweight scanner) + worker2 (full verifier)")
