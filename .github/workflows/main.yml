@@ -28,4 +28,4 @@ jobs:
           PYTHONUNBUFFERED: "1"
           PYTHONIOENCODING: "utf-8"
         run: |
-          timeout 355m python3 -u runner.py || true
+          timeout 355m python3 -u analyzer.py || true
