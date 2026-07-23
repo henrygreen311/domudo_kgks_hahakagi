@@ -59,6 +59,16 @@ NETWORK_BLOCK_TIME_SEC = {
 }
 DEFAULT_BLOCK_TIME_SEC = 15
 
+# Raw confirms × per-chain block time is only a rough guess — exchanges don't
+# actually wait out that many sequential blocks in real time for large confirm
+# counts (batched/checkpointed confirmation tracking, fast-finality shortcuts,
+# etc.), so the naive multiplication badly overestimates arrival time once
+# confirms get large (e.g. minConfirm=600-5000 on a 2-3s/block chain naively
+# implies 20-50+ minutes, when real-world arrivals for those same values are
+# commonly just a few minutes). Cap the confirms-derived guess at a sane
+# ceiling instead of trusting the linear extrapolation past that point.
+CONFIRM_ESTIMATE_CAP_SEC = 8 * 60
+
 ORDER_BOOK_LIMIT = 50
 ORDER_BOOK_LIMIT_OVERRIDES = {'KuCoin': 100}
 
@@ -590,7 +600,15 @@ def _extract_time_estimate(network_data, network_norm):
             if confirms <= 0:
                 continue
             block_time = NETWORK_BLOCK_TIME_SEC.get(network_norm, DEFAULT_BLOCK_TIME_SEC)
-            seconds = confirms * block_time
+            raw_seconds = confirms * block_time
+            if raw_seconds > CONFIRM_ESTIMATE_CAP_SEC:
+                seconds = CONFIRM_ESTIMATE_CAP_SEC
+                return seconds, (
+                    f"{key}={val!r} (~{block_time}s/block on {network_norm or 'unknown'}, "
+                    f"capped at {_fmt_duration(CONFIRM_ESTIMATE_CAP_SEC)} — raw linear estimate "
+                    f"{_fmt_duration(raw_seconds)} is unreliable for large confirm counts)"
+                )
+            seconds = raw_seconds
             return seconds, f"{key}={val!r} (~{block_time}s/block on {network_norm or 'unknown'})"
 
     return None, None
@@ -1015,9 +1033,16 @@ def log_profit_block(profit):
 
 TRADE_COINS_REQUIRED_FIELDS = (
     'pair', 'exchange', 'coin_wd_network', 'arrival_time', 'usdt_holder',
-    'usdt_transfer_fee', 'usdt_d_address', 'coin_d_address',
-    'buy_sell_trading_fee', 'min_withdrawal', 'gas_deducted',
+    'coin_d_address', 'buy_sell_trading_fee', 'min_withdrawal', 'gas_deducted',
 )
+
+# Only required when USDT capital actually has to move from the holder
+# exchange to the buy exchange. When the buy exchange already holds the
+# capital (usdt_transfer_network is None), there's no transfer step, so no
+# transfer fee applies and no USDT destination address is used — treating
+# them as unconditionally required caused every already-on-buy-exchange
+# opportunity to be silently skipped instead of saved.
+TRADE_COINS_TRANSFER_FIELDS = ('usdt_transfer_fee', 'usdt_d_address')
 
 def save_trade_coin(r, profit):
     """
@@ -1074,7 +1099,12 @@ def save_trade_coin(r, profit):
         'gas_deducted':          gas_deducted,
     }
 
-    missing = [k for k in TRADE_COINS_REQUIRED_FIELDS if row.get(k) is None or row.get(k) == '']
+    transfer_needed = profit.get('usdt_transfer_network') is not None
+    required_fields = list(TRADE_COINS_REQUIRED_FIELDS)
+    if transfer_needed:
+        required_fields += list(TRADE_COINS_TRANSFER_FIELDS)
+
+    missing = [k for k in required_fields if row.get(k) is None or row.get(k) == '']
     if missing:
         log.info(f"       SAVE   skipped — missing: {', '.join(missing)}")
         return
