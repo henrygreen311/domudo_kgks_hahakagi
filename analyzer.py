@@ -8,17 +8,16 @@ import requests
 from datetime import datetime
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import urlparse, urlencode
+from urllib.parse import urlparse
 
 
 PROXY_BASE_SCAN = "https://arb-bot.infinityfree.io/proxy.php"
 PROXY_BASE_TRADE = "https://trade.infinityfree.io/trade_proxy.php"
 
 
-PROXY_EXCHANGES_SCAN = {'Bybit', 'KuCoin'}
+PROXY_EXCHANGES_SCAN = {'Bybit'}
 PROXY_EXCHANGES_TRADE = {
-    'Bybit', 'Bitget', 'MEXC', 'BingX', 'KuCoin',
-    'CoinEx', 'BitMart', 'OKX', 'LBank',
+    'Bybit', 'Bitget', 'MEXC', 'BingX', 'CoinEx',
 }
 PROXY_EXCHANGE_IDS_SCAN = {name.lower() for name in PROXY_EXCHANGES_SCAN}
 PROXY_EXCHANGE_IDS_TRADE = {name.lower() for name in PROXY_EXCHANGES_TRADE}
@@ -47,6 +46,12 @@ CAPITAL_USD     = 1000
 DEPTH_CHECK_USD = 1000
 MIN_STORE_PROFIT_USD = 0.001
 DEFAULT_TAKER_FEE = 0.001
+DEFAULT_MAKER_FEE = 0.001
+# A per-pair fee override (seen on some low-liquidity/new listings) can sit
+# far above an exchange's advertised schedule and its generic market
+# metadata alike. Anything at or above this gets flagged loudly instead of
+# quietly eating into (or reversing) profit.
+FEE_ANOMALY_THRESHOLD = 0.01
 
 
 MAX_TRANSFER_TIME_SEC = 5 * 60
@@ -70,7 +75,7 @@ DEFAULT_BLOCK_TIME_SEC = 15
 CONFIRM_ESTIMATE_CAP_SEC = 8 * 60
 
 ORDER_BOOK_LIMIT = 50
-ORDER_BOOK_LIMIT_OVERRIDES = {'KuCoin': 100}
+ORDER_BOOK_LIMIT_OVERRIDES = {}
 
 def order_book_limit_for(exchange_name):
     return ORDER_BOOK_LIMIT_OVERRIDES.get(exchange_name, ORDER_BOOK_LIMIT)
@@ -227,35 +232,9 @@ def route_through_proxy(ex, mode):
         request_headers.update(_PROXY_HEADERS)
         request_headers['X-Proxy-Target-Host'] = parsed.netloc
 
-        # --- LBank fix ---------------------------------------------------
-        # ccxt's LBank signer (lbank/lbank2) sends timestamp, signature_method,
-        # and echostr as plain HTTP headers rather than as query/body params
-        # (unlike every other exchange here, which authenticates via query
-        # string, body params, or dash-named headers). Many shared-hosting
-        # reverse proxies (InfinityFree's stack included) silently drop any
-        # inbound header whose *name* contains an underscore — this is
-        # standard Nginx/FastCGI behavior (`underscores_in_headers off`).
-        # "signature_method" has an underscore, so it — and often its
-        # neighbors — never reach trade_proxy.php, and LBank correctly
-        # rejects the request with error_code 10202. Query strings aren't
-        # subject to that stripping, so we duplicate the three values there
-        # as a belt-and-braces fix, on top of leaving them in the headers.
-        extra_qs = {}
-        if exchange_key in ('lbank', 'lbank2') and headers:
-            for key in ('timestamp', 'signature_method', 'echostr'):
-                val = headers.get(key)
-                if val is not None:
-                    extra_qs[key] = val
-        # -------------------------------------------------------------------
-
         new_url = f"{proxy_base}/{exchange_key}{parsed.path}"
-        query_parts = []
         if parsed.query:
-            query_parts.append(parsed.query)
-        if extra_qs:
-            query_parts.append(urlencode(extra_qs))
-        if query_parts:
-            new_url += "?" + "&".join(query_parts)
+            new_url += f"?{parsed.query}"
 
         def do_request():
             resp = _proxy_session.request(
@@ -323,9 +302,6 @@ def build_exchange(name, mode):
 
     if proxied:
         ex = route_through_proxy(ex, mode)
-
-        if name_lower == 'kucoin':
-            ex.set_markets(ex.fetch_markets())
 
 
     if not proxied:
@@ -926,19 +902,83 @@ def check_metadata(r):
     return r
 
 
-def get_trading_fee_rate(exchange_name, symbol):
+def get_trading_fees(exchange_name, symbol):
+    """Return (maker_rate, taker_rate, source) for a symbol.
+
+    Checked in order of trust, most authoritative first:
+      1. A LIVE, symbol-specific fee query (fetch_trading_fee) — the only
+         source that reliably reflects a per-pair override, which can sit
+         far above what the exchange's advertised schedule or generic
+         market metadata would suggest.
+      2. Market metadata loaded via load_markets() (ccxt's cached maker/taker
+         for the symbol).
+      3. The exchange's account-level default trading fees.
+      4. Hardcoded fallback constants, if nothing else is available.
+    """
     ex = ensure_exchange(exchange_name)
     if ex is None:
-        return DEFAULT_TAKER_FEE
+        return DEFAULT_MAKER_FEE, DEFAULT_TAKER_FEE, 'default (exchange unavailable)'
+
+    if getattr(ex, 'has', {}).get('fetchTradingFee'):
+        try:
+            fee_data = with_retries(lambda: ex.fetch_trading_fee(symbol), exchange_name)
+            maker = _to_float((fee_data or {}).get('maker'))
+            taker = _to_float((fee_data or {}).get('taker'))
+            if maker is not None or taker is not None:
+                return (
+                    maker if maker is not None else DEFAULT_MAKER_FEE,
+                    taker if taker is not None else DEFAULT_TAKER_FEE,
+                    'live per-symbol fee',
+                )
+        except Exception as e:
+            log.warning(f"  WARNING  {exchange_name} fetch_trading_fee({symbol}): {str(e)[:200]}")
+
     market = (getattr(ex, 'markets', None) or {}).get(symbol)
-    if market and market.get('taker') is not None:
-        return market['taker']
+    if market:
+        maker = _to_float(market.get('maker'))
+        taker = _to_float(market.get('taker'))
+        if maker is not None or taker is not None:
+            return (
+                maker if maker is not None else DEFAULT_MAKER_FEE,
+                taker if taker is not None else DEFAULT_TAKER_FEE,
+                'market metadata',
+            )
+
     fees    = getattr(ex, 'fees', {}) or {}
     trading = fees.get('trading') or {}
-    taker   = trading.get('taker')
-    if taker is not None:
-        return taker
-    return DEFAULT_TAKER_FEE
+    maker   = _to_float(trading.get('maker'))
+    taker   = _to_float(trading.get('taker'))
+    if maker is not None or taker is not None:
+        return (
+            maker if maker is not None else DEFAULT_MAKER_FEE,
+            taker if taker is not None else DEFAULT_TAKER_FEE,
+            'exchange default',
+        )
+
+    return DEFAULT_MAKER_FEE, DEFAULT_TAKER_FEE, 'hardcoded fallback (no data)'
+
+def check_fee_anomaly(exchange_name, symbol, maker_rate, taker_rate, source):
+    """Loudly flag any pair whose real fee is far above a normal spot rate.
+    Returns True if this pair should be treated as high-risk before trading."""
+    worst = max(maker_rate or 0, taker_rate or 0)
+    if worst >= FEE_ANOMALY_THRESHOLD:
+        log.warning(
+            f"  🚨 FEE ANOMALY  {exchange_name} {symbol}: "
+            f"maker={maker_rate*100:.2f}%  taker={taker_rate*100:.2f}%  "
+            f"(source: {source}) — far above a normal spot fee. "
+            f"Double-check this on the exchange's own trade screen before trading it."
+        )
+        return True
+    return False
+
+def get_trading_fee_rate(exchange_name, symbol):
+    """Taker rate used for profit calc. Pulls the live per-symbol rate when
+    available (see get_trading_fees) so a per-pair fee override shows up in
+    the actual math instead of being silently assumed away, and flags it
+    loudly via check_fee_anomaly either way."""
+    maker_rate, taker_rate, source = get_trading_fees(exchange_name, symbol)
+    check_fee_anomaly(exchange_name, symbol, maker_rate, taker_rate, source)
+    return taker_rate
 
 
 def fmt_price(p):
@@ -2067,7 +2107,7 @@ def main():
     log.info("trader.py — Stage 2: worker1 (lightweight scanner) + worker2 (full verifier)")
     log.info(f"worker1 interval: {WORKER1_INTERVAL_SEC}s  |  worker2: event-driven")
     log.info(f"Min qualifying profit: ${MIN_STORE_PROFIT_USD}  |  fail-streak limit: {FAIL_STREAK_LIMIT}")
-    log.info("Scanner mode: uses general API keys, proxies only Bybit & KuCoin via arb-bot")
+    log.info("Scanner mode: uses general API keys, proxies only Bybit via arb-bot")
     log.info("Trader mode: uses restricted API keys, proxies ALL exchanges via trade-proxy")
     log.info("")
 
