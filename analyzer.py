@@ -17,7 +17,8 @@ PROXY_BASE_TRADE = "https://trade.infinityfree.io/trade_proxy.php"
 
 PROXY_EXCHANGES_SCAN = {'Bybit'}
 PROXY_EXCHANGES_TRADE = {
-    'Bybit', 'Bitget', 'MEXC', 'BingX', 'CoinEx',
+    'Bybit', 'Bitget', 'MEXC', 'BingX',
+    'CoinEx', 'OKX',
 }
 PROXY_EXCHANGE_IDS_SCAN = {name.lower() for name in PROXY_EXCHANGES_SCAN}
 PROXY_EXCHANGE_IDS_TRADE = {name.lower() for name in PROXY_EXCHANGES_TRADE}
@@ -46,12 +47,6 @@ CAPITAL_USD     = 1000
 DEPTH_CHECK_USD = 1000
 MIN_STORE_PROFIT_USD = 0.001
 DEFAULT_TAKER_FEE = 0.001
-DEFAULT_MAKER_FEE = 0.001
-# A per-pair fee override (seen on some low-liquidity/new listings) can sit
-# far above an exchange's advertised schedule and its generic market
-# metadata alike. Anything at or above this gets flagged loudly instead of
-# quietly eating into (or reversing) profit.
-FEE_ANOMALY_THRESHOLD = 0.01
 
 
 MAX_TRANSFER_TIME_SEC = 5 * 60
@@ -63,16 +58,6 @@ NETWORK_BLOCK_TIME_SEC = {
     'SUI': 3, 'XRP': 4, 'DOGE': 60, 'LTC': 150, 'ZKSYNC': 1, 'BTC-LN': 1,
 }
 DEFAULT_BLOCK_TIME_SEC = 15
-
-# Raw confirms × per-chain block time is only a rough guess — exchanges don't
-# actually wait out that many sequential blocks in real time for large confirm
-# counts (batched/checkpointed confirmation tracking, fast-finality shortcuts,
-# etc.), so the naive multiplication badly overestimates arrival time once
-# confirms get large (e.g. minConfirm=600-5000 on a 2-3s/block chain naively
-# implies 20-50+ minutes, when real-world arrivals for those same values are
-# commonly just a few minutes). Cap the confirms-derived guess at a sane
-# ceiling instead of trusting the linear extrapolation past that point.
-CONFIRM_ESTIMATE_CAP_SEC = 8 * 60
 
 ORDER_BOOK_LIMIT = 50
 ORDER_BOOK_LIMIT_OVERRIDES = {}
@@ -231,7 +216,6 @@ def route_through_proxy(ex, mode):
         request_headers = dict(headers or {})
         request_headers.update(_PROXY_HEADERS)
         request_headers['X-Proxy-Target-Host'] = parsed.netloc
-
         new_url = f"{proxy_base}/{exchange_key}{parsed.path}"
         if parsed.query:
             new_url += f"?{parsed.query}"
@@ -576,15 +560,7 @@ def _extract_time_estimate(network_data, network_norm):
             if confirms <= 0:
                 continue
             block_time = NETWORK_BLOCK_TIME_SEC.get(network_norm, DEFAULT_BLOCK_TIME_SEC)
-            raw_seconds = confirms * block_time
-            if raw_seconds > CONFIRM_ESTIMATE_CAP_SEC:
-                seconds = CONFIRM_ESTIMATE_CAP_SEC
-                return seconds, (
-                    f"{key}={val!r} (~{block_time}s/block on {network_norm or 'unknown'}, "
-                    f"capped at {_fmt_duration(CONFIRM_ESTIMATE_CAP_SEC)} — raw linear estimate "
-                    f"{_fmt_duration(raw_seconds)} is unreliable for large confirm counts)"
-                )
-            seconds = raw_seconds
+            seconds = confirms * block_time
             return seconds, f"{key}={val!r} (~{block_time}s/block on {network_norm or 'unknown'})"
 
     return None, None
@@ -902,83 +878,19 @@ def check_metadata(r):
     return r
 
 
-def get_trading_fees(exchange_name, symbol):
-    """Return (maker_rate, taker_rate, source) for a symbol.
-
-    Checked in order of trust, most authoritative first:
-      1. A LIVE, symbol-specific fee query (fetch_trading_fee) — the only
-         source that reliably reflects a per-pair override, which can sit
-         far above what the exchange's advertised schedule or generic
-         market metadata would suggest.
-      2. Market metadata loaded via load_markets() (ccxt's cached maker/taker
-         for the symbol).
-      3. The exchange's account-level default trading fees.
-      4. Hardcoded fallback constants, if nothing else is available.
-    """
+def get_trading_fee_rate(exchange_name, symbol):
     ex = ensure_exchange(exchange_name)
     if ex is None:
-        return DEFAULT_MAKER_FEE, DEFAULT_TAKER_FEE, 'default (exchange unavailable)'
-
-    if getattr(ex, 'has', {}).get('fetchTradingFee'):
-        try:
-            fee_data = with_retries(lambda: ex.fetch_trading_fee(symbol), exchange_name)
-            maker = _to_float((fee_data or {}).get('maker'))
-            taker = _to_float((fee_data or {}).get('taker'))
-            if maker is not None or taker is not None:
-                return (
-                    maker if maker is not None else DEFAULT_MAKER_FEE,
-                    taker if taker is not None else DEFAULT_TAKER_FEE,
-                    'live per-symbol fee',
-                )
-        except Exception as e:
-            log.warning(f"  WARNING  {exchange_name} fetch_trading_fee({symbol}): {str(e)[:200]}")
-
+        return DEFAULT_TAKER_FEE
     market = (getattr(ex, 'markets', None) or {}).get(symbol)
-    if market:
-        maker = _to_float(market.get('maker'))
-        taker = _to_float(market.get('taker'))
-        if maker is not None or taker is not None:
-            return (
-                maker if maker is not None else DEFAULT_MAKER_FEE,
-                taker if taker is not None else DEFAULT_TAKER_FEE,
-                'market metadata',
-            )
-
+    if market and market.get('taker') is not None:
+        return market['taker']
     fees    = getattr(ex, 'fees', {}) or {}
     trading = fees.get('trading') or {}
-    maker   = _to_float(trading.get('maker'))
-    taker   = _to_float(trading.get('taker'))
-    if maker is not None or taker is not None:
-        return (
-            maker if maker is not None else DEFAULT_MAKER_FEE,
-            taker if taker is not None else DEFAULT_TAKER_FEE,
-            'exchange default',
-        )
-
-    return DEFAULT_MAKER_FEE, DEFAULT_TAKER_FEE, 'hardcoded fallback (no data)'
-
-def check_fee_anomaly(exchange_name, symbol, maker_rate, taker_rate, source):
-    """Loudly flag any pair whose real fee is far above a normal spot rate.
-    Returns True if this pair should be treated as high-risk before trading."""
-    worst = max(maker_rate or 0, taker_rate or 0)
-    if worst >= FEE_ANOMALY_THRESHOLD:
-        log.warning(
-            f"  🚨 FEE ANOMALY  {exchange_name} {symbol}: "
-            f"maker={maker_rate*100:.2f}%  taker={taker_rate*100:.2f}%  "
-            f"(source: {source}) — far above a normal spot fee. "
-            f"Double-check this on the exchange's own trade screen before trading it."
-        )
-        return True
-    return False
-
-def get_trading_fee_rate(exchange_name, symbol):
-    """Taker rate used for profit calc. Pulls the live per-symbol rate when
-    available (see get_trading_fees) so a per-pair fee override shows up in
-    the actual math instead of being silently assumed away, and flags it
-    loudly via check_fee_anomaly either way."""
-    maker_rate, taker_rate, source = get_trading_fees(exchange_name, symbol)
-    check_fee_anomaly(exchange_name, symbol, maker_rate, taker_rate, source)
-    return taker_rate
+    taker   = trading.get('taker')
+    if taker is not None:
+        return taker
+    return DEFAULT_TAKER_FEE
 
 
 def fmt_price(p):
@@ -1073,16 +985,9 @@ def log_profit_block(profit):
 
 TRADE_COINS_REQUIRED_FIELDS = (
     'pair', 'exchange', 'coin_wd_network', 'arrival_time', 'usdt_holder',
-    'coin_d_address', 'buy_sell_trading_fee', 'min_withdrawal', 'gas_deducted',
+    'usdt_transfer_fee', 'usdt_d_address', 'coin_d_address',
+    'buy_sell_trading_fee', 'min_withdrawal', 'gas_deducted',
 )
-
-# Only required when USDT capital actually has to move from the holder
-# exchange to the buy exchange. When the buy exchange already holds the
-# capital (usdt_transfer_network is None), there's no transfer step, so no
-# transfer fee applies and no USDT destination address is used — treating
-# them as unconditionally required caused every already-on-buy-exchange
-# opportunity to be silently skipped instead of saved.
-TRADE_COINS_TRANSFER_FIELDS = ('usdt_transfer_fee', 'usdt_d_address')
 
 def save_trade_coin(r, profit):
     """
@@ -1107,17 +1012,12 @@ def save_trade_coin(r, profit):
     usdt_holder  = profit.get('usdt_transfer_from')
     usdt_network = profit.get('usdt_transfer_network')
     usdt_fee     = profit.get('usdt_transfer_fee_usd')
-    # trade_coins.usdt_transfer_fee is NOT NULL in Supabase, so when no
-    # transfer is needed (capital already on buy_ex) we store '' rather than
-    # None — trader.py's parse_usdt_transfer_fee() and this file's own
-    # missing-field check both treat '' as "no value" identically to None,
-    # so behavior is unchanged; this just satisfies the DB constraint.
     usdt_transfer_fee = (
         f"{usdt_network}/{usdt_fee:.4f}"
-        if usdt_network and usdt_fee is not None else ''
+        if usdt_network and usdt_fee is not None else None
     )
 
-    usdt_d_address = profit.get('usdt_dest_address') or ''
+    usdt_d_address = profit.get('usdt_dest_address')
     coin_d_address = profit.get('coin_dest_address')
 
     buy_fee  = profit.get('buy_fee_usd')
@@ -1144,12 +1044,7 @@ def save_trade_coin(r, profit):
         'gas_deducted':          gas_deducted,
     }
 
-    transfer_needed = profit.get('usdt_transfer_network') is not None
-    required_fields = list(TRADE_COINS_REQUIRED_FIELDS)
-    if transfer_needed:
-        required_fields += list(TRADE_COINS_TRANSFER_FIELDS)
-
-    missing = [k for k in required_fields if row.get(k) is None or row.get(k) == '']
+    missing = [k for k in TRADE_COINS_REQUIRED_FIELDS if row.get(k) is None or row.get(k) == '']
     if missing:
         log.info(f"       SAVE   skipped — missing: {', '.join(missing)}")
         return
