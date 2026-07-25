@@ -28,7 +28,7 @@ jobs:
         run: |
           set -o pipefail
 
-          timeout 355m python3 -u analyzer.py 2>&1 | while IFS= read -r line; do
+          timeout 355m python3 -u tracker.py 2>&1 | while IFS= read -r line; do
             echo "$line"
 
             curl -s \
