@@ -144,12 +144,10 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         # open a position once we're at the concurrency cap.
         async with self._lock:
             if self._total_opened >= cfg.max_total_trades:
-                log.info(f"[execution] lifetime trade limit ({cfg.max_total_trades}) reached — no new trades")
                 return False
             if symbol in self._open_positions:
                 return False
             if len(self._open_positions) >= cfg.max_open_positions:
-                log.info(f"[execution] max open positions ({cfg.max_open_positions}) reached — skipping {symbol}")
                 return False
             self._open_positions[symbol] = None  # placeholder reservation
 
@@ -242,7 +240,9 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
             log.error(f"[execution] {symbol} order {order_id} reported no fill — abandoning")
             return None
 
-        opening_fee = await self._get_opening_fee(symbol, order_id)
+        opening_fee = await self._get_opening_fee(
+            symbol, order_id, notional_usdt=deal_size * contract_size * deal_avg_price
+        )
 
         take_profit_price = self._compute_take_profit_price(
             direction=direction,
@@ -299,16 +299,52 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
             await asyncio.sleep(cfg.fill_poll_interval_sec)
         return None
 
-    async def _get_opening_fee(self, symbol: str, order_id: str) -> float:
+    async def _get_opening_fee(self, symbol: str, order_id: str, notional_usdt: float) -> float:
         """Retrieves the actual fee charged for opening the position. Trading
         fees vary by pair/VIP level/promotions, so this is always looked up
-        from the exchange rather than assumed."""
+        from the exchange rather than assumed.
+
+        The fill's fee record can lag a beat behind the order itself being
+        reported as filled, so this retries a few times before concluding
+        there's genuinely no fee data yet. If it still comes back empty, it
+        falls back to the exchange's *quoted* taker fee rate for this pair
+        (also fetched live, never hardcoded) rather than silently using 0 —
+        a 0 opening fee understates the true cost and makes the take-profit
+        calculated from it too tight to clear fees."""
+        fee = await self._fetch_fee_from_trades(symbol, order_id)
+        if fee is not None and fee > 0:
+            return fee
+
+        log.warning(
+            f"[execution] {symbol} order {order_id} — no fill fee reported by the exchange yet; "
+            f"falling back to the quoted taker fee rate for this pair"
+        )
+        return await self._estimate_fee_from_rate(symbol, notional_usdt)
+
+    async def _fetch_fee_from_trades(
+        self, symbol: str, order_id: str, attempts: int = 6, delay_sec: float = 0.5
+    ) -> Optional[float]:
+        for attempt in range(1, attempts + 1):
+            try:
+                trades = await self._client.get_trades(symbol=symbol, order_id=order_id)
+            except BitMartAPIError as exc:
+                log.warning(f"[execution] fee lookup attempt {attempt}/{attempts} failed for {symbol} {order_id}: {exc}")
+                trades = []
+            total_fee = sum(float(t.get("paid_fees", 0)) for t in trades)
+            if total_fee > 0:
+                return total_fee
+            if attempt < attempts:
+                await asyncio.sleep(delay_sec)
+        return None
+
+    async def _estimate_fee_from_rate(self, symbol: str, notional_usdt: float) -> float:
         try:
-            trades = await self._client.get_trades(symbol=symbol, order_id=order_id)
+            rate_info = await self._client.get_trade_fee_rate(symbol)
+            taker_rate = float(rate_info.get("taker_fee_rate", 0))
         except BitMartAPIError as exc:
-            log.warning(f"[execution] could not fetch fill fees for {symbol} {order_id}: {exc} — assuming 0 fee")
+            log.warning(f"[execution] could not fetch trade fee rate for {symbol}: {exc} — assuming 0 fee")
             return 0.0
-        return sum(float(t.get("paid_fees", 0)) for t in trades)
+        return notional_usdt * taker_rate
 
     def _compute_take_profit_price(
         self,
@@ -419,17 +455,24 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         """Looks up the fill(s) that closed this position (whether by the
         take-profit order or by exchange liquidation) to get the real exit
         price, realized PnL, and closing fee — never estimated."""
-        try:
-            trades = await self._client.get_trades(symbol=symbol)
-        except BitMartAPIError as exc:
-            log.warning(f"[execution] could not fetch closing trades for {symbol}: {exc}")
-            return None, None, None, "unknown"
-
         opened_at_ms = closed.opened_at * 1000.0
         close_sides = (2, 3)  # buy_close_short=2, sell_close_long=3
-        closing_trades = [
-            t for t in trades if float(t.get("create_time", 0)) >= opened_at_ms and t.get("side") in close_sides
-        ]
+
+        closing_trades: List[dict] = []
+        for attempt in range(1, 4):
+            try:
+                trades = await self._client.get_trades(symbol=symbol)
+            except BitMartAPIError as exc:
+                log.warning(f"[execution] could not fetch closing trades for {symbol}: {exc}")
+                trades = []
+            closing_trades = [
+                t for t in trades if float(t.get("create_time", 0)) >= opened_at_ms and t.get("side") in close_sides
+            ]
+            if closing_trades:
+                break
+            if attempt < 3:
+                await asyncio.sleep(0.5)
+
         if not closing_trades:
             return None, None, None, "unknown"
 
@@ -441,8 +484,13 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         realized_pnl = sum(float(t.get("realised_profit", 0)) for t in closing_trades)
         closing_fee = sum(float(t.get("paid_fees", 0)) for t in closing_trades)
 
-        tp = closed.take_profit_price
-        close_reason = "take_profit" if tp and abs(exit_price - tp) / tp < 0.003 else "liquidation_or_other"
+        # Determine *why* it closed by checking whether the fill actually
+        # belongs to our take-profit order — comparing exit price to the TP
+        # price is unreliable (a liquidation can land close to the TP price
+        # by coincidence).
+        tp_order_id = str(closed.tp_order_id) if closed.tp_order_id else None
+        filled_by_tp = tp_order_id is not None and any(str(t.get("order_id")) == tp_order_id for t in closing_trades)
+        close_reason = "take_profit" if filled_by_tp else "liquidation_or_other"
         return exit_price, realized_pnl, closing_fee, close_reason
 
     async def _check_price_alert(self, symbol: str, pos: OpenPosition, active: dict) -> None:
