@@ -324,12 +324,18 @@ class TradeStore:
             self._trades.pop(symbol, None)
 
 
-def compute_order_flow_metrics(trades: List[dict]) -> dict:
+def compute_order_flow_metrics(
+    trades: List[dict],
+    window_sec: Optional[float] = None,
+    whale_size_multiplier: float = 3.0,
+) -> dict:
     buys = [t for t in trades if t["side"] == "buy"]
     sells = [t for t in trades if t["side"] == "sell"]
 
     buy_volume = sum(t["qty"] for t in buys)
     sell_volume = sum(t["qty"] for t in sells)
+    total_volume = buy_volume + sell_volume
+    total_trades = len(trades)
 
     if sell_volume > 0:
         buy_sell_ratio = buy_volume / sell_volume
@@ -337,6 +343,48 @@ def compute_order_flow_metrics(trades: List[dict]) -> dict:
         buy_sell_ratio = float("inf")
     else:
         buy_sell_ratio = 0.0
+
+    # --- Aggressive market order detection ---
+    # Trades in this feed are already taker-side executions (see TradeStore.apply_trade),
+    # so buy_volume/sell_volume ARE the aggressive/market-order volumes. These are just
+    # explicit, purpose-named aliases plus the derived percentages/delta.
+    aggressive_buy_pct = (buy_volume / total_volume) if total_volume > 0 else 0.0
+    aggressive_sell_pct = (sell_volume / total_volume) if total_volume > 0 else 0.0
+
+    # --- Whale detection: trades meaningfully larger than the window's average size ---
+    avg_trade_qty = (total_volume / total_trades) if total_trades else 0.0
+    whale_threshold = avg_trade_qty * whale_size_multiplier
+    whale_buys = [t for t in buys if whale_threshold > 0 and t["qty"] >= whale_threshold]
+    whale_sells = [t for t in sells if whale_threshold > 0 and t["qty"] >= whale_threshold]
+    whale_buy_volume = sum(t["qty"] for t in whale_buys)
+    whale_sell_volume = sum(t["qty"] for t in whale_sells)
+
+    # --- Trade speed / intensity ---
+    if window_sec and window_sec > 0:
+        trades_per_sec = total_trades / window_sec
+        volume_per_sec = total_volume / window_sec
+        buy_trades_per_sec = len(buys) / window_sec
+        sell_trades_per_sec = len(sells) / window_sec
+    else:
+        trades_per_sec = volume_per_sec = buy_trades_per_sec = sell_trades_per_sec = 0.0
+
+    # --- Consecutive buy/sell streaks, in chronological order ---
+    ordered = sorted(trades, key=lambda t: t["timestamp"])
+    longest_buy_streak = longest_sell_streak = 0
+    current_streak_side = None
+    current_streak_len = 0
+    for t in ordered:
+        if t["side"] == current_streak_side:
+            current_streak_len += 1
+        else:
+            current_streak_side = t["side"]
+            current_streak_len = 1
+        if current_streak_side == "buy":
+            longest_buy_streak = max(longest_buy_streak, current_streak_len)
+        else:
+            longest_sell_streak = max(longest_sell_streak, current_streak_len)
+    current_buy_streak = current_streak_len if current_streak_side == "buy" else 0
+    current_sell_streak = current_streak_len if current_streak_side == "sell" else 0
 
     return {
         "buy_volume": buy_volume,
@@ -349,13 +397,41 @@ def compute_order_flow_metrics(trades: List[dict]) -> dict:
         "avg_sell_size": (sell_volume / len(sells)) if sells else 0.0,
         "largest_buy": max((t["qty"] for t in buys), default=0.0),
         "largest_sell": max((t["qty"] for t in sells), default=0.0),
+        # Aggressive market order detection
+        "market_buy_volume": buy_volume,
+        "market_sell_volume": sell_volume,
+        "aggressive_buy_pct": aggressive_buy_pct,
+        "aggressive_sell_pct": aggressive_sell_pct,
+        "net_volume_delta": buy_volume - sell_volume,
+        # Whale detection
+        "whale_buy_count": len(whale_buys),
+        "whale_sell_count": len(whale_sells),
+        "whale_buy_volume": whale_buy_volume,
+        "whale_sell_volume": whale_sell_volume,
+        "whale_trade_count": len(whale_buys) + len(whale_sells),
+        # Trade speed / intensity
+        "trades_per_sec": trades_per_sec,
+        "volume_per_sec": volume_per_sec,
+        "buy_trades_per_sec": buy_trades_per_sec,
+        "sell_trades_per_sec": sell_trades_per_sec,
+        # Consecutive streaks
+        "current_buy_streak": current_buy_streak,
+        "current_sell_streak": current_sell_streak,
+        "longest_buy_streak": longest_buy_streak,
+        "longest_sell_streak": longest_sell_streak,
     }
 
 
 class OrderFlowAnalyzer:
-    def __init__(self, trade_store: TradeStore, windows_ms: Tuple[int, ...] = (500, 1000, 2000, 5000)) -> None:
+    def __init__(
+        self,
+        trade_store: TradeStore,
+        windows_ms: Tuple[int, ...] = (500, 1000, 2000, 5000),
+        whale_size_multiplier: float = 3.0,
+    ) -> None:
         self._trade_store = trade_store
         self._windows_ms = windows_ms
+        self._whale_size_multiplier = whale_size_multiplier
         self._metrics: Dict[str, Dict[int, dict]] = {}
         self._lock = asyncio.Lock()
 
@@ -365,7 +441,11 @@ class OrderFlowAnalyzer:
             per_window = {}
             for window_ms in self._windows_ms:
                 trades = await self._trade_store.get_window(symbol, window_ms)
-                per_window[window_ms] = compute_order_flow_metrics(trades)
+                per_window[window_ms] = compute_order_flow_metrics(
+                    trades,
+                    window_sec=window_ms / 1000.0,
+                    whale_size_multiplier=self._whale_size_multiplier,
+                )
             computed[symbol] = per_window
 
         async with self._lock:
@@ -381,7 +461,7 @@ class OrderFlowAnalyzer:
             return {symbol: {w: dict(m) for w, m in windows.items()} for symbol, windows in self._metrics.items()}
 
 
-def compute_liquidity_metrics(book: dict) -> dict:
+def compute_liquidity_metrics(book: dict, distance_bands: Optional[Tuple[float, ...]] = None) -> dict:
     bid_liquidity = book.get("bid_liquidity", 0.0)
     ask_liquidity = book.get("ask_liquidity", 0.0)
     total_liquidity = bid_liquidity + ask_liquidity
@@ -407,7 +487,7 @@ def compute_liquidity_metrics(book: dict) -> dict:
     else:
         dominance = "balanced"
 
-    return {
+    result = {
         "bid_liquidity": bid_liquidity,
         "ask_liquidity": ask_liquidity,
         "bid_ask_ratio": bid_ask_ratio,
@@ -417,16 +497,72 @@ def compute_liquidity_metrics(book: dict) -> dict:
         "dominance": dominance,
     }
 
+    if distance_bands:
+        best_bid = book.get("best_bid")
+        best_ask = book.get("best_ask")
+        mid_price = ((best_bid[0] + best_ask[0]) / 2.0) if best_bid and best_ask else 0.0
+        result["band_imbalance"] = (
+            compute_band_imbalance(book.get("bids", []), book.get("asks", []), mid_price, distance_bands)
+            if mid_price > 0
+            else {}
+        )
+
+    return result
+
+
+def compute_band_imbalance(
+    bids: List[Tuple[float, float]],
+    asks: List[Tuple[float, float]],
+    mid_price: float,
+    distance_bands: Tuple[float, ...],
+) -> Dict[float, dict]:
+    """Order book liquidity/imbalance within % distance bands from mid price.
+
+    Nearby liquidity (tight bands) matters more for short-term price impact than
+    liquidity sitting far from the current price, so this breaks the book down
+    by proximity instead of summing it all together.
+    """
+    bands: Dict[float, dict] = {}
+    for pct in distance_bands:
+        band_bid = sum(v for p, v in bids if mid_price > 0 and (mid_price - p) / mid_price <= pct)
+        band_ask = sum(v for p, v in asks if mid_price > 0 and (p - mid_price) / mid_price <= pct)
+        total = band_bid + band_ask
+
+        if band_ask > 0:
+            bid_ask_ratio = band_bid / band_ask
+        elif band_bid > 0:
+            bid_ask_ratio = float("inf")
+        else:
+            bid_ask_ratio = 0.0
+
+        if band_bid > 0:
+            ask_bid_ratio = band_ask / band_bid
+        elif band_ask > 0:
+            ask_bid_ratio = float("inf")
+        else:
+            ask_bid_ratio = 0.0
+
+        imbalance = ((band_bid - band_ask) / total) if total > 0 else 0.0
+
+        bands[pct] = {
+            "bid_liquidity": band_bid,
+            "ask_liquidity": band_ask,
+            "bid_ask_ratio": bid_ask_ratio,
+            "ask_bid_ratio": ask_bid_ratio,
+            "imbalance": imbalance,
+        }
+    return bands
+
 
 class LiquidityEngine:
     def __init__(self, order_book: OrderBookStore) -> None:
         self._order_book = order_book
 
-    async def get(self, symbol: str) -> Optional[dict]:
+    async def get(self, symbol: str, distance_bands: Optional[Tuple[float, ...]] = None) -> Optional[dict]:
         book = await self._order_book.get_book(symbol)
         if not book:
             return None
-        return compute_liquidity_metrics(book)
+        return compute_liquidity_metrics(book, distance_bands=distance_bands)
 
     async def snapshot(self, symbols: List[str]) -> Dict[str, dict]:
         result: Dict[str, dict] = {}
@@ -450,6 +586,23 @@ class SignalConfig:
     take_profit_pct: float = 0.002
     stop_loss_pct: float = 0.005
     cooldown_sec: float = 5.0
+
+    # --- New order-flow features (each toggled independently, all off by default) ---
+    enable_aggressive_order_detection: bool = False
+    aggressive_dominance_pct: float = 0.65
+
+    enable_whale_detection: bool = False  # whale size threshold is set via OrderFlowAnalyzer(whale_size_multiplier=...)
+
+    enable_trade_intensity: bool = False
+    intensity_dominance_ratio: float = 1.5
+
+    enable_streak_detection: bool = False
+    streak_confirmation_length: int = 4
+
+    enable_book_imbalance_by_distance: bool = False
+    book_imbalance_distance_bands: Tuple[float, ...] = (0.001, 0.0025, 0.005, 0.01)
+    book_imbalance_check_band: float = 0.001
+    book_imbalance_ratio_threshold: float = 1.2
 
 
 @dataclass
@@ -510,7 +663,10 @@ class SignalGenerator:
             price_change_pct = (price - history[0][1]) / history[0][1]
 
         flow = await self._order_flow.get(symbol, cfg.order_flow_window_ms)
-        liquidity = await self._liquidity_engine.get(symbol)
+        liquidity = await self._liquidity_engine.get(
+            symbol,
+            distance_bands=cfg.book_imbalance_distance_bands if cfg.enable_book_imbalance_by_distance else None,
+        )
         if flow is None or liquidity is None:
             return None
 
@@ -540,6 +696,39 @@ class SignalGenerator:
             "market data fresh": is_fresh,
             "liquidity sufficient": liquidity_sufficient,
         }
+
+        # --- New order-flow checks, merged into existing scoring (each independently toggled) ---
+        if cfg.enable_aggressive_order_detection:
+            long_checks["aggressive buyers in control"] = flow.get("aggressive_buy_pct", 0.0) >= cfg.aggressive_dominance_pct
+            short_checks["aggressive sellers in control"] = flow.get("aggressive_sell_pct", 0.0) >= cfg.aggressive_dominance_pct
+
+        if cfg.enable_whale_detection:
+            long_checks["whale buying detected"] = (
+                flow.get("whale_buy_count", 0) > 0 and flow.get("whale_buy_volume", 0.0) > flow.get("whale_sell_volume", 0.0)
+            )
+            short_checks["whale selling detected"] = (
+                flow.get("whale_sell_count", 0) > 0 and flow.get("whale_sell_volume", 0.0) > flow.get("whale_buy_volume", 0.0)
+            )
+
+        if cfg.enable_trade_intensity:
+            buy_tps = flow.get("buy_trades_per_sec", 0.0)
+            sell_tps = flow.get("sell_trades_per_sec", 0.0)
+            long_checks["buy trade intensity elevated"] = (sell_tps == 0 and buy_tps > 0) or (
+                sell_tps > 0 and buy_tps / sell_tps >= cfg.intensity_dominance_ratio
+            )
+            short_checks["sell trade intensity elevated"] = (buy_tps == 0 and sell_tps > 0) or (
+                buy_tps > 0 and sell_tps / buy_tps >= cfg.intensity_dominance_ratio
+            )
+
+        if cfg.enable_streak_detection:
+            long_checks["active buy streak"] = flow.get("current_buy_streak", 0) >= cfg.streak_confirmation_length
+            short_checks["active sell streak"] = flow.get("current_sell_streak", 0) >= cfg.streak_confirmation_length
+
+        if cfg.enable_book_imbalance_by_distance:
+            band = (liquidity.get("band_imbalance") or {}).get(cfg.book_imbalance_check_band)
+            if band:
+                long_checks["near-book liquidity favors bids"] = band["bid_ask_ratio"] >= cfg.book_imbalance_ratio_threshold
+                short_checks["near-book liquidity favors asks"] = band["ask_bid_ratio"] >= cfg.book_imbalance_ratio_threshold
 
         long_count = sum(long_checks.values())
         short_count = sum(short_checks.values())
@@ -577,139 +766,3 @@ class SignalGenerator:
             timestamp=now,
             reasons=reasons,
         )
-
-
-@dataclass
-class PaperTrade:
-    symbol: str
-    direction: str
-    entry_price: float
-    entry_time: float
-    take_profit: float
-    stop_loss: float
-    mfe_pct: float = 0.0
-    mae_pct: float = 0.0
-
-
-@dataclass
-class PaperTradeResult:
-    symbol: str
-    direction: str
-    entry_price: float
-    exit_price: float
-    entry_time: float
-    exit_time: float
-    outcome: str
-    mfe_pct: float
-    mae_pct: float
-    duration_sec: float
-    gross_profit_pct: float
-    fees_pct: float
-    net_profit_pct: float
-
-
-class PaperTradingEngine:
-    def __init__(self, taker_fee_rate: float = 0.0006, max_trade_duration_sec: float = 60.0) -> None:
-        self._open_trades: Dict[str, PaperTrade] = {}
-        self._results: List[PaperTradeResult] = []
-        self._taker_fee_rate = taker_fee_rate
-        self._max_duration = max_trade_duration_sec
-        self._lock = asyncio.Lock()
-
-    async def has_open_trade(self, symbol: str) -> bool:
-        async with self._lock:
-            return symbol in self._open_trades
-
-    async def open_trade(self, signal: Signal) -> bool:
-        async with self._lock:
-            if signal.symbol in self._open_trades:
-                return False
-            self._open_trades[signal.symbol] = PaperTrade(
-                symbol=signal.symbol,
-                direction=signal.direction,
-                entry_price=signal.entry_price,
-                entry_time=signal.timestamp,
-                take_profit=signal.take_profit,
-                stop_loss=signal.stop_loss,
-            )
-            return True
-
-    async def update(self, symbol: str, current_price: float, now: float) -> Optional[PaperTradeResult]:
-        async with self._lock:
-            trade = self._open_trades.get(symbol)
-            if not trade:
-                return None
-
-            if trade.direction == "long":
-                move_pct = (current_price - trade.entry_price) / trade.entry_price
-                hit_tp = current_price >= trade.take_profit
-                hit_sl = current_price <= trade.stop_loss
-            else:
-                move_pct = (trade.entry_price - current_price) / trade.entry_price
-                hit_tp = current_price <= trade.take_profit
-                hit_sl = current_price >= trade.stop_loss
-
-            trade.mfe_pct = max(trade.mfe_pct, move_pct)
-            trade.mae_pct = min(trade.mae_pct, move_pct)
-
-            timed_out = (now - trade.entry_time) >= self._max_duration
-            if not (hit_tp or hit_sl or timed_out):
-                return None
-
-            outcome = "tp" if hit_tp else "sl" if hit_sl else "timeout"
-            fees_pct = self._taker_fee_rate * 2
-            net_profit_pct = move_pct - fees_pct
-
-            result = PaperTradeResult(
-                symbol=symbol,
-                direction=trade.direction,
-                entry_price=trade.entry_price,
-                exit_price=current_price,
-                entry_time=trade.entry_time,
-                exit_time=now,
-                outcome=outcome,
-                mfe_pct=trade.mfe_pct,
-                mae_pct=trade.mae_pct,
-                duration_sec=now - trade.entry_time,
-                gross_profit_pct=move_pct,
-                fees_pct=fees_pct,
-                net_profit_pct=net_profit_pct,
-            )
-
-            del self._open_trades[symbol]
-            self._results.append(result)
-            return result
-
-    async def stats(self) -> dict:
-        async with self._lock:
-            results = list(self._results)
-
-        total = len(results)
-        wins = [r for r in results if r.net_profit_pct > 0]
-        losses = [r for r in results if r.net_profit_pct <= 0]
-
-        win_rate = (len(wins) / total) if total else 0.0
-        average_profit = (sum(r.net_profit_pct for r in wins) / len(wins)) if wins else 0.0
-        average_loss = (sum(r.net_profit_pct for r in losses) / len(losses)) if losses else 0.0
-
-        gross_win = sum(r.net_profit_pct for r in wins)
-        gross_loss = abs(sum(r.net_profit_pct for r in losses))
-        if gross_loss > 0:
-            profit_factor = gross_win / gross_loss
-        elif gross_win > 0:
-            profit_factor = float("inf")
-        else:
-            profit_factor = 0.0
-
-        return {
-            "total_signals": total,
-            "winning_trades": len(wins),
-            "losing_trades": len(losses),
-            "win_rate": win_rate,
-            "average_profit_pct": average_profit,
-            "average_loss_pct": average_loss,
-            "profit_factor": profit_factor,
-            "total_fees_pct": sum(r.fees_pct for r in results),
-            "net_pnl_pct": sum(r.net_profit_pct for r in results),
-            "average_holding_time_sec": (sum(r.duration_sec for r in results) / total) if total else 0.0,
-        }
