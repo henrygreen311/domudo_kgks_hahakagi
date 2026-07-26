@@ -1,7 +1,9 @@
 import asyncio
+import re
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Deque, Dict, List, Optional, Tuple
 
 
@@ -220,41 +222,82 @@ def _first_present(payload: dict, keys: Tuple[str, ...]):
     return None
 
 
+_ISO_FRACTION_RE = re.compile(r"(\.\d{6})\d+")
+
+
+def _parse_timestamp_ms(raw) -> float:
+    if raw is None:
+        return time.time() * 1000.0
+    if isinstance(raw, (int, float)):
+        ts = float(raw)
+        return ts * 1000.0 if ts < 10 ** 12 else ts
+    if isinstance(raw, str):
+        text = raw.strip()
+        try:
+            ts = float(text)
+            return ts * 1000.0 if ts < 10 ** 12 else ts
+        except ValueError:
+            pass
+        try:
+            iso = text.replace("Z", "+00:00")
+            iso = _ISO_FRACTION_RE.sub(r"\1", iso)
+            return datetime.fromisoformat(iso).timestamp() * 1000.0
+        except (ValueError, TypeError):
+            return time.time() * 1000.0
+    return time.time() * 1000.0
+
+
 class TradeStore:
     def __init__(self, windows_ms: Tuple[int, ...] = (500, 1000, 2000, 5000)) -> None:
         self._trades: Dict[str, Deque[dict]] = defaultdict(deque)
         self._windows_ms = windows_ms
         self._max_window_ms = max(windows_ms)
         self._lock = asyncio.Lock()
+        self._unmapped_ways_seen: set = set()
+        self.on_unmapped_way = lambda way, payload: None
 
     async def apply_trade(self, payload: dict) -> None:
         symbol = payload.get("symbol")
         if not symbol:
             return
 
-        price_raw = _first_present(payload, ("price", "p"))
-        qty_raw = _first_present(payload, ("vol", "size", "qty", "v"))
+        price_raw = _first_present(payload, ("deal_price", "price", "p"))
+        qty_raw = _first_present(payload, ("deal_vol", "vol", "size", "qty", "v"))
         try:
             price = float(price_raw)
             qty = float(qty_raw)
         except (TypeError, ValueError):
             return
 
-        way = _first_present(payload, ("way", "side"))
-        if way in (1, "1", "buy", "Buy", "BUY"):
+        way = _first_present(payload, ("way",))
+        m_flag = payload.get("m")
+
+        side = None
+        if isinstance(way, str) and way.isdigit():
+            way = int(way)
+        if isinstance(way, int) and 1 <= way <= 4:
             side = "buy"
-        elif way in (2, "2", "sell", "Sell", "SELL"):
+        elif isinstance(way, int) and 5 <= way <= 8:
             side = "sell"
+        elif isinstance(m_flag, bool):
+            # m=true: buyer is maker -> seller is taker -> sell.
+            # m=false: seller is maker -> buyer is taker -> buy.
+            side = "sell" if m_flag else "buy"
         else:
+            generic_side = _first_present(payload, ("side",))
+            if generic_side in (1, "1", "buy", "Buy", "BUY"):
+                side = "buy"
+            elif generic_side in (2, "2", "sell", "Sell", "SELL"):
+                side = "sell"
+
+        if side is None:
+            if way not in self._unmapped_ways_seen:
+                self._unmapped_ways_seen.add(way)
+                self.on_unmapped_way(way, payload)
             return
 
-        raw_ts = _first_present(payload, ("ms_t", "timestamp", "time", "t"))
-        try:
-            ts_ms = float(raw_ts)
-            if ts_ms < 10 ** 12:
-                ts_ms *= 1000.0
-        except (TypeError, ValueError):
-            ts_ms = time.time() * 1000.0
+        raw_ts = _first_present(payload, ("created_at", "ms_t", "timestamp", "time", "t"))
+        ts_ms = _parse_timestamp_ms(raw_ts)
 
         trade = {"timestamp": ts_ms, "price": price, "qty": qty, "side": side}
 
