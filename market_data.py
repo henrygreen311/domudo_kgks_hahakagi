@@ -1,6 +1,7 @@
 import asyncio
 import time
 from collections import defaultdict, deque
+from dataclasses import dataclass, field
 from typing import Deque, Dict, List, Optional, Tuple
 
 
@@ -335,3 +336,337 @@ class OrderFlowAnalyzer:
     async def snapshot(self) -> Dict[str, Dict[int, dict]]:
         async with self._lock:
             return {symbol: {w: dict(m) for w, m in windows.items()} for symbol, windows in self._metrics.items()}
+
+
+def compute_liquidity_metrics(book: dict) -> dict:
+    bid_liquidity = book.get("bid_liquidity", 0.0)
+    ask_liquidity = book.get("ask_liquidity", 0.0)
+    total_liquidity = bid_liquidity + ask_liquidity
+
+    if ask_liquidity > 0:
+        bid_ask_ratio = bid_liquidity / ask_liquidity
+    elif bid_liquidity > 0:
+        bid_ask_ratio = float("inf")
+    else:
+        bid_ask_ratio = 0.0
+
+    imbalance = ((bid_liquidity - ask_liquidity) / total_liquidity) if total_liquidity > 0 else 0.0
+
+    best_bid = book.get("best_bid")
+    best_ask = book.get("best_ask")
+    best_bid_size = best_bid[1] if best_bid else 0.0
+    best_ask_size = best_ask[1] if best_ask else 0.0
+
+    if imbalance > 0:
+        dominance = "buyers"
+    elif imbalance < 0:
+        dominance = "sellers"
+    else:
+        dominance = "balanced"
+
+    return {
+        "bid_liquidity": bid_liquidity,
+        "ask_liquidity": ask_liquidity,
+        "bid_ask_ratio": bid_ask_ratio,
+        "imbalance": imbalance,
+        "best_bid_size": best_bid_size,
+        "best_ask_size": best_ask_size,
+        "dominance": dominance,
+    }
+
+
+class LiquidityEngine:
+    def __init__(self, order_book: OrderBookStore) -> None:
+        self._order_book = order_book
+
+    async def get(self, symbol: str) -> Optional[dict]:
+        book = await self._order_book.get_book(symbol)
+        if not book:
+            return None
+        return compute_liquidity_metrics(book)
+
+    async def snapshot(self, symbols: List[str]) -> Dict[str, dict]:
+        result: Dict[str, dict] = {}
+        for symbol in symbols:
+            metrics = await self.get(symbol)
+            if metrics is not None:
+                result[symbol] = metrics
+        return result
+
+
+@dataclass
+class SignalConfig:
+    volume_ratio_threshold: float = 1.5
+    max_spread_pct: float = 0.001
+    price_trend_window_sec: float = 2.0
+    min_price_move_pct: float = 0.0005
+    max_data_age_sec: float = 5.0
+    min_liquidity: float = 0.0
+    order_flow_window_ms: int = 1000
+    min_confirmations: int = 5
+    take_profit_pct: float = 0.002
+    stop_loss_pct: float = 0.001
+    cooldown_sec: float = 5.0
+
+
+@dataclass
+class Signal:
+    symbol: str
+    direction: str
+    confidence: float
+    entry_price: float
+    take_profit: float
+    stop_loss: float
+    timestamp: float
+    reasons: List[str] = field(default_factory=list)
+
+
+class SignalGenerator:
+    def __init__(
+        self,
+        market_data: MarketDataStore,
+        order_flow: OrderFlowAnalyzer,
+        liquidity_engine: LiquidityEngine,
+        config: Optional[SignalConfig] = None,
+    ) -> None:
+        self._market_data = market_data
+        self._order_flow = order_flow
+        self._liquidity_engine = liquidity_engine
+        self.config = config or SignalConfig()
+        self._price_history: Dict[str, Deque[Tuple[float, float]]] = defaultdict(deque)
+        self._last_signal_time: Dict[str, float] = {}
+
+    def _update_price_history(self, symbol: str, price: float, now: float) -> None:
+        history = self._price_history[symbol]
+        history.append((now, price))
+        cutoff = now - self.config.price_trend_window_sec
+        while history and history[0][0] < cutoff:
+            history.popleft()
+
+    async def evaluate(self, symbol: str) -> Optional[Signal]:
+        cfg = self.config
+        now = time.time()
+
+        last_signal_at = self._last_signal_time.get(symbol)
+        if last_signal_at is not None and (now - last_signal_at) < cfg.cooldown_sec:
+            return None
+
+        market = await self._market_data.get(symbol)
+        if not market:
+            return None
+
+        price = market["last_price"]
+        data_age = now - market["last_update"]
+        is_fresh = data_age <= cfg.max_data_age_sec
+        spread_pct = (market["spread"] / price) if price else None
+
+        self._update_price_history(symbol, price, now)
+        history = self._price_history[symbol]
+        price_change_pct = None
+        if len(history) >= 2 and history[0][1]:
+            price_change_pct = (price - history[0][1]) / history[0][1]
+
+        flow = await self._order_flow.get(symbol, cfg.order_flow_window_ms)
+        liquidity = await self._liquidity_engine.get(symbol)
+        if flow is None or liquidity is None:
+            return None
+
+        liquidity_sufficient = liquidity["bid_liquidity"] >= cfg.min_liquidity and liquidity["ask_liquidity"] >= cfg.min_liquidity
+        spread_tight = spread_pct is not None and spread_pct <= cfg.max_spread_pct
+
+        buy_dominant = (flow["sell_volume"] == 0 and flow["buy_volume"] > 0) or (
+            flow["sell_volume"] > 0 and flow["buy_volume"] / flow["sell_volume"] >= cfg.volume_ratio_threshold
+        )
+        sell_dominant = (flow["buy_volume"] == 0 and flow["sell_volume"] > 0) or (
+            flow["buy_volume"] > 0 and flow["sell_volume"] / flow["buy_volume"] >= cfg.volume_ratio_threshold
+        )
+
+        long_checks = {
+            "buy volume exceeds sell volume": buy_dominant,
+            "bid liquidity exceeds ask liquidity": liquidity["bid_liquidity"] > liquidity["ask_liquidity"],
+            "spread below threshold": spread_tight,
+            "price moving upward": price_change_pct is not None and price_change_pct >= cfg.min_price_move_pct,
+            "market data fresh": is_fresh,
+            "liquidity sufficient": liquidity_sufficient,
+        }
+        short_checks = {
+            "sell volume exceeds buy volume": sell_dominant,
+            "ask liquidity exceeds bid liquidity": liquidity["ask_liquidity"] > liquidity["bid_liquidity"],
+            "spread below threshold": spread_tight,
+            "price moving downward": price_change_pct is not None and price_change_pct <= -cfg.min_price_move_pct,
+            "market data fresh": is_fresh,
+            "liquidity sufficient": liquidity_sufficient,
+        }
+
+        long_count = sum(long_checks.values())
+        short_count = sum(short_checks.values())
+
+        if long_count >= cfg.min_confirmations and long_count > short_count:
+            direction = "long"
+            checks = long_checks
+            confirmations = long_count
+        elif short_count >= cfg.min_confirmations and short_count > long_count:
+            direction = "short"
+            checks = short_checks
+            confirmations = short_count
+        else:
+            return None
+
+        confidence = confirmations / len(checks)
+        reasons = [name for name, passed in checks.items() if passed]
+
+        if direction == "long":
+            take_profit = price * (1 + cfg.take_profit_pct)
+            stop_loss = price * (1 - cfg.stop_loss_pct)
+        else:
+            take_profit = price * (1 - cfg.take_profit_pct)
+            stop_loss = price * (1 + cfg.stop_loss_pct)
+
+        self._last_signal_time[symbol] = now
+
+        return Signal(
+            symbol=symbol,
+            direction=direction,
+            confidence=confidence,
+            entry_price=price,
+            take_profit=take_profit,
+            stop_loss=stop_loss,
+            timestamp=now,
+            reasons=reasons,
+        )
+
+
+@dataclass
+class PaperTrade:
+    symbol: str
+    direction: str
+    entry_price: float
+    entry_time: float
+    take_profit: float
+    stop_loss: float
+    mfe_pct: float = 0.0
+    mae_pct: float = 0.0
+
+
+@dataclass
+class PaperTradeResult:
+    symbol: str
+    direction: str
+    entry_price: float
+    exit_price: float
+    entry_time: float
+    exit_time: float
+    outcome: str
+    mfe_pct: float
+    mae_pct: float
+    duration_sec: float
+    gross_profit_pct: float
+    fees_pct: float
+    net_profit_pct: float
+
+
+class PaperTradingEngine:
+    def __init__(self, taker_fee_rate: float = 0.0006, max_trade_duration_sec: float = 60.0) -> None:
+        self._open_trades: Dict[str, PaperTrade] = {}
+        self._results: List[PaperTradeResult] = []
+        self._taker_fee_rate = taker_fee_rate
+        self._max_duration = max_trade_duration_sec
+        self._lock = asyncio.Lock()
+
+    async def has_open_trade(self, symbol: str) -> bool:
+        async with self._lock:
+            return symbol in self._open_trades
+
+    async def open_trade(self, signal: Signal) -> bool:
+        async with self._lock:
+            if signal.symbol in self._open_trades:
+                return False
+            self._open_trades[signal.symbol] = PaperTrade(
+                symbol=signal.symbol,
+                direction=signal.direction,
+                entry_price=signal.entry_price,
+                entry_time=signal.timestamp,
+                take_profit=signal.take_profit,
+                stop_loss=signal.stop_loss,
+            )
+            return True
+
+    async def update(self, symbol: str, current_price: float, now: float) -> Optional[PaperTradeResult]:
+        async with self._lock:
+            trade = self._open_trades.get(symbol)
+            if not trade:
+                return None
+
+            if trade.direction == "long":
+                move_pct = (current_price - trade.entry_price) / trade.entry_price
+                hit_tp = current_price >= trade.take_profit
+                hit_sl = current_price <= trade.stop_loss
+            else:
+                move_pct = (trade.entry_price - current_price) / trade.entry_price
+                hit_tp = current_price <= trade.take_profit
+                hit_sl = current_price >= trade.stop_loss
+
+            trade.mfe_pct = max(trade.mfe_pct, move_pct)
+            trade.mae_pct = min(trade.mae_pct, move_pct)
+
+            timed_out = (now - trade.entry_time) >= self._max_duration
+            if not (hit_tp or hit_sl or timed_out):
+                return None
+
+            outcome = "tp" if hit_tp else "sl" if hit_sl else "timeout"
+            fees_pct = self._taker_fee_rate * 2
+            net_profit_pct = move_pct - fees_pct
+
+            result = PaperTradeResult(
+                symbol=symbol,
+                direction=trade.direction,
+                entry_price=trade.entry_price,
+                exit_price=current_price,
+                entry_time=trade.entry_time,
+                exit_time=now,
+                outcome=outcome,
+                mfe_pct=trade.mfe_pct,
+                mae_pct=trade.mae_pct,
+                duration_sec=now - trade.entry_time,
+                gross_profit_pct=move_pct,
+                fees_pct=fees_pct,
+                net_profit_pct=net_profit_pct,
+            )
+
+            del self._open_trades[symbol]
+            self._results.append(result)
+            return result
+
+    async def stats(self) -> dict:
+        async with self._lock:
+            results = list(self._results)
+
+        total = len(results)
+        wins = [r for r in results if r.net_profit_pct > 0]
+        losses = [r for r in results if r.net_profit_pct <= 0]
+
+        win_rate = (len(wins) / total) if total else 0.0
+        average_profit = (sum(r.net_profit_pct for r in wins) / len(wins)) if wins else 0.0
+        average_loss = (sum(r.net_profit_pct for r in losses) / len(losses)) if losses else 0.0
+
+        gross_win = sum(r.net_profit_pct for r in wins)
+        gross_loss = abs(sum(r.net_profit_pct for r in losses))
+        if gross_loss > 0:
+            profit_factor = gross_win / gross_loss
+        elif gross_win > 0:
+            profit_factor = float("inf")
+        else:
+            profit_factor = 0.0
+
+        return {
+            "total_signals": total,
+            "winning_trades": len(wins),
+            "losing_trades": len(losses),
+            "win_rate": win_rate,
+            "average_profit_pct": average_profit,
+            "average_loss_pct": average_loss,
+            "profit_factor": profit_factor,
+            "total_fees_pct": sum(r.fees_pct for r in results),
+            "net_pnl_pct": sum(r.net_profit_pct for r in results),
+            "average_holding_time_sec": (sum(r.duration_sec for r in results) / total) if total else 0.0,
+        }
