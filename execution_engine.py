@@ -35,6 +35,7 @@ class ExecutionConfig:
     requested_leverage: int = 100
     min_leverage_required: int = 50
     max_open_positions: int = 5
+    max_total_trades: int = 10
     target_net_profit_usdt: float = 0.10
     open_type: str = "isolated"
     fill_poll_interval_sec: float = 0.5
@@ -56,11 +57,13 @@ class OpenPosition:
     size_contracts: float
     contract_size: float
     leverage: int
+    margin_usdt: float
     opening_fee: float
     take_profit_price: float
     tp_order_id: Optional[str]
     opened_at: float = field(default_factory=time.time)
     last_alert_level: int = 0
+    db_id: Optional[int] = None
 
 
 def _round_to_step(value: float, step_str: str, rounding=ROUND_DOWN) -> float:
@@ -97,15 +100,33 @@ class ExecutionEngineBase(ABC):
 class DemoFuturesExecutionEngine(ExecutionEngineBase):
     """Executes signals as real orders against BitMart Demo Futures Trading."""
 
-    def __init__(self, client: BitMartFuturesClient, config: Optional[ExecutionConfig] = None) -> None:
+    def __init__(
+        self,
+        client: BitMartFuturesClient,
+        config: Optional[ExecutionConfig] = None,
+        position_store=None,
+    ) -> None:
         self._client = client
         self.config = config or ExecutionConfig()
+        self._position_store = position_store
         self._open_positions: Dict[str, OpenPosition] = {}
+        self._total_opened = 0
         self._lock = asyncio.Lock()
 
     async def open_count(self) -> int:
         async with self._lock:
             return len(self._open_positions)
+
+    async def total_opened(self) -> int:
+        async with self._lock:
+            return self._total_opened
+
+    async def trades_exhausted(self) -> bool:
+        """True once the lifetime trade cap has been reached AND every
+        position opened under it has since closed — the signal tracker.py
+        uses to shut the bot down for manual review."""
+        async with self._lock:
+            return self._total_opened >= self.config.max_total_trades and len(self._open_positions) == 0
 
     async def has_open_position(self, symbol: str) -> bool:
         async with self._lock:
@@ -122,6 +143,9 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         # Reserve a slot atomically so two concurrent signals can't both
         # open a position once we're at the concurrency cap.
         async with self._lock:
+            if self._total_opened >= cfg.max_total_trades:
+                log.info(f"[execution] lifetime trade limit ({cfg.max_total_trades}) reached — no new trades")
+                return False
             if symbol in self._open_positions:
                 return False
             if len(self._open_positions) >= cfg.max_open_positions:
@@ -140,6 +164,7 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
                 self._open_positions.pop(symbol, None)
                 return False
             self._open_positions[symbol] = opened
+            self._total_opened += 1
         return True
 
     async def _open_position(self, signal: Signal) -> Optional[OpenPosition]:
@@ -240,7 +265,7 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
             f"opening_fee={opening_fee:.6f} take_profit={take_profit_price}"
         )
 
-        return OpenPosition(
+        position = OpenPosition(
             symbol=symbol,
             direction=direction,
             order_id=order_id,
@@ -248,10 +273,16 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
             size_contracts=deal_size,
             contract_size=contract_size,
             leverage=leverage,
+            margin_usdt=cfg.margin_per_trade_usdt,
             opening_fee=opening_fee,
             take_profit_price=take_profit_price,
             tp_order_id=tp_order_id,
         )
+
+        if self._position_store is not None:
+            position.db_id = await self._position_store.record_open(position)
+
+        return position
 
     async def _wait_for_fill(self, symbol: str, order_id: str) -> Optional[dict]:
         cfg = self.config
@@ -358,14 +389,61 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
                 async with self._lock:
                     closed = self._open_positions.pop(symbol, None)
                 if closed is not None:
-                    log.info(
-                        f"[execution] {symbol} position closed (entry={closed.entry_price} "
-                        f"take_profit={closed.take_profit_price}) — slot freed "
-                        f"({len(self._open_positions)}/{self.config.max_open_positions} open)"
-                    )
+                    await self._finalize_closed_position(symbol, closed)
                 continue
 
             await self._check_price_alert(symbol, pos, active)
+
+    async def _finalize_closed_position(self, symbol: str, closed: OpenPosition) -> None:
+        exit_price, realized_pnl, closing_fee, close_reason = await self._get_close_details(symbol, closed)
+        closed_at = time.time()
+
+        log.info(
+            f"[execution] {symbol} position closed (entry={closed.entry_price} exit={exit_price} "
+            f"take_profit={closed.take_profit_price} realized_pnl={realized_pnl} reason={close_reason}) — "
+            f"slot freed ({len(self._open_positions)}/{self.config.max_open_positions} open, "
+            f"{self._total_opened}/{self.config.max_total_trades} lifetime trades)"
+        )
+
+        if self._position_store is not None:
+            await self._position_store.record_close(
+                row_id=closed.db_id,
+                exit_price=exit_price,
+                realized_pnl=realized_pnl,
+                closing_fee=closing_fee,
+                close_reason=close_reason,
+                closed_at=closed_at,
+            )
+
+    async def _get_close_details(self, symbol: str, closed: OpenPosition):
+        """Looks up the fill(s) that closed this position (whether by the
+        take-profit order or by exchange liquidation) to get the real exit
+        price, realized PnL, and closing fee — never estimated."""
+        try:
+            trades = await self._client.get_trades(symbol=symbol)
+        except BitMartAPIError as exc:
+            log.warning(f"[execution] could not fetch closing trades for {symbol}: {exc}")
+            return None, None, None, "unknown"
+
+        opened_at_ms = closed.opened_at * 1000.0
+        close_sides = (2, 3)  # buy_close_short=2, sell_close_long=3
+        closing_trades = [
+            t for t in trades if float(t.get("create_time", 0)) >= opened_at_ms and t.get("side") in close_sides
+        ]
+        if not closing_trades:
+            return None, None, None, "unknown"
+
+        total_vol = sum(float(t.get("vol", 0)) for t in closing_trades)
+        if total_vol <= 0:
+            return None, None, None, "unknown"
+
+        exit_price = sum(float(t.get("price", 0)) * float(t.get("vol", 0)) for t in closing_trades) / total_vol
+        realized_pnl = sum(float(t.get("realised_profit", 0)) for t in closing_trades)
+        closing_fee = sum(float(t.get("paid_fees", 0)) for t in closing_trades)
+
+        tp = closed.take_profit_price
+        close_reason = "take_profit" if tp and abs(exit_price - tp) / tp < 0.003 else "liquidation_or_other"
+        return exit_price, realized_pnl, closing_fee, close_reason
 
     async def _check_price_alert(self, symbol: str, pos: OpenPosition, active: dict) -> None:
         """Logs a movement update once the position has moved another
