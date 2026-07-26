@@ -441,14 +441,14 @@ class LiquidityEngine:
 class SignalConfig:
     volume_ratio_threshold: float = 1.5
     max_spread_pct: float = 0.001
-    price_trend_window_sec: float = 2.0
+    price_trend_window_sec: float = 30.0
     min_price_move_pct: float = 0.0005
     max_data_age_sec: float = 5.0
     min_liquidity: float = 0.0
     order_flow_window_ms: int = 1000
     min_confirmations: int = 5
     take_profit_pct: float = 0.002
-    stop_loss_pct: float = 0.001
+    stop_loss_pct: float = 0.005
     cooldown_sec: float = 5.0
 
 
