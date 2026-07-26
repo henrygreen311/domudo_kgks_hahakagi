@@ -16,7 +16,6 @@ bookkeeping here.
 
 import asyncio
 import logging
-import math
 import time
 import uuid
 from abc import ABC, abstractmethod
@@ -40,6 +39,12 @@ class ExecutionConfig:
     open_type: str = "isolated"
     fill_poll_interval_sec: float = 0.5
     fill_timeout_sec: float = 15.0
+    # Log a price-movement update whenever a position moves another
+    # `alert_move_step_pct` percentage points further from its entry price
+    # (in either direction). E.g. with 0.5, alerts fire at +0.5%, +1.0%,
+    # -0.5%, -1.0%, etc. — never more than once per step, so the log isn't
+    # spammed on every monitor tick.
+    alert_move_step_pct: float = 0.5
 
 
 @dataclass
@@ -55,6 +60,7 @@ class OpenPosition:
     take_profit_price: float
     tp_order_id: Optional[str]
     opened_at: float = field(default_factory=time.time)
+    last_alert_level: int = 0
 
 
 def _round_to_step(value: float, step_str: str, rounding=ROUND_DOWN) -> float:
@@ -331,26 +337,73 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         zero remaining size has been closed by its take-profit order or by
         exchange liquidation — either way, we free the slot. No stop loss and
         no timeout logic exist here by design: BitMart's own liquidation
-        engine is the only thing that can end a losing position."""
-        async with self._lock:
-            symbols = [s for s, p in self._open_positions.items() if p is not None]
+        engine is the only thing that can end a losing position.
 
-        for symbol in symbols:
+        While a position stays open, it's also checked for a significant
+        price move (see `_check_price_alert`) so a trade running against —
+        or in favor of — us gets surfaced without flooding the log."""
+        async with self._lock:
+            tracked = {s: p for s, p in self._open_positions.items() if p is not None}
+
+        for symbol, pos in tracked.items():
             try:
                 positions = await self._client.get_position(symbol=symbol)
             except BitMartAPIError as exc:
                 log.warning(f"[execution] position check failed for {symbol}: {exc}")
                 continue
 
-            still_open = any(float(p.get("current_amount", 0)) > 0 for p in positions)
-            if still_open:
+            active = next((p for p in positions if float(p.get("current_amount", 0)) > 0), None)
+
+            if active is None:
+                async with self._lock:
+                    closed = self._open_positions.pop(symbol, None)
+                if closed is not None:
+                    log.info(
+                        f"[execution] {symbol} position closed (entry={closed.entry_price} "
+                        f"take_profit={closed.take_profit_price}) — slot freed "
+                        f"({len(self._open_positions)}/{self.config.max_open_positions} open)"
+                    )
                 continue
 
-            async with self._lock:
-                closed = self._open_positions.pop(symbol, None)
-            if closed is not None:
-                log.info(
-                    f"[execution] {symbol} position closed (entry={closed.entry_price} "
-                    f"take_profit={closed.take_profit_price}) — slot freed "
-                    f"({len(self._open_positions)}/{self.config.max_open_positions} open)"
-                )
+            await self._check_price_alert(symbol, pos, active)
+
+    async def _check_price_alert(self, symbol: str, pos: OpenPosition, active: dict) -> None:
+        """Logs a movement update once the position has moved another
+        `alert_move_step_pct` further from entry than the last alert,
+        in either direction. Purely observational — it never touches the
+        take-profit order or closes anything."""
+        cfg = self.config
+        step = cfg.alert_move_step_pct
+        if step <= 0:
+            return
+
+        try:
+            mark_price = float(active.get("mark_price", 0))
+            unrealized_pnl = float(active.get("unrealized_pnl", 0))
+            liquidation_price = active.get("liquidation_price")
+        except (TypeError, ValueError):
+            return
+        if mark_price <= 0 or pos.entry_price <= 0:
+            return
+
+        if pos.direction == "long":
+            move_pct = (mark_price - pos.entry_price) / pos.entry_price * 100.0
+        else:
+            move_pct = (pos.entry_price - mark_price) / pos.entry_price * 100.0
+
+        level = int(move_pct / step)  # truncates toward zero -> one bucket per `step`
+        if level == pos.last_alert_level:
+            return
+
+        async with self._lock:
+            current = self._open_positions.get(symbol)
+            if current is None:
+                return  # closed out from under us between the check above and here
+            current.last_alert_level = level
+
+        outlook = "favorable" if move_pct >= 0 else "adverse"
+        log.info(
+            f"[monitor] {symbol} {pos.direction.upper()} move {move_pct:+.2f}% ({outlook}) — "
+            f"entry={pos.entry_price} mark={mark_price} unrealized_pnl={unrealized_pnl:+.4f} "
+            f"take_profit={pos.take_profit_price} liquidation={liquidation_price} leverage={pos.leverage}x"
+        )
