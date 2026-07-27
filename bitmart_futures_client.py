@@ -197,6 +197,23 @@ class BitMartFuturesClient:
         data = await self._request("GET", "/contract/private/transaction-history", params=params, auth="keyed")
         return data or []
 
+    async def get_order_history(
+        self, symbol: str, start_time: Optional[int] = None, end_time: Optional[int] = None
+    ) -> List[dict]:
+        """Returns filled/cancelled orders for `symbol`. `start_time`/`end_time`
+        are Unix seconds (not ms — this endpoint differs from get_trades).
+        Used to resolve a triggered TP/SL plan order's real execution
+        order_id: BitMart assigns that execution a brand-new order_id, and
+        the only link back to the plan order is `client_order_id`, which is
+        formatted as `PLAN_{original_plan_order_id}`."""
+        params: Dict[str, Any] = {"symbol": symbol}
+        if start_time is not None:
+            params["start_time"] = int(start_time)
+        if end_time is not None:
+            params["end_time"] = int(end_time)
+        data = await self._request("GET", "/contract/private/order-history", params=params, auth="keyed")
+        return data or []
+
     # ------------------------------------------------------------------
     # Trading (SIGNED auth)
     # ------------------------------------------------------------------

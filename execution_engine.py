@@ -454,20 +454,38 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
     async def _get_close_details(self, symbol: str, closed: OpenPosition):
         """Looks up the fill(s) that closed this position (whether by the
         take-profit order or by exchange liquidation) to get the real exit
-        price, realized PnL, and closing fee — never estimated."""
+        price, realized PnL, and closing fee — never estimated.
+
+        A triggered TP/SL plan order executes as a brand-new order with its
+        own order_id — it does NOT reuse the id returned when the plan order
+        was submitted. The only link back to that submission is
+        `client_order_id`, which BitMart formats as `PLAN_{plan_order_id}`.
+        So to tell a take-profit fill apart from a liquidation, we first look
+        through order-history for an execution whose client_order_id
+        references our tp_order_id, and use *that* order_id — not
+        closed.tp_order_id — to pull the matching trades."""
+        resolved_order_id = await self._resolve_tp_execution_order_id(symbol, closed)
+
         opened_at_ms = closed.opened_at * 1000.0
         close_sides = (2, 3)  # buy_close_short=2, sell_close_long=3
 
         closing_trades: List[dict] = []
         for attempt in range(1, 4):
             try:
-                trades = await self._client.get_trades(symbol=symbol)
+                if resolved_order_id:
+                    trades = await self._client.get_trades(symbol=symbol, order_id=resolved_order_id)
+                else:
+                    trades = await self._client.get_trades(symbol=symbol)
             except BitMartAPIError as exc:
                 log.warning(f"[execution] could not fetch closing trades for {symbol}: {exc}")
                 trades = []
-            closing_trades = [
-                t for t in trades if float(t.get("create_time", 0)) >= opened_at_ms and t.get("side") in close_sides
-            ]
+
+            if resolved_order_id:
+                closing_trades = trades  # already filtered server-side by order_id
+            else:
+                closing_trades = [
+                    t for t in trades if float(t.get("create_time", 0)) >= opened_at_ms and t.get("side") in close_sides
+                ]
             if closing_trades:
                 break
             if attempt < 3:
@@ -484,14 +502,26 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         realized_pnl = sum(float(t.get("realised_profit", 0)) for t in closing_trades)
         closing_fee = sum(float(t.get("paid_fees", 0)) for t in closing_trades)
 
-        # Determine *why* it closed by checking whether the fill actually
-        # belongs to our take-profit order — comparing exit price to the TP
-        # price is unreliable (a liquidation can land close to the TP price
-        # by coincidence).
-        tp_order_id = str(closed.tp_order_id) if closed.tp_order_id else None
-        filled_by_tp = tp_order_id is not None and any(str(t.get("order_id")) == tp_order_id for t in closing_trades)
-        close_reason = "take_profit" if filled_by_tp else "liquidation_or_other"
+        close_reason = "take_profit" if resolved_order_id else "liquidation_or_other"
         return exit_price, realized_pnl, closing_fee, close_reason
+
+    async def _resolve_tp_execution_order_id(self, symbol: str, closed: OpenPosition) -> Optional[str]:
+        if not closed.tp_order_id:
+            return None
+        try:
+            history = await self._client.get_order_history(
+                symbol, start_time=int(closed.opened_at) - 5, end_time=int(time.time()) + 5
+            )
+        except BitMartAPIError as exc:
+            log.warning(f"[execution] could not fetch order history for {symbol}: {exc}")
+            return None
+
+        needle = str(closed.tp_order_id)
+        for entry in history:
+            client_order_id = str(entry.get("client_order_id") or "")
+            if needle in client_order_id and str(entry.get("state")) == "4":
+                return str(entry.get("order_id"))
+        return None
 
     async def _check_price_alert(self, symbol: str, pos: OpenPosition, active: dict) -> None:
         """Logs a movement update once the position has moved another

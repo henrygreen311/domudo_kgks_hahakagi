@@ -56,10 +56,17 @@ class MarketDataStore:
 
 
 class OrderBookStore:
-    def __init__(self, depth_levels: int = 20) -> None:
+    def __init__(self, depth_levels: int = 20, history_window_ms: float = 2000.0, history_top_levels: int = 10) -> None:
         self._books: Dict[str, Dict[str, List[Tuple[float, float]]]] = {}
         self._depth_levels = depth_levels
         self._lock = asyncio.Lock()
+        # Rolling per-symbol history of recent snapshots (timestamp_ms, {"bids": [...], "asks": [...]})
+        # so higher-level consumers (e.g. sweep detection) can compare book
+        # state now vs a moment ago without each maintaining their own feed.
+        self._history: Dict[str, Deque[Tuple[float, dict]]] = defaultdict(deque)
+        self._history_window_ms = history_window_ms
+        self._history_top_levels = history_top_levels
+        self._last_update: Dict[str, float] = {}
 
     async def apply_depth_update(self, payload: dict) -> None:
         symbol = payload.get("symbol")
@@ -79,10 +86,18 @@ class OrderBookStore:
             levels.append((price, vol))
 
         levels.sort(key=lambda x: x[0], reverse=(side == "bids"))
+        now_ms = time.time() * 1000.0
 
         async with self._lock:
             book = self._books.setdefault(symbol, {"bids": [], "asks": []})
             book[side] = levels
+            self._last_update[symbol] = now_ms
+
+            history = self._history[symbol]
+            history.append((now_ms, {"bids": list(book["bids"][: self._history_top_levels]), "asks": list(book["asks"][: self._history_top_levels])}))
+            cutoff = now_ms - self._history_window_ms
+            while len(history) > 1 and history[0][0] < cutoff:
+                history.popleft()
 
     async def get_book(self, symbol: str) -> Optional[dict]:
         async with self._lock:
@@ -91,6 +106,7 @@ class OrderBookStore:
                 return None
             bids = book.get("bids", [])
             asks = book.get("asks", [])
+            last_update = self._last_update.get(symbol)
 
         best_bid = bids[0] if bids else None
         best_ask = asks[0] if asks else None
@@ -106,7 +122,19 @@ class OrderBookStore:
             "bid_liquidity": bid_liquidity,
             "ask_liquidity": ask_liquidity,
             "spread": spread,
+            "last_update": last_update,
         }
+
+    async def get_book_history(self, symbol: str, window_ms: float) -> List[Tuple[float, dict]]:
+        """Returns (timestamp_ms, {"bids": [...], "asks": [...]}) snapshots for
+        `symbol` within the last `window_ms`, oldest first. Used by the event
+        confirmation layer to detect order-book sweeps (levels disappearing
+        between an earlier snapshot and now)."""
+        now_ms = time.time() * 1000.0
+        cutoff = now_ms - window_ms
+        async with self._lock:
+            history = list(self._history.get(symbol, ()))
+        return [snap for snap in history if snap[0] >= cutoff]
 
     async def symbols(self) -> List[str]:
         async with self._lock:
@@ -115,6 +143,8 @@ class OrderBookStore:
     async def remove(self, symbol: str) -> None:
         async with self._lock:
             self._books.pop(symbol, None)
+            self._history.pop(symbol, None)
+            self._last_update.pop(symbol, None)
 
 
 DEFAULT_RANKING_WEIGHTS = {
@@ -323,6 +353,10 @@ class TradeStore:
         async with self._lock:
             self._trades.pop(symbol, None)
 
+    @property
+    def windows_ms(self) -> Tuple[int, ...]:
+        return self._windows_ms
+
 
 def compute_order_flow_metrics(
     trades: List[dict],
@@ -460,6 +494,10 @@ class OrderFlowAnalyzer:
         async with self._lock:
             return {symbol: {w: dict(m) for w, m in windows.items()} for symbol, windows in self._metrics.items()}
 
+    @property
+    def windows_ms(self) -> Tuple[int, ...]:
+        return self._windows_ms
+
 
 def compute_liquidity_metrics(book: dict, distance_bands: Optional[Tuple[float, ...]] = None) -> dict:
     bid_liquidity = book.get("bid_liquidity", 0.0)
@@ -587,6 +625,12 @@ class SignalConfig:
     stop_loss_pct: float = 0.005
     cooldown_sec: float = 5.0
 
+    # --- Prerequisite / quality checks (section 1) ---
+    # These gate whether a symbol is evaluated at all. They are NOT
+    # predictive and never contribute to confidence — a signal is only
+    # produced when every one of these passes.
+    max_order_book_age_sec: float = 5.0  # proxy for "exchange connection healthy"
+
     # --- New order-flow features (each toggled independently, all off by default) ---
     enable_aggressive_order_detection: bool = False
     aggressive_dominance_pct: float = 0.65
@@ -615,6 +659,7 @@ class Signal:
     stop_loss: float
     timestamp: float
     reasons: List[str] = field(default_factory=list)
+    prerequisites: List[str] = field(default_factory=list)
 
 
 class SignalGenerator:
@@ -623,11 +668,13 @@ class SignalGenerator:
         market_data: MarketDataStore,
         order_flow: OrderFlowAnalyzer,
         liquidity_engine: LiquidityEngine,
+        order_book: OrderBookStore,
         config: Optional[SignalConfig] = None,
     ) -> None:
         self._market_data = market_data
         self._order_flow = order_flow
         self._liquidity_engine = liquidity_engine
+        self._order_book = order_book
         self.config = config or SignalConfig()
         self._price_history: Dict[str, Deque[Tuple[float, float]]] = defaultdict(deque)
         self._last_signal_time: Dict[str, float] = {}
@@ -663,16 +710,40 @@ class SignalGenerator:
             price_change_pct = (price - history[0][1]) / history[0][1]
 
         flow = await self._order_flow.get(symbol, cfg.order_flow_window_ms)
+        book = await self._order_book.get_book(symbol)
         liquidity = await self._liquidity_engine.get(
             symbol,
             distance_bands=cfg.book_imbalance_distance_bands if cfg.enable_book_imbalance_by_distance else None,
         )
-        if flow is None or liquidity is None:
+        if flow is None or liquidity is None or book is None:
             return None
 
         liquidity_sufficient = liquidity["bid_liquidity"] >= cfg.min_liquidity and liquidity["ask_liquidity"] >= cfg.min_liquidity
         spread_tight = spread_pct is not None and spread_pct <= cfg.max_spread_pct
 
+        book_last_update = book.get("last_update")
+        connection_healthy = book_last_update is not None and (now - book_last_update / 1000.0) <= cfg.max_order_book_age_sec
+        book_synchronized = (
+            book.get("best_bid") is not None
+            and book.get("best_ask") is not None
+            and book["best_bid"][0] < book["best_ask"][0]
+        )
+
+        # --- Section 1: prerequisite / quality checks ---
+        # These are NOT predictive signals and must never affect confidence.
+        # If any of these fail, we don't evaluate direction or open a trade
+        # at all — trading conditions simply aren't acceptable right now.
+        prerequisite_checks = {
+            "spread below threshold": spread_tight,
+            "market data fresh": is_fresh,
+            "liquidity sufficient": liquidity_sufficient,
+            "exchange connection healthy": connection_healthy,
+            "order book synchronized": book_synchronized,
+        }
+        if not all(prerequisite_checks.values()):
+            return None
+
+        # --- Section 2: directional signal layer (predictive, confidence-bearing) ---
         buy_dominant = (flow["sell_volume"] == 0 and flow["buy_volume"] > 0) or (
             flow["sell_volume"] > 0 and flow["buy_volume"] / flow["sell_volume"] >= cfg.volume_ratio_threshold
         )
@@ -683,21 +754,15 @@ class SignalGenerator:
         long_checks = {
             "buy volume exceeds sell volume": buy_dominant,
             "bid liquidity exceeds ask liquidity": liquidity["bid_liquidity"] > liquidity["ask_liquidity"],
-            "spread below threshold": spread_tight,
             "price moving upward": price_change_pct is not None and price_change_pct >= cfg.min_price_move_pct,
-            "market data fresh": is_fresh,
-            "liquidity sufficient": liquidity_sufficient,
         }
         short_checks = {
             "sell volume exceeds buy volume": sell_dominant,
             "ask liquidity exceeds bid liquidity": liquidity["ask_liquidity"] > liquidity["bid_liquidity"],
-            "spread below threshold": spread_tight,
             "price moving downward": price_change_pct is not None and price_change_pct <= -cfg.min_price_move_pct,
-            "market data fresh": is_fresh,
-            "liquidity sufficient": liquidity_sufficient,
         }
 
-        # --- New order-flow checks, merged into existing scoring (each independently toggled) ---
+        # --- Additional directional order-flow checks, each independently toggled ---
         if cfg.enable_aggressive_order_detection:
             long_checks["aggressive buyers in control"] = flow.get("aggressive_buy_pct", 0.0) >= cfg.aggressive_dominance_pct
             short_checks["aggressive sellers in control"] = flow.get("aggressive_sell_pct", 0.0) >= cfg.aggressive_dominance_pct
@@ -744,8 +809,11 @@ class SignalGenerator:
         else:
             return None
 
+        # Confidence reflects directional probability only — quality/prerequisite
+        # checks already gated whether we got this far and never factor in here.
         confidence = confirmations / len(checks)
         reasons = [name for name, passed in checks.items() if passed]
+        passed_prerequisites = [name for name, passed in prerequisite_checks.items() if passed]
 
         if direction == "long":
             take_profit = price * (1 + cfg.take_profit_pct)
@@ -765,4 +833,5 @@ class SignalGenerator:
             stop_loss=stop_loss,
             timestamp=now,
             reasons=reasons,
+            prerequisites=passed_prerequisites,
         )
