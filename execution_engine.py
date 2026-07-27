@@ -1,12 +1,16 @@
 """
-Execution engine for BitMart Demo Futures trading.
+Execution engine for OKX Demo Trading (USDT-margined perpetual swaps).
 
 This module replaces the old paper-trading simulator with a real (demo)
-execution path: it opens actual Demo Futures positions through the BitMart
+execution path: it opens actual Demo Trading positions through the OKX
 API, waits for the fill, computes a take-profit price from the *actual*
 filled price and *actual* opening fee (never a hardcoded fee assumption),
-and places that take-profit on the exchange. It also tracks how many
-positions are open so the bot never exceeds the configured concurrency cap.
+and places that take-profit on the exchange as a standalone TP algo order.
+It also tracks how many positions are open so the bot never exceeds the
+configured concurrency cap.
+
+Assumes the OKX (demo) account is in **net (one-way)** position mode — see
+okx_futures_client.py's module docstring for details.
 
 `ExecutionEngineBase` exists so a live-trading engine can be added later by
 subclassing and swapping only the parts that differ (e.g. credential
@@ -23,10 +27,10 @@ from dataclasses import dataclass, field
 from decimal import ROUND_DOWN, ROUND_UP, Decimal
 from typing import Dict, List, Optional
 
-from bitmart_futures_client import BitMartAPIError, BitMartFuturesClient
+from okx_futures_client import OKXAPIError, OKXFuturesClient
 from market_data import Signal
 
-log = logging.getLogger("bitmart_futures.execution")
+log = logging.getLogger("okx_futures.execution")
 
 
 @dataclass
@@ -98,11 +102,11 @@ class ExecutionEngineBase(ABC):
 
 
 class DemoFuturesExecutionEngine(ExecutionEngineBase):
-    """Executes signals as real orders against BitMart Demo Futures Trading."""
+    """Executes signals as real orders against OKX Demo Trading."""
 
     def __init__(
         self,
-        client: BitMartFuturesClient,
+        client: OKXFuturesClient,
         config: Optional[ExecutionConfig] = None,
         position_store=None,
     ) -> None:
@@ -172,7 +176,7 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
 
         try:
             contract = await self._client.get_contract_details(symbol)
-        except BitMartAPIError as exc:
+        except OKXAPIError as exc:
             log.error(f"[execution] could not fetch contract details for {symbol}: {exc}")
             return None
 
@@ -206,7 +210,7 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
 
         try:
             await self._client.submit_leverage(symbol, leverage, cfg.open_type)
-        except BitMartAPIError as exc:
+        except OKXAPIError as exc:
             log.error(f"[execution] failed to set leverage for {symbol}: {exc}")
             return None
 
@@ -222,7 +226,7 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
                 open_type=cfg.open_type,
                 client_order_id=client_order_id,
             )
-        except BitMartAPIError as exc:
+        except OKXAPIError as exc:
             log.error(f"[execution] order submission failed for {symbol}: {exc}")
             return None
 
@@ -290,7 +294,7 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         while time.time() < deadline:
             try:
                 detail = await self._client.get_order(symbol, order_id)
-            except BitMartAPIError as exc:
+            except OKXAPIError as exc:
                 log.warning(f"[execution] order status check failed for {symbol} {order_id}: {exc}")
                 await asyncio.sleep(cfg.fill_poll_interval_sec)
                 continue
@@ -327,7 +331,7 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         for attempt in range(1, attempts + 1):
             try:
                 trades = await self._client.get_trades(symbol=symbol, order_id=order_id)
-            except BitMartAPIError as exc:
+            except OKXAPIError as exc:
                 log.warning(f"[execution] fee lookup attempt {attempt}/{attempts} failed for {symbol} {order_id}: {exc}")
                 trades = []
             total_fee = sum(float(t.get("paid_fees", 0)) for t in trades)
@@ -341,7 +345,7 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         try:
             rate_info = await self._client.get_trade_fee_rate(symbol)
             taker_rate = float(rate_info.get("taker_fee_rate", 0))
-        except BitMartAPIError as exc:
+        except OKXAPIError as exc:
             log.warning(f"[execution] could not fetch trade fee rate for {symbol}: {exc} — assuming 0 fee")
             return 0.0
         return notional_usdt * taker_rate
@@ -391,7 +395,7 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
                 category="market",
             )
             return str(result.get("order_id")) if result else None
-        except BitMartAPIError as exc:
+        except OKXAPIError as exc:
             log.error(f"[execution] failed to place take-profit for {symbol}: {exc}")
             return None
 
@@ -403,7 +407,7 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         """Checks each tracked position against the exchange. A position with
         zero remaining size has been closed by its take-profit order or by
         exchange liquidation — either way, we free the slot. No stop loss and
-        no timeout logic exist here by design: BitMart's own liquidation
+        no timeout logic exist here by design: OKX's own liquidation
         engine is the only thing that can end a losing position.
 
         While a position stays open, it's also checked for a significant
@@ -415,7 +419,7 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         for symbol, pos in tracked.items():
             try:
                 positions = await self._client.get_position(symbol=symbol)
-            except BitMartAPIError as exc:
+            except OKXAPIError as exc:
                 log.warning(f"[execution] position check failed for {symbol}: {exc}")
                 continue
 
@@ -453,21 +457,21 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
 
     async def _get_close_details(self, symbol: str, closed: OpenPosition):
         """Looks up the fill(s) that closed this position (whether by the
-        take-profit order or by exchange liquidation) to get the real exit
-        price, realized PnL, and closing fee — never estimated.
+        take-profit algo order or by exchange liquidation) to get the real
+        exit price, realized PnL, and closing fee — never estimated.
 
-        A triggered TP/SL plan order executes as a brand-new order with its
-        own order_id — it does NOT reuse the id returned when the plan order
-        was submitted. The only link back to that submission is
-        `client_order_id`, which BitMart formats as `PLAN_{plan_order_id}`.
-        So to tell a take-profit fill apart from a liquidation, we first look
-        through order-history for an execution whose client_order_id
-        references our tp_order_id, and use *that* order_id — not
-        closed.tp_order_id — to pull the matching trades."""
+        OKX's TP algo order (`tp_order_id` = the algoId returned when it was
+        placed) executes on trigger as a brand-new regular order with its
+        own ordId. We first check the algo order's own status — once it's
+        "effective" (triggered), OKX links back to the ordId(s) it spawned —
+        and use *that* to pull the matching fills. If we can't resolve it
+        (e.g. the position closed via liquidation instead), we fall back to
+        every fill on the closing side since the position was opened."""
         resolved_order_id = await self._resolve_tp_execution_order_id(symbol, closed)
 
         opened_at_ms = closed.opened_at * 1000.0
-        close_sides = (2, 3)  # buy_close_short=2, sell_close_long=3
+        # Closing a long is a sell; closing a short is a buy.
+        closing_side = "sell" if closed.direction == "long" else "buy"
 
         closing_trades: List[dict] = []
         for attempt in range(1, 4):
@@ -476,7 +480,7 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
                     trades = await self._client.get_trades(symbol=symbol, order_id=resolved_order_id)
                 else:
                     trades = await self._client.get_trades(symbol=symbol)
-            except BitMartAPIError as exc:
+            except OKXAPIError as exc:
                 log.warning(f"[execution] could not fetch closing trades for {symbol}: {exc}")
                 trades = []
 
@@ -484,7 +488,8 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
                 closing_trades = trades  # already filtered server-side by order_id
             else:
                 closing_trades = [
-                    t for t in trades if float(t.get("create_time", 0)) >= opened_at_ms and t.get("side") in close_sides
+                    t for t in trades
+                    if float(t.get("create_time", 0) or 0) >= opened_at_ms and t.get("side") == closing_side
                 ]
             if closing_trades:
                 break
@@ -494,33 +499,38 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         if not closing_trades:
             return None, None, None, "unknown"
 
-        total_vol = sum(float(t.get("vol", 0)) for t in closing_trades)
+        total_vol = sum(float(t.get("vol", 0) or 0) for t in closing_trades)
         if total_vol <= 0:
             return None, None, None, "unknown"
 
-        exit_price = sum(float(t.get("price", 0)) * float(t.get("vol", 0)) for t in closing_trades) / total_vol
-        realized_pnl = sum(float(t.get("realised_profit", 0)) for t in closing_trades)
-        closing_fee = sum(float(t.get("paid_fees", 0)) for t in closing_trades)
+        exit_price = sum(float(t.get("price", 0) or 0) * float(t.get("vol", 0) or 0) for t in closing_trades) / total_vol
+        realized_pnl = sum(float(t.get("realised_profit", 0) or 0) for t in closing_trades)
+        closing_fee = sum(float(t.get("paid_fees", 0) or 0) for t in closing_trades)
 
         close_reason = "take_profit" if resolved_order_id else "liquidation_or_other"
         return exit_price, realized_pnl, closing_fee, close_reason
 
     async def _resolve_tp_execution_order_id(self, symbol: str, closed: OpenPosition) -> Optional[str]:
+        """`closed.tp_order_id` is the algoId of the TP algo order placed at
+        open time. Checks whether it has triggered ("effective") and, if
+        so, returns the ordId of the order it spawned so fills can be
+        pulled precisely. Verify `get_algo_order_status`'s field names
+        against a live demo response — OKX's exact linkage field for a
+        triggered conditional order's child ordId should be confirmed
+        before relying on this in production; the fallback path above
+        (scan closing-side fills since open) still produces correct P&L
+        even if this returns None."""
         if not closed.tp_order_id:
             return None
         try:
-            history = await self._client.get_order_history(
-                symbol, start_time=int(closed.opened_at) - 5, end_time=int(time.time()) + 5
-            )
-        except BitMartAPIError as exc:
-            log.warning(f"[execution] could not fetch order history for {symbol}: {exc}")
+            status = await self._client.get_algo_order_status(symbol, closed.tp_order_id)
+        except OKXAPIError as exc:
+            log.warning(f"[execution] could not fetch TP algo order status for {symbol}: {exc}")
             return None
-
-        needle = str(closed.tp_order_id)
-        for entry in history:
-            client_order_id = str(entry.get("client_order_id") or "")
-            if needle in client_order_id and str(entry.get("state")) == "4":
-                return str(entry.get("order_id"))
+        if not status:
+            return None
+        if status.get("state") == "effective" and status.get("ord_id"):
+            return str(status.get("ord_id"))
         return None
 
     async def _check_price_alert(self, symbol: str, pos: OpenPosition, active: dict) -> None:

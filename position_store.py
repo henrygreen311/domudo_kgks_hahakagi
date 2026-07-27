@@ -15,7 +15,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional
 
-log = logging.getLogger("bitmart_futures.position_store")
+log = logging.getLogger("okx_futures.position_store")
 
 TABLE = "position_history"
 

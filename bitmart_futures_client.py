@@ -1,48 +1,83 @@
 """
-BitMart USDT-M Futures REST client.
+OKX v5 USDT-margined Perpetual Swap REST client.
 
-Supports both the production and Demo Trading environments. Demo Trading uses
-the same API key/secret/memo as production but a different base URL
-(https://demo-api-cloud-v2.bitmart.com). All endpoint paths and signing rules
-are identical between the two environments.
+Supports both production and OKX's Demo Trading environment. Unlike BitMart
+(which uses a separate demo host), OKX Demo Trading uses the SAME REST host
+as production (https://www.okx.com) and is toggled purely with the
+`x-simulated-trading: 1` header on every request. The WebSocket side is the
+opposite — demo trading uses a different host (wspap.okx.com) — see
+tracker.py / test_ws.py for that.
 
-Auth levels used here:
-  - NONE:   public market data, no headers required.
-  - KEYED:  private GET endpoints, only the X-BM-KEY header is required.
-  - SIGNED: private POST endpoints, require X-BM-KEY, X-BM-TIMESTAMP and
-            X-BM-SIGN = HMAC_SHA256(secret, f"{timestamp_ms}#{memo}#{body}")
+Auth (all private endpoints):
+  OK-ACCESS-KEY, OK-ACCESS-SIGN, OK-ACCESS-TIMESTAMP, OK-ACCESS-PASSPHRASE
+  headers, where:
+    sign = base64(HMAC_SHA256(secret, f"{timestamp}{method}{requestPath}{body}"))
+    timestamp is ISO8601 with milliseconds, e.g. 2024-01-01T00:00:00.000Z
+
+Position mode assumption
+-------------------------
+This client assumes the OKX (demo) account is set to **net (one-way)**
+position mode (Trade Settings -> Position Mode -> Net). That matches how
+the bot already behaves (it never holds simultaneous long+short on the same
+symbol), and keeps every order call posSide-free: `side=buy` opens/adds
+long exposure, `side=sell` opens/adds short exposure, and closes go through
+the opposite side with `reduceOnly=true`. If the account is in long/short
+(hedge) mode instead, OKX will reject orders here with a posSide-related
+error — switch the account to net mode before running this.
+
+Symbol format
+-------------
+Callers pass OKX instIds directly, e.g. "BTC-USDT-SWAP", not "BTCUSDT".
+
+Field-mapping note
+-------------------
+To keep execution_engine.py's business logic close to its original shape,
+several methods below translate OKX's native field names into the same
+keys the old BitMart client returned (e.g. `current_amount`, `mark_price`,
+`deal_avg_price`, `paid_fees`). Where OKX's exact response shape for a
+less-common field (e.g. per-fill realized PnL) couldn't be double-checked
+against a live account, it's flagged with a comment — verify against a
+real demo response before trusting the numbers in production.
 """
 
 import asyncio
+import base64
 import hashlib
 import hmac
 import json
 import logging
 import time
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import requests
 
-log = logging.getLogger("bitmart_futures.client")
+log = logging.getLogger("okx_futures.client")
 
-PROD_BASE_URL = "https://api-cloud-v2.bitmart.com"
-DEMO_BASE_URL = "https://demo-api-cloud-v2.bitmart.com"
+BASE_URL = "https://www.okx.com"
 
-USER_AGENT = "bitmart-futures-bot/1.0"
+USER_AGENT = "okx-futures-bot/1.0"
+
+INST_TYPE = "SWAP"
 
 
-class BitMartAPIError(Exception):
-    """Raised when BitMart returns a non-success application code, or the
-    request fails after all retries have been exhausted."""
+class OKXAPIError(Exception):
+    """Raised when OKX returns a non-"0" `code`, or the request fails after
+    all retries have been exhausted."""
 
-    def __init__(self, message: str, code: Optional[int] = None, payload: Optional[dict] = None) -> None:
+    def __init__(self, message: str, code: Optional[str] = None, payload: Optional[dict] = None) -> None:
         super().__init__(message)
         self.code = code
         self.payload = payload
 
 
-class BitMartFuturesClient:
-    """Thin async wrapper around the BitMart Futures v2 REST API.
+def _iso_timestamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.") + f"{datetime.now(timezone.utc).microsecond // 1000:03d}Z"
+
+
+class OKXFuturesClient:
+    """Thin async wrapper around the OKX v5 Trade/Account/Public REST API,
+    scoped to USDT-margined perpetual swaps.
 
     All network I/O happens via `requests`, executed in a worker thread via
     `asyncio.to_thread` so the async event loop is never blocked.
@@ -52,7 +87,7 @@ class BitMartFuturesClient:
         self,
         api_key: str,
         api_secret: str,
-        memo: str,
+        passphrase: str,
         demo_trading: bool = True,
         timeout_sec: float = 10.0,
         max_retries: int = 3,
@@ -60,9 +95,9 @@ class BitMartFuturesClient:
     ) -> None:
         self._api_key = api_key
         self._api_secret = api_secret
-        self._memo = memo
-        self.base_url = DEMO_BASE_URL if demo_trading else PROD_BASE_URL
+        self._passphrase = passphrase
         self.demo_trading = demo_trading
+        self.base_url = BASE_URL
         self._timeout = timeout_sec
         self._max_retries = max_retries
         self._retry_base_delay = retry_base_delay_sec
@@ -72,9 +107,10 @@ class BitMartFuturesClient:
     # Low-level request plumbing
     # ------------------------------------------------------------------
 
-    def _sign(self, timestamp_ms: str, body_str: str) -> str:
-        payload = f"{timestamp_ms}#{self._memo}#{body_str}"
-        return hmac.new(self._api_secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    def _sign(self, timestamp: str, method: str, request_path: str, body_str: str) -> str:
+        payload = f"{timestamp}{method}{request_path}{body_str}"
+        digest = hmac.new(self._api_secret.encode(), payload.encode(), hashlib.sha256).digest()
+        return base64.b64encode(digest).decode()
 
     def _do_request(
         self,
@@ -82,25 +118,34 @@ class BitMartFuturesClient:
         path: str,
         params: Optional[Dict[str, Any]] = None,
         body: Optional[Dict[str, Any]] = None,
-        auth: str = "none",
-    ) -> dict:
-        url = f"{self.base_url}{path}"
-        headers = {"User-Agent": USER_AGENT}
-        body_str = json.dumps(body, separators=(",", ":")) if body is not None else None
+        auth: bool = False,
+    ) -> Any:
+        # OKX signs over the exact query string that goes on the wire, so
+        # build it once and reuse it for both the signature and the request.
+        query_str = ""
+        if params:
+            clean = {k: v for k, v in params.items() if v is not None}
+            if clean:
+                query_str = "?" + "&".join(f"{k}={v}" for k, v in clean.items())
+        request_path = path + query_str
+        body_str = json.dumps(body, separators=(",", ":")) if body else ""
 
-        if auth in ("keyed", "signed"):
-            headers["X-BM-KEY"] = self._api_key
-        if auth == "signed":
-            timestamp_ms = str(int(time.time() * 1000))
-            headers["X-BM-TIMESTAMP"] = timestamp_ms
-            headers["X-BM-SIGN"] = self._sign(timestamp_ms, body_str or "{}")
-            headers["Content-Type"] = "application/json"
+        url = f"{self.base_url}{request_path}"
+        headers = {"User-Agent": USER_AGENT, "Content-Type": "application/json"}
+        if self.demo_trading:
+            headers["x-simulated-trading"] = "1"
+
+        if auth:
+            timestamp = _iso_timestamp()
+            headers["OK-ACCESS-KEY"] = self._api_key
+            headers["OK-ACCESS-SIGN"] = self._sign(timestamp, method, request_path, body_str)
+            headers["OK-ACCESS-TIMESTAMP"] = timestamp
+            headers["OK-ACCESS-PASSPHRASE"] = self._passphrase
 
         resp = self._session.request(
             method,
             url,
-            params=params,
-            data=body_str,
+            data=body_str if body_str else None,
             headers=headers,
             timeout=self._timeout,
         )
@@ -108,8 +153,8 @@ class BitMartFuturesClient:
         data = resp.json()
 
         code = data.get("code")
-        if code != 1000:
-            raise BitMartAPIError(f"{path} failed: code={code} message={data.get('message')}", code=code, payload=data)
+        if code != "0":
+            raise OKXAPIError(f"{path} failed: code={code} msg={data.get('msg')}", code=code, payload=data)
         return data.get("data")
 
     async def _request(
@@ -118,109 +163,197 @@ class BitMartFuturesClient:
         path: str,
         params: Optional[Dict[str, Any]] = None,
         body: Optional[Dict[str, Any]] = None,
-        auth: str = "none",
-    ) -> dict:
+        auth: bool = False,
+    ) -> Any:
         last_exc: Optional[Exception] = None
         delay = self._retry_base_delay
         for attempt in range(1, self._max_retries + 1):
             try:
                 return await asyncio.to_thread(self._do_request, method, path, params, body, auth)
-            except BitMartAPIError as exc:
-                # Application-level errors (bad params, insufficient leverage,
-                # etc.) are not retried since retrying would repeat the same
-                # mistake; the caller should decide what to do next.
-                log.error(f"[bitmart-api] {method} {path} rejected: {exc}")
+            except OKXAPIError as exc:
+                # Application-level errors (bad params, insufficient margin,
+                # etc.) are not retried — retrying would repeat the mistake.
+                log.error(f"[okx-api] {method} {path} rejected: {exc}")
                 raise
             except (requests.RequestException, ValueError) as exc:
                 last_exc = exc
                 log.warning(
-                    f"[bitmart-api] {method} {path} attempt {attempt}/{self._max_retries} failed: "
+                    f"[okx-api] {method} {path} attempt {attempt}/{self._max_retries} failed: "
                     f"{type(exc).__name__}: {str(exc)[:200]}"
                 )
                 if attempt < self._max_retries:
                     await asyncio.sleep(delay)
                     delay *= 2
-        raise BitMartAPIError(f"{method} {path} failed after {self._max_retries} attempts: {last_exc}")
+        raise OKXAPIError(f"{method} {path} failed after {self._max_retries} attempts: {last_exc}")
 
     # ------------------------------------------------------------------
-    # Market data (NONE auth)
+    # Market data / instrument metadata (no auth)
     # ------------------------------------------------------------------
+
+    async def list_swap_instruments(self) -> List[dict]:
+        """Returns all live USDT-margined perpetual swap instruments.
+        Used at startup to build the WS subscription universe (OKX's public
+        WS has no "all tickers" firehose channel — each instId must be
+        subscribed individually)."""
+        data = await self._request("GET", "/api/v5/public/instruments", params={"instType": INST_TYPE})
+        return [
+            d for d in (data or [])
+            if d.get("settleCcy") == "USDT" and d.get("state") == "live" and str(d.get("instId", "")).endswith("-USDT-SWAP")
+        ]
 
     async def get_contract_details(self, symbol: str) -> dict:
-        """Returns the first (and only) contract entry for `symbol`, including
-        `max_leverage`, `contract_size`, `price_precision`, `vol_precision`,
-        and `min_volume` — all required before sizing/leveraging an order."""
-        data = await self._request("GET", "/contract/public/details", params={"symbol": symbol})
-        symbols = data.get("symbols") or []
-        if not symbols:
-            raise BitMartAPIError(f"No contract details returned for {symbol}")
-        return symbols[0]
+        """Returns contract metadata for `symbol` (an instId, e.g.
+        "BTC-USDT-SWAP"), translated into the same keys the old BitMart
+        client returned so execution_engine.py's sizing math is unchanged:
+          max_leverage   <- lever
+          contract_size  <- ctVal (value of 1 contract, in the base ccy)
+          price_precision <- tickSz
+          vol_precision  <- lotSz
+          min_volume     <- minSz
+        """
+        data = await self._request("GET", "/api/v5/public/instruments", params={"instType": INST_TYPE, "instId": symbol})
+        rows = data or []
+        if not rows:
+            raise OKXAPIError(f"No instrument details returned for {symbol}")
+        row = rows[0]
+        return {
+            "max_leverage": row.get("lever"),
+            "contract_size": row.get("ctVal"),
+            "price_precision": row.get("tickSz"),
+            "vol_precision": row.get("lotSz"),
+            "min_volume": row.get("minSz"),
+        }
 
     # ------------------------------------------------------------------
-    # Account / private GET (KEYED auth)
+    # Account / private GET
     # ------------------------------------------------------------------
 
     async def get_trade_fee_rate(self, symbol: str) -> dict:
-        return await self._request(
-            "GET", "/contract/private/trade-fee-rate", params={"symbol": symbol}, auth="keyed"
+        data = await self._request(
+            "GET", "/api/v5/account/trade-fee", params={"instType": INST_TYPE, "instId": symbol}, auth=True
         )
+        rows = data or []
+        row = rows[0] if rows else {}
+        # OKX quotes taker fee as a negative string (e.g. "-0.0005" = 0.05%
+        # paid). Normalize to a positive rate so callers can multiply
+        # straight through, matching the old BitMart client's convention.
+        taker = row.get("taker")
+        try:
+            taker_rate = abs(float(taker)) if taker is not None else 0.0
+        except (TypeError, ValueError):
+            taker_rate = 0.0
+        return {"taker_fee_rate": taker_rate}
 
     async def get_position(self, symbol: Optional[str] = None) -> List[dict]:
-        params = {"symbol": symbol} if symbol else None
-        data = await self._request("GET", "/contract/private/position-v2", params=params, auth="keyed")
-        return data or []
+        params = {"instType": INST_TYPE, "instId": symbol} if symbol else {"instType": INST_TYPE}
+        data = await self._request("GET", "/api/v5/account/positions", params=params, auth=True)
+        results = []
+        for p in data or []:
+            try:
+                current_amount = abs(float(p.get("pos", 0)))
+            except (TypeError, ValueError):
+                current_amount = 0.0
+            results.append({
+                "current_amount": current_amount,
+                "mark_price": p.get("markPx"),
+                "unrealized_pnl": p.get("upl"),
+                "liquidation_price": p.get("liqPx"),
+                "avg_price": p.get("avgPx"),
+                "raw": p,
+            })
+        return results
 
     async def get_order(self, symbol: str, order_id: str) -> dict:
-        return await self._request(
-            "GET", "/contract/private/order", params={"symbol": symbol, "order_id": str(order_id)}, auth="keyed"
+        data = await self._request(
+            "GET", "/api/v5/trade/order", params={"instId": symbol, "ordId": str(order_id)}, auth=True
         )
+        rows = data or []
+        row = rows[0] if rows else {}
+        # OKX order states: live, partially_filled, filled, canceled,
+        # mmp_canceled. Map "filled" to "4" to match the old BitMart
+        # client's convention that callers (execution_engine.py) check for.
+        state = "4" if row.get("state") == "filled" else row.get("state")
+        return {
+            "state": state,
+            "deal_avg_price": row.get("avgPx"),
+            "deal_size": row.get("accFillSz"),
+            "order_id": row.get("ordId"),
+            "client_order_id": row.get("clOrdId"),
+            "raw": row,
+        }
 
     async def get_trades(
         self, symbol: Optional[str] = None, order_id: Optional[str] = None
     ) -> List[dict]:
-        params: Dict[str, Any] = {}
-        if symbol:
-            params["symbol"] = symbol
-        if order_id:
-            params["order_id"] = order_id
-        data = await self._request("GET", "/contract/private/trades", params=params, auth="keyed")
-        return data or []
+        """Returns fills, translated to the old field names
+        (price/vol/paid_fees/create_time/side/realised_profit).
 
-    async def get_transaction_history(
-        self, symbol: Optional[str] = None, flow_type: Optional[int] = None, page_size: int = 20
-    ) -> List[dict]:
-        params: Dict[str, Any] = {"page_size": page_size}
+        NOTE: OKX's /trade/fills response does not carry a reliable
+        per-fill realized-PnL field for swaps in all cases — verify this
+        against a live demo response. If `pnl` isn't present, realized_pnl
+        will come back as 0 here and should instead be read from
+        get_order()'s `raw.pnl` for a fully-closed order."""
+        params: Dict[str, Any] = {"instType": INST_TYPE}
         if symbol:
-            params["symbol"] = symbol
-        if flow_type is not None:
-            params["flow_type"] = flow_type
-        data = await self._request("GET", "/contract/private/transaction-history", params=params, auth="keyed")
-        return data or []
+            params["instId"] = symbol
+        if order_id:
+            params["ordId"] = str(order_id)
+        data = await self._request("GET", "/api/v5/trade/fills", params=params, auth=True)
+        results = []
+        for t in data or []:
+            try:
+                pnl = float(t.get("pnl", 0) or 0)
+            except (TypeError, ValueError):
+                pnl = 0.0
+            try:
+                fee = abs(float(t.get("fee", 0) or 0))
+            except (TypeError, ValueError):
+                fee = 0.0
+            results.append({
+                "price": t.get("fillPx"),
+                "vol": t.get("fillSz"),
+                "paid_fees": fee,
+                "realised_profit": pnl,
+                "create_time": t.get("ts"),
+                "side": t.get("side"),
+                "order_id": t.get("ordId"),
+                "raw": t,
+            })
+        return results
 
     async def get_order_history(
         self, symbol: str, start_time: Optional[int] = None, end_time: Optional[int] = None
     ) -> List[dict]:
-        """Returns filled/cancelled orders for `symbol`. `start_time`/`end_time`
-        are Unix seconds (not ms — this endpoint differs from get_trades).
-        Used to resolve a triggered TP/SL plan order's real execution
-        order_id: BitMart assigns that execution a brand-new order_id, and
-        the only link back to the plan order is `client_order_id`, which is
-        formatted as `PLAN_{original_plan_order_id}`."""
-        params: Dict[str, Any] = {"symbol": symbol}
+        """Returns recently filled/canceled orders for `symbol` (last 7
+        days via /trade/orders-history). `start_time`/`end_time` are Unix
+        seconds, converted to the ms timestamps OKX expects."""
+        params: Dict[str, Any] = {"instType": INST_TYPE, "instId": symbol}
         if start_time is not None:
-            params["start_time"] = int(start_time)
+            params["begin"] = str(int(start_time) * 1000)
         if end_time is not None:
-            params["end_time"] = int(end_time)
-        data = await self._request("GET", "/contract/private/order-history", params=params, auth="keyed")
-        return data or []
+            params["end"] = str(int(end_time) * 1000)
+        data = await self._request("GET", "/api/v5/trade/orders-history", params=params, auth=True)
+        results = []
+        for row in data or []:
+            state = "4" if row.get("state") == "filled" else row.get("state")
+            results.append({
+                "order_id": row.get("ordId"),
+                "client_order_id": row.get("clOrdId"),
+                "state": state,
+                "raw": row,
+            })
+        return results
 
     # ------------------------------------------------------------------
-    # Trading (SIGNED auth)
+    # Trading (private POST)
     # ------------------------------------------------------------------
 
     async def submit_leverage(self, symbol: str, leverage: int, open_type: str) -> dict:
-        body = {"symbol": symbol, "leverage": str(leverage), "open_type": open_type}
-        return await self._request("POST", "/contract/private/submit-leverage", body=body, auth="signed")
+        mgn_mode = "isolated" if open_type == "isolated" else "cross"
+        body = {"instId": symbol, "lever": str(leverage), "mgnMode": mgn_mode}
+        data = await self._request("POST", "/api/v5/account/set-leverage", body=body, auth=True)
+        rows = data or []
+        return rows[0] if rows else {}
 
     async def submit_order(
         self,
@@ -234,19 +367,37 @@ class BitMartFuturesClient:
         mode: Optional[int] = None,
         client_order_id: Optional[str] = None,
     ) -> dict:
-        """side: 1=buy_open_long, 2=buy_close_short, 3=sell_close_long, 4=sell_open_short"""
-        body: Dict[str, Any] = {"symbol": symbol, "side": side, "type": order_type, "size": size}
+        """`side` keeps the old BitMart numeric convention so
+        execution_engine.py doesn't need to change its call sites:
+          1 = buy_open_long   -> OKX side="buy"
+          2 = buy_close_short -> OKX side="buy",  reduceOnly=true
+          3 = sell_close_long -> OKX side="sell", reduceOnly=true
+          4 = sell_open_short -> OKX side="sell"
+        Assumes net (one-way) position mode — see module docstring."""
+        side_map = {1: ("buy", False), 2: ("buy", True), 3: ("sell", True), 4: ("sell", False)}
+        okx_side, reduce_only = side_map.get(side, ("buy", False))
+        mgn_mode = "isolated" if (open_type or "isolated") == "isolated" else "cross"
+
+        body: Dict[str, Any] = {
+            "instId": symbol,
+            "tdMode": mgn_mode,
+            "side": okx_side,
+            "ordType": "market" if order_type == "market" else "limit",
+            "sz": str(size),
+        }
+        if reduce_only:
+            body["reduceOnly"] = "true"
         if order_type == "limit" and price is not None:
-            body["price"] = price
-        if leverage is not None:
-            body["leverage"] = str(leverage)
-        if open_type is not None:
-            body["open_type"] = open_type
-        if mode is not None:
-            body["mode"] = mode
+            body["px"] = price
         if client_order_id is not None:
-            body["client_order_id"] = client_order_id
-        return await self._request("POST", "/contract/private/submit-order", body=body, auth="signed")
+            body["clOrdId"] = client_order_id
+
+        data = await self._request("POST", "/api/v5/trade/order", body=body, auth=True)
+        rows = data or []
+        row = rows[0] if rows else {}
+        if row.get("sCode") not in (None, "0"):
+            raise OKXAPIError(f"order rejected: sCode={row.get('sCode')} sMsg={row.get('sMsg')}", code=row.get("sCode"), payload=row)
+        return {"order_id": row.get("ordId"), "client_order_id": row.get("clOrdId")}
 
     async def submit_tp_sl_order(
         self,
@@ -260,24 +411,73 @@ class BitMartFuturesClient:
         plan_category: int = 2,
         category: str = "market",
     ) -> dict:
-        """order_type: 'take_profit' or 'stop_loss'.
-        side: 2=close short, 3=close long (hedge mode)."""
+        """Places a standalone take-profit algo order via
+        /api/v5/trade/order-algo (ordType="conditional"), market-executed
+        on trigger. `side` uses the same BitMart-style close codes as
+        submit_order (2=close short via buy, 3=close long via sell)."""
+        side_map = {2: "buy", 3: "sell"}
+        okx_side = side_map.get(side)
+        if okx_side is None:
+            raise OKXAPIError(f"submit_tp_sl_order: unsupported side {side!r}")
+
         body: Dict[str, Any] = {
-            "symbol": symbol,
-            "type": order_type,
-            "side": side,
-            "trigger_price": trigger_price,
-            "executive_price": executive_price,
-            "price_type": price_type,
-            "plan_category": plan_category,
-            "category": category,
+            "instId": symbol,
+            "tdMode": "isolated",
+            "side": okx_side,
+            "ordType": "conditional",
+            "reduceOnly": "true",
+            "tpTriggerPx": trigger_price,
+            "tpOrdPx": "-1",  # -1 = execute the TP as a market order once triggered
         }
         if size is not None:
-            body["size"] = size
-        return await self._request("POST", "/contract/private/submit-tp-sl-order", body=body, auth="signed")
+            body["sz"] = str(size)
+
+        data = await self._request("POST", "/api/v5/trade/order-algo", body=body, auth=True)
+        rows = data or []
+        row = rows[0] if rows else {}
+        if row.get("sCode") not in (None, "0"):
+            raise OKXAPIError(f"tp/sl order rejected: sCode={row.get('sCode')} sMsg={row.get('sMsg')}", code=row.get("sCode"), payload=row)
+        return {"order_id": row.get("algoId")}
 
     async def cancel_order(self, symbol: str, order_id: Optional[str] = None) -> dict:
-        body: Dict[str, Any] = {"symbol": symbol}
+        body: Dict[str, Any] = {"instId": symbol}
         if order_id is not None:
-            body["order_id"] = order_id
-        return await self._request("POST", "/contract/private/cancel-order", body=body, auth="signed")
+            body["ordId"] = str(order_id)
+        data = await self._request("POST", "/api/v5/trade/cancel-order", body=body, auth=True)
+        rows = data or []
+        return rows[0] if rows else {}
+
+    async def get_algo_order_status(self, symbol: str, algo_id: str) -> Optional[dict]:
+        """Looks up a TP/SL conditional algo order's status via
+        /api/v5/trade/orders-algo-history. NOTE: the exact field OKX uses
+        to report the ordId(s) a triggered conditional order spawned has
+        not been verified here against a live response — this reads a
+        best-guess `ordIdList`/`ordId` field defensively and returns
+        `ord_id: None` if neither is present, in which case callers should
+        fall back to a time/side-based fills scan instead of trusting this
+        linkage blindly."""
+        data = await self._request(
+            "GET",
+            "/api/v5/trade/orders-algo-history",
+            params={"instType": INST_TYPE, "ordType": "conditional", "algoId": str(algo_id), "instId": symbol},
+            auth=True,
+        )
+        rows = data or []
+        row = rows[0] if rows else None
+        if not row:
+            return None
+        ord_id = row.get("ordId")
+        if not ord_id:
+            ord_id_list = row.get("ordIdList") or []
+            ord_id = ord_id_list[0] if ord_id_list else None
+        return {"state": row.get("state"), "ord_id": ord_id, "raw": row}
+
+    async def cancel_algo_order(self, symbol: str, algo_id: str) -> dict:
+        """Cancels a pending TP algo order (e.g. before manually closing a
+        position). Not present on the old BitMart client's public surface,
+        but needed since OKX TP orders are a separate algo-order object."""
+        data = await self._request(
+            "POST", "/api/v5/trade/cancel-algos", body=[{"instId": symbol, "algoId": str(algo_id)}], auth=True
+        )
+        rows = data or []
+        return rows[0] if rows else {}

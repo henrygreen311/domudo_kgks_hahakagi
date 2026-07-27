@@ -30,7 +30,7 @@ from typing import List, Optional
 
 from market_data import LiquidityEngine, MarketDataStore, OrderBookStore, OrderFlowAnalyzer, Signal, TradeStore, compute_order_flow_metrics
 
-log = logging.getLogger("bitmart_futures.confirmation")
+log = logging.getLogger("okx_futures.confirmation")
 
 
 @dataclass
