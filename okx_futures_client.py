@@ -14,16 +14,23 @@ Auth (all private endpoints):
     sign = base64(HMAC_SHA256(secret, f"{timestamp}{method}{requestPath}{body}"))
     timestamp is ISO8601 with milliseconds, e.g. 2024-01-01T00:00:00.000Z
 
-Position mode assumption
--------------------------
-This client assumes the OKX (demo) account is set to **net (one-way)**
-position mode (Trade Settings -> Position Mode -> Net). That matches how
-the bot already behaves (it never holds simultaneous long+short on the same
-symbol), and keeps every order call posSide-free: `side=buy` opens/adds
-long exposure, `side=sell` opens/adds short exposure, and closes go through
-the opposite side with `reduceOnly=true`. If the account is in long/short
-(hedge) mode instead, OKX will reject orders here with a posSide-related
-error — switch the account to net mode before running this.
+Position mode
+-------------
+`position_mode` (constructor arg) must match whatever the OKX account is
+actually set to under Trade Settings -> Position Mode:
+
+  "long_short" (hedge mode, the default here) — every trade/leverage call
+  includes `posSide` ("long"/"short"), derived from the BitMart-style
+  `side` code below. `reduceOnly` is omitted, since OKX only accepts it
+  in net mode; in hedge mode, side+posSide alone determine open vs close.
+
+  "net" (one-way mode) — no `posSide` is sent, `side=buy`/`side=sell`
+  alone opens/adds exposure, and closes go through the opposite side with
+  `reduceOnly=true`.
+
+Passing "long_short" while the account is actually in net mode (or vice
+versa) is exactly what produces OKX's `code=51000 msg=Parameter posSide
+error` — the two must match.
 
 Symbol format
 -------------
@@ -92,11 +99,15 @@ class OKXFuturesClient:
         timeout_sec: float = 10.0,
         max_retries: int = 3,
         retry_base_delay_sec: float = 0.5,
+        position_mode: str = "long_short",
     ) -> None:
+        if position_mode not in ("long_short", "net"):
+            raise ValueError(f"position_mode must be 'long_short' or 'net', got {position_mode!r}")
         self._api_key = api_key
         self._api_secret = api_secret
         self._passphrase = passphrase
         self.demo_trading = demo_trading
+        self.position_mode = position_mode
         self.base_url = BASE_URL
         self._timeout = timeout_sec
         self._max_retries = max_retries
@@ -364,9 +375,17 @@ class OKXFuturesClient:
     # Trading (private POST)
     # ------------------------------------------------------------------
 
-    async def submit_leverage(self, symbol: str, leverage: int, open_type: str) -> dict:
+    async def submit_leverage(self, symbol: str, leverage: int, open_type: str, direction: Optional[str] = None) -> dict:
+        """`direction` ("long"/"short") is required when the client is in
+        hedge mode, since OKX's set-leverage endpoint requires `posSide`
+        for isolated margin under long/short position mode (this is what
+        produces `code=51000 msg=Parameter posSide error` if omitted)."""
         mgn_mode = "isolated" if open_type == "isolated" else "cross"
-        body = {"instId": symbol, "lever": str(leverage), "mgnMode": mgn_mode}
+        body: Dict[str, Any] = {"instId": symbol, "lever": str(leverage), "mgnMode": mgn_mode}
+        if self.position_mode == "long_short":
+            if direction not in ("long", "short"):
+                raise OKXAPIError(f"submit_leverage: hedge mode requires direction='long'/'short', got {direction!r}")
+            body["posSide"] = direction
         data = await self._request("POST", "/api/v5/account/set-leverage", body=body, auth=True)
         rows = data or []
         return rows[0] if rows else {}
@@ -385,13 +404,17 @@ class OKXFuturesClient:
     ) -> dict:
         """`side` keeps the old BitMart numeric convention so
         execution_engine.py doesn't need to change its call sites:
-          1 = buy_open_long   -> OKX side="buy"
-          2 = buy_close_short -> OKX side="buy",  reduceOnly=true
-          3 = sell_close_long -> OKX side="sell", reduceOnly=true
-          4 = sell_open_short -> OKX side="sell"
-        Assumes net (one-way) position mode — see module docstring."""
-        side_map = {1: ("buy", False), 2: ("buy", True), 3: ("sell", True), 4: ("sell", False)}
-        okx_side, reduce_only = side_map.get(side, ("buy", False))
+          1 = buy_open_long   -> OKX side="buy",  posSide="long"
+          2 = buy_close_short -> OKX side="buy",  posSide="short" (reduceOnly in net mode)
+          3 = sell_close_long -> OKX side="sell", posSide="long"  (reduceOnly in net mode)
+          4 = sell_open_short -> OKX side="sell", posSide="short"
+        In hedge (long_short) mode, `posSide` is sent and `reduceOnly` is
+        omitted (OKX only accepts reduceOnly in net mode — side+posSide
+        alone determine open vs close in hedge mode). In net mode,
+        `posSide` is omitted and `reduceOnly` is sent instead — see module
+        docstring."""
+        side_map = {1: ("buy", "long", False), 2: ("buy", "short", True), 3: ("sell", "long", True), 4: ("sell", "short", False)}
+        okx_side, pos_side, reduce_only = side_map.get(side, ("buy", "long", False))
         mgn_mode = "isolated" if (open_type or "isolated") == "isolated" else "cross"
 
         body: Dict[str, Any] = {
@@ -401,7 +424,9 @@ class OKXFuturesClient:
             "ordType": "market" if order_type == "market" else "limit",
             "sz": str(size),
         }
-        if reduce_only:
+        if self.position_mode == "long_short":
+            body["posSide"] = pos_side
+        elif reduce_only:
             body["reduceOnly"] = "true"
         if order_type == "limit" and price is not None:
             body["px"] = price
@@ -430,21 +455,28 @@ class OKXFuturesClient:
         """Places a standalone take-profit algo order via
         /api/v5/trade/order-algo (ordType="conditional"), market-executed
         on trigger. `side` uses the same BitMart-style close codes as
-        submit_order (2=close short via buy, 3=close long via sell)."""
-        side_map = {2: "buy", 3: "sell"}
-        okx_side = side_map.get(side)
-        if okx_side is None:
+        submit_order (2=close short via buy, 3=close long via sell). In
+        hedge mode, `posSide` is sent (identifying which position this
+        closes) and `reduceOnly` is omitted; in net mode it's the reverse
+        — see module docstring."""
+        side_map = {2: ("buy", "short"), 3: ("sell", "long")}
+        mapped = side_map.get(side)
+        if mapped is None:
             raise OKXAPIError(f"submit_tp_sl_order: unsupported side {side!r}")
+        okx_side, pos_side = mapped
 
         body: Dict[str, Any] = {
             "instId": symbol,
             "tdMode": "isolated",
             "side": okx_side,
             "ordType": "conditional",
-            "reduceOnly": "true",
             "tpTriggerPx": trigger_price,
             "tpOrdPx": "-1",  # -1 = execute the TP as a market order once triggered
         }
+        if self.position_mode == "long_short":
+            body["posSide"] = pos_side
+        else:
+            body["reduceOnly"] = "true"
         if size is not None:
             body["sz"] = str(size)
 

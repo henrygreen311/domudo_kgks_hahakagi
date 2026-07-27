@@ -9,8 +9,9 @@ and places that take-profit on the exchange as a standalone TP algo order.
 It also tracks how many positions are open so the bot never exceeds the
 configured concurrency cap.
 
-Assumes the OKX (demo) account is in **net (one-way)** position mode — see
-okx_futures_client.py's module docstring for details.
+Position mode (net vs. hedge) is configured on the `OKXFuturesClient`
+instance passed in here — see okx_futures_client.py's module docstring.
+It must match whatever the OKX account is actually set to.
 
 `ExecutionEngineBase` exists so a live-trading engine can be added later by
 subclassing and swapping only the parts that differ (e.g. credential
@@ -209,7 +210,7 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
             return None
 
         try:
-            await self._client.submit_leverage(symbol, leverage, cfg.open_type)
+            await self._client.submit_leverage(symbol, leverage, cfg.open_type, direction=direction)
         except OKXAPIError as exc:
             log.error(f"[execution] failed to set leverage for {symbol}: {exc}")
             return None
