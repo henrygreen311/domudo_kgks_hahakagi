@@ -535,9 +535,20 @@ class OKXFuturesClient:
         return {"order_id": row.get("algoId")}
 
     async def get_closed_position(self, symbol: str, opened_at_ms: float) -> Optional[dict]:
-        """Returns the exchange's own record of the most recent position on
-        `symbol` that was opened at or after `opened_at_ms` (Unix ms), via
+        """Returns the exchange's own record of the position on `symbol`
+        that closed at or after `opened_at_ms` (Unix ms — our local
+        timestamp for when the position was opened), via
         /api/v5/account/positions-history.
+
+        Filters on the row's `uTime` (its close time), not `cTime` (its
+        open time): `opened_at_ms` is captured locally only after the
+        opening order's fill-wait, fee lookup, and TP placement all
+        complete, so it can land slightly *after* OKX's own `cTime` for
+        the same position — filtering on cTime would then wrongly drop
+        the correct row every time. `uTime` doesn't have that problem:
+        a position's close necessarily happens after it opens, so uTime
+        is always safely after our local opened_at regardless of any
+        skew on the open side.
 
         This is the endpoint to use for a closed position's realized PnL:
         unlike /trade/fills (see get_trades()), positions-history rows
@@ -556,7 +567,7 @@ class OKXFuturesClient:
         candidates = []
         for row in data or []:
             try:
-                if float(row.get("cTime", 0) or 0) >= opened_at_ms:
+                if float(row.get("uTime", 0) or 0) >= opened_at_ms:
                     candidates.append(row)
             except (TypeError, ValueError):
                 continue
