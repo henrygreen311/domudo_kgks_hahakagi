@@ -78,6 +78,27 @@ class OKXAPIError(Exception):
         self.payload = payload
 
 
+def _inner_error_detail(data: Any) -> str:
+    """OKX's top-level `msg` on a rejected /trade/order (or order-algo)
+    call is frequently a generic placeholder — e.g. "All operations
+    failed" or "Operation failed" — while the *actual* reason (wrong
+    account/position mode, insufficient margin, bad posSide, lot-size
+    violation, etc.) sits on the per-item `sCode`/`sMsg` fields inside
+    `data`. Without surfacing those, every rejection looks identical in
+    the logs no matter the real cause. Returns "" if there's nothing more
+    specific to add."""
+    if not isinstance(data, dict):
+        return ""
+    rows = data.get("data")
+    if not isinstance(rows, list):
+        return ""
+    parts = []
+    for row in rows:
+        if isinstance(row, dict) and row.get("sCode") not in (None, "0"):
+            parts.append(f"sCode={row.get('sCode')} sMsg={row.get('sMsg')}")
+    return " | ".join(parts)
+
+
 def _iso_timestamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.") + f"{datetime.now(timezone.utc).microsecond // 1000:03d}Z"
 
@@ -172,8 +193,10 @@ class OKXFuturesClient:
             raise OKXAPIError(f"{path} failed: HTTP {resp.status_code} with non-JSON body: {resp.text[:200]}")
 
         if 400 <= resp.status_code < 500:
+            detail = _inner_error_detail(data)
+            suffix = f" ({detail})" if detail else ""
             raise OKXAPIError(
-                f"{path} failed: HTTP {resp.status_code} code={data.get('code')} msg={data.get('msg')}",
+                f"{path} failed: HTTP {resp.status_code} code={data.get('code')} msg={data.get('msg')}{suffix}",
                 code=data.get("code"),
                 payload=data,
             )
@@ -181,7 +204,9 @@ class OKXFuturesClient:
 
         code = data.get("code")
         if code != "0":
-            raise OKXAPIError(f"{path} failed: code={code} msg={data.get('msg')}", code=code, payload=data)
+            detail = _inner_error_detail(data)
+            suffix = f" ({detail})" if detail else ""
+            raise OKXAPIError(f"{path} failed: code={code} msg={data.get('msg')}{suffix}", code=code, payload=data)
         return data.get("data")
 
     async def _request(
