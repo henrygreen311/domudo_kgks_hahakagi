@@ -53,6 +53,13 @@ class ExecutionConfig:
     max_open_positions: int = 5
     max_total_trades: int = 10
     target_net_profit_usdt: float = 0.10
+    # Extra fractional price cushion applied on top of the TP price that
+    # would exactly hit target_net_profit_usdt after fees. The TP order
+    # fills at market once triggered (tpOrdPx="-1"), so the actual fill
+    # price can land worse than the trigger price if the market moves fast
+    # between the two — e.g. a computed TP of 0.02510 becomes 0.02515 with
+    # the default 0.1% buffer. Set to 0 to disable.
+    tp_slippage_buffer_pct: float = 0.001
     open_type: str = "isolated"
     fill_poll_interval_sec: float = 0.5
     fill_timeout_sec: float = 15.0
@@ -409,12 +416,19 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         """Take profit is derived entirely from real, exchange-reported
         numbers: the actual filled entry price/size and the actual opening
         fee (doubled to estimate the matching closing fee), targeting a net
-        realized profit of `target_net_profit_usdt` after both fees."""
+        realized profit of `target_net_profit_usdt` after both fees. On top
+        of that, the price itself is nudged a little further from entry by
+        `tp_slippage_buffer_pct` — e.g. a computed TP of 0.02510 becomes
+        0.02515 with the default 0.1% buffer — to absorb the gap between
+        the TP trigger price and its actual market-filled price (the TP
+        fills at market once triggered, so it can execute worse than the
+        trigger if the market moves fast)."""
         cfg = self.config
         estimated_total_fees = opening_fee * 2.0
         notional = size_contracts * contract_size * entry_price
         required_gross_profit = cfg.target_net_profit_usdt + estimated_total_fees
         price_move_frac = required_gross_profit / notional if notional > 0 else 0.0
+        price_move_frac += cfg.tp_slippage_buffer_pct
 
         if direction == "long":
             raw_tp = entry_price * (1 + price_move_frac)
