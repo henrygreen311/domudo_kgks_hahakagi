@@ -545,10 +545,31 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
             else:
                 resolved_order_id = await self._resolve_tp_execution_order_id(symbol, closed)
                 close_reason = "take_profit" if resolved_order_id else "liquidation_or_other"
+
+            # `total_fee` from positions-history is CUMULATIVE for the whole
+            # position (opening fee + closing fee + any funding fee) — see
+            # get_closed_position()'s docstring. We already have the real
+            # opening fee from the fill at open time (`closed.opening_fee`),
+            # so the true closing-side fee is whatever's left after backing
+            # that out. Storing `total_fee` itself as closing_fee (the
+            # previous bug) double-counted the opening fee and made
+            # net_pnl — computed downstream as
+            # realized_pnl - opening_fee - closing_fee — read far too
+            # negative.
+            total_fee = float(history_row["total_fee"])
+            closing_fee = total_fee - closed.opening_fee
+            if closing_fee < 0:
+                log.warning(
+                    f"[execution] {symbol} — derived closing_fee came back negative "
+                    f"(total_fee={total_fee:.8f} opening_fee={closed.opening_fee:.8f}); "
+                    f"clamping to 0 rather than storing a negative fee"
+                )
+                closing_fee = 0.0
+
             return (
                 float(history_row["exit_price"]),
                 history_row["realized_pnl"],
-                history_row["closing_fee"],
+                closing_fee,
                 close_reason,
             )
 

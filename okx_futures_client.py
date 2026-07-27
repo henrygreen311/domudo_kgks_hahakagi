@@ -557,7 +557,22 @@ class OKXFuturesClient:
         that says exactly how the position closed (1/2 = closed normally,
         3/4 = liquidated, 5/6 = ADL) instead of having to infer it.
         Returns None if no matching row is found yet (the record can lag
-        a little behind the position actually closing)."""
+        a little behind the position actually closing).
+
+        IMPORTANT — `fee` here is CUMULATIVE for the position's entire
+        lifecycle (the opening trade's fee *and* the closing trade's fee
+        added together), not the closing trade's fee in isolation. OKX
+        produces one positions-history row per position, covering
+        open-to-close, so there is no separate "closing-only" fee field
+        on this endpoint. `fundingFee` is reported separately and is
+        included here too since it's a real cost of holding the position.
+        Callers that already know the real opening fee (captured from the
+        fill at open time) must subtract it back out of `total_fee` to
+        isolate the true closing-side fee — treating `total_fee` itself
+        as the closing fee double-counts the opening fee (this was the
+        bug: it made closing_fee read ~2x too high and made net_pnl,
+        computed downstream as realized_pnl - opening_fee - closing_fee,
+        subtract the opening fee twice)."""
         data = await self._request(
             "GET",
             "/api/v5/account/positions-history",
@@ -579,13 +594,21 @@ class OKXFuturesClient:
         except (TypeError, ValueError):
             pnl = 0.0
         try:
-            fee = abs(float(row.get("fee", 0) or 0))
+            trading_fee = abs(float(row.get("fee", 0) or 0))
         except (TypeError, ValueError):
-            fee = 0.0
+            trading_fee = 0.0
+        try:
+            funding_fee = abs(float(row.get("fundingFee", 0) or 0))
+        except (TypeError, ValueError):
+            funding_fee = 0.0
         return {
             "exit_price": row.get("closeAvgPx"),
             "realized_pnl": pnl,
-            "closing_fee": fee,
+            # Cumulative fee for the WHOLE position (open + close + funding).
+            # See docstring above — this is NOT the closing-only fee. The
+            # caller must subtract the known opening_fee from this to get
+            # the true closing_fee.
+            "total_fee": trading_fee + funding_fee,
             "close_type": row.get("type"),
             "raw": row,
         }
