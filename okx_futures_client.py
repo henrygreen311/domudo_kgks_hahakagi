@@ -99,6 +99,24 @@ def _inner_error_detail(data: Any) -> str:
     return " | ".join(parts)
 
 
+def _first_inner_scode(data: Any) -> Optional[str]:
+    """The actionable per-item `sCode` (e.g. "51155" for a compliance-
+    restricted pair) that `_inner_error_detail` renders into the message
+    text. Pulled out separately so callers can branch on the real reason
+    programmatically instead of the generic top-level `code` (frequently
+    just "1"/"All operations failed"), without having to regex the log
+    string."""
+    if not isinstance(data, dict):
+        return None
+    rows = data.get("data")
+    if not isinstance(rows, list):
+        return None
+    for row in rows:
+        if isinstance(row, dict) and row.get("sCode") not in (None, "0"):
+            return str(row.get("sCode"))
+    return None
+
+
 def _iso_timestamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.") + f"{datetime.now(timezone.utc).microsecond // 1000:03d}Z"
 
@@ -197,7 +215,7 @@ class OKXFuturesClient:
             suffix = f" ({detail})" if detail else ""
             raise OKXAPIError(
                 f"{path} failed: HTTP {resp.status_code} code={data.get('code')} msg={data.get('msg')}{suffix}",
-                code=data.get("code"),
+                code=_first_inner_scode(data) or data.get("code"),
                 payload=data,
             )
         resp.raise_for_status()
@@ -206,7 +224,11 @@ class OKXFuturesClient:
         if code != "0":
             detail = _inner_error_detail(data)
             suffix = f" ({detail})" if detail else ""
-            raise OKXAPIError(f"{path} failed: code={code} msg={data.get('msg')}{suffix}", code=code, payload=data)
+            raise OKXAPIError(
+                f"{path} failed: code={code} msg={data.get('msg')}{suffix}",
+                code=_first_inner_scode(data) or code,
+                payload=data,
+            )
         return data.get("data")
 
     async def _request(
@@ -511,6 +533,51 @@ class OKXFuturesClient:
         if row.get("sCode") not in (None, "0"):
             raise OKXAPIError(f"tp/sl order rejected: sCode={row.get('sCode')} sMsg={row.get('sMsg')}", code=row.get("sCode"), payload=row)
         return {"order_id": row.get("algoId")}
+
+    async def get_closed_position(self, symbol: str, opened_at_ms: float) -> Optional[dict]:
+        """Returns the exchange's own record of the most recent position on
+        `symbol` that was opened at or after `opened_at_ms` (Unix ms), via
+        /api/v5/account/positions-history.
+
+        This is the endpoint to use for a closed position's realized PnL:
+        unlike /trade/fills (see get_trades()), positions-history rows
+        carry genuine `pnl` (price PnL, excluding fees) and `fee` fields
+        for closed FUTURES/SWAP/OPTION positions, plus a `type` field
+        that says exactly how the position closed (1/2 = closed normally,
+        3/4 = liquidated, 5/6 = ADL) instead of having to infer it.
+        Returns None if no matching row is found yet (the record can lag
+        a little behind the position actually closing)."""
+        data = await self._request(
+            "GET",
+            "/api/v5/account/positions-history",
+            params={"instType": INST_TYPE, "instId": symbol},
+            auth=True,
+        )
+        candidates = []
+        for row in data or []:
+            try:
+                if float(row.get("cTime", 0) or 0) >= opened_at_ms:
+                    candidates.append(row)
+            except (TypeError, ValueError):
+                continue
+        if not candidates:
+            return None
+        row = max(candidates, key=lambda r: float(r.get("uTime", 0) or 0))
+        try:
+            pnl = float(row.get("pnl", 0) or 0)
+        except (TypeError, ValueError):
+            pnl = 0.0
+        try:
+            fee = abs(float(row.get("fee", 0) or 0))
+        except (TypeError, ValueError):
+            fee = 0.0
+        return {
+            "exit_price": row.get("closeAvgPx"),
+            "realized_pnl": pnl,
+            "closing_fee": fee,
+            "close_type": row.get("type"),
+            "raw": row,
+        }
 
     async def cancel_order(self, symbol: str, order_id: Optional[str] = None) -> dict:
         body: Dict[str, Any] = {"instId": symbol}

@@ -33,6 +33,17 @@ from market_data import Signal
 
 log = logging.getLogger("okx_futures.execution")
 
+# OKX sCodes that mean the exchange itself will never let this account
+# trade this instrument — a regional/compliance restriction, a delisted
+# or borrow-restricted pair, etc. — as opposed to a transient or
+# bot-caused error (bad params, insufficient margin, rate limit) that
+# might succeed on a later signal. Retrying these wastes API calls and
+# spams identical rejections, so the symbol is blacklisted in-memory for
+# the rest of this run the first time one of these codes is seen.
+PERMANENTLY_UNTRADEABLE_OKX_CODES = {
+    "51155",  # "You can't trade this pair or borrow this crypto due to local compliance restrictions."
+}
+
 
 @dataclass
 class ExecutionConfig:
@@ -117,10 +128,37 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         self._open_positions: Dict[str, OpenPosition] = {}
         self._total_opened = 0
         self._lock = asyncio.Lock()
+        # symbol -> the OKXAPIError that got it blacklisted, for logging/introspection.
+        self._blacklisted_symbols: Dict[str, OKXAPIError] = {}
 
     async def open_count(self) -> int:
         async with self._lock:
             return len(self._open_positions)
+
+    async def is_blacklisted(self, symbol: str) -> bool:
+        """True once the exchange has told us `symbol` can never be
+        traded on this account (see PERMANENTLY_UNTRADEABLE_OKX_CODES) —
+        callers should stop attempting it for the rest of this run."""
+        async with self._lock:
+            return symbol in self._blacklisted_symbols
+
+    async def blacklisted_symbols(self) -> List[str]:
+        async with self._lock:
+            return sorted(self._blacklisted_symbols.keys())
+
+    async def _blacklist(self, symbol: str, exc: OKXAPIError) -> None:
+        async with self._lock:
+            is_new = symbol not in self._blacklisted_symbols
+            self._blacklisted_symbols[symbol] = exc
+        if is_new:
+            log.warning(
+                f"[execution] {symbol} blacklisted for the rest of this run — "
+                f"exchange rejected it as permanently untradeable, not a bot error: {exc}"
+            )
+
+    @staticmethod
+    def _is_permanent_rejection(exc: OKXAPIError) -> bool:
+        return exc.code in PERMANENTLY_UNTRADEABLE_OKX_CODES
 
     async def total_opened(self) -> int:
         async with self._lock:
@@ -148,6 +186,8 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         # Reserve a slot atomically so two concurrent signals can't both
         # open a position once we're at the concurrency cap.
         async with self._lock:
+            if symbol in self._blacklisted_symbols:
+                return False
             if self._total_opened >= cfg.max_total_trades:
                 return False
             if symbol in self._open_positions:
@@ -212,6 +252,9 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         try:
             await self._client.submit_leverage(symbol, leverage, cfg.open_type, direction=direction)
         except OKXAPIError as exc:
+            if self._is_permanent_rejection(exc):
+                await self._blacklist(symbol, exc)
+                return None
             log.error(f"[execution] failed to set leverage for {symbol}: {exc}")
             return None
 
@@ -228,6 +271,9 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
                 client_order_id=client_order_id,
             )
         except OKXAPIError as exc:
+            if self._is_permanent_rejection(exc):
+                await self._blacklist(symbol, exc)
+                return None
             log.error(f"[execution] order submission failed for {symbol}: {exc}")
             return None
 
@@ -457,17 +503,66 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
             )
 
     async def _get_close_details(self, symbol: str, closed: OpenPosition):
-        """Looks up the fill(s) that closed this position (whether by the
-        take-profit algo order or by exchange liquidation) to get the real
-        exit price, realized PnL, and closing fee — never estimated.
+        """Looks up the exchange's own closed-position record to get the
+        real exit price, realized PnL, and closing fee — never estimated.
 
-        OKX's TP algo order (`tp_order_id` = the algoId returned when it was
-        placed) executes on trigger as a brand-new regular order with its
-        own ordId. We first check the algo order's own status — once it's
-        "effective" (triggered), OKX links back to the ordId(s) it spawned —
-        and use *that* to pull the matching fills. If we can't resolve it
-        (e.g. the position closed via liquidation instead), we fall back to
-        every fill on the closing side since the position was opened."""
+        This reads /api/v5/account/positions-history (via
+        get_closed_position()), which is the endpoint OKX actually
+        populates with a genuine realized-PnL field for closed swap
+        positions, plus a `close_type` that says exactly how it closed.
+        The record can lag a beat behind the position showing as closed
+        in monitor_positions(), so this retries a few times first.
+
+        The previous version of this method sourced these numbers from
+        /trade/fills instead, reading a `pnl` field from each fill —
+        but OKX's /trade/fills response simply has no realized-PnL field
+        for swaps, so that always evaluated to 0 regardless of whether
+        the trade actually won or lost. That fallback is kept below only
+        for the rare case positions-history hasn't produced a row yet,
+        in which case exit_price/closing_fee can still be recovered from
+        fills, but realized_pnl will (as before) come back as 0 there —
+        logged clearly so it isn't mistaken for a real zero-PnL trade."""
+        opened_at_ms = closed.opened_at * 1000.0
+
+        history_row = None
+        for attempt in range(1, 4):
+            try:
+                history_row = await self._client.get_closed_position(symbol, opened_at_ms)
+            except OKXAPIError as exc:
+                log.warning(f"[execution] could not fetch closed-position record for {symbol}: {exc}")
+                history_row = None
+            if history_row is not None:
+                break
+            if attempt < 3:
+                await asyncio.sleep(0.5)
+
+        if history_row is not None and history_row.get("exit_price") not in (None, ""):
+            close_type = str(history_row.get("close_type") or "")
+            if close_type in ("3", "4", "5", "6"):
+                # 3/4 = liquidation, 5/6 = ADL — exchange-driven closes,
+                # same bucket the rest of the codebase already uses.
+                close_reason = "liquidation_or_other"
+            else:
+                resolved_order_id = await self._resolve_tp_execution_order_id(symbol, closed)
+                close_reason = "take_profit" if resolved_order_id else "liquidation_or_other"
+            return (
+                float(history_row["exit_price"]),
+                history_row["realized_pnl"],
+                history_row["closing_fee"],
+                close_reason,
+            )
+
+        log.warning(
+            f"[execution] {symbol} — no positions-history record yet; falling back to a fills scan "
+            f"(realized_pnl will read as 0 there — OKX's /trade/fills has no PnL field for swaps)"
+        )
+        return await self._get_close_details_from_fills(symbol, closed)
+
+    async def _get_close_details_from_fills(self, symbol: str, closed: OpenPosition):
+        """Fallback used only when positions-history hasn't produced a row
+        for this close yet. Recovers exit_price/closing_fee/close_reason
+        from raw fills, same as the original implementation — but cannot
+        recover a real realized_pnl this way (see _get_close_details)."""
         resolved_order_id = await self._resolve_tp_execution_order_id(symbol, closed)
 
         opened_at_ms = closed.opened_at * 1000.0
