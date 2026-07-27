@@ -419,7 +419,7 @@ class OKXFuturesClient:
         self,
         symbol: str,
         side: int,
-        size: int,
+        size: float,
         order_type: str = "market",
         price: Optional[str] = None,
         leverage: Optional[str] = None,
@@ -473,7 +473,7 @@ class OKXFuturesClient:
         trigger_price: str,
         executive_price: str,
         price_type: int = 1,
-        size: Optional[int] = None,
+        size: Optional[float] = None,
         plan_category: int = 2,
         category: str = "market",
     ) -> dict:

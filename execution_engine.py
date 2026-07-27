@@ -221,7 +221,7 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
             order = await self._client.submit_order(
                 symbol=symbol,
                 side=side,
-                size=int(size_contracts),
+                size=size_contracts,
                 order_type="market",
                 leverage=str(leverage),
                 open_type=cfg.open_type,
@@ -232,7 +232,7 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
             return None
 
         order_id = str(order.get("order_id"))
-        log.info(f"[execution] opened {direction.upper()} {symbol} order_id={order_id} size={int(size_contracts)}")
+        log.info(f"[execution] opened {direction.upper()} {symbol} order_id={order_id} size={size_contracts}")
 
         filled = await self._wait_for_fill(symbol, order_id)
         if filled is None:
@@ -262,7 +262,7 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
             symbol=symbol,
             direction=direction,
             take_profit_price=take_profit_price,
-            size_contracts=int(deal_size),
+            size_contracts=deal_size,
         )
 
         log.info(
@@ -378,7 +378,7 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
             return _round_to_step(raw_tp, price_precision, rounding=ROUND_DOWN)
 
     async def _place_take_profit(
-        self, symbol: str, direction: str, take_profit_price: float, size_contracts: int
+        self, symbol: str, direction: str, take_profit_price: float, size_contracts: float
     ) -> Optional[str]:
         # Hedge-mode close sides: 3 closes a long, 2 closes a short.
         close_side = 3 if direction == "long" else 2
