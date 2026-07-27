@@ -149,8 +149,24 @@ class OKXFuturesClient:
             headers=headers,
             timeout=self._timeout,
         )
+
+        # OKX returns a JSON body with the real code/msg even on 4xx
+        # responses, so parse it before deciding anything -- raise_for_status()
+        # would discard that body and mislabel a permanent, non-retryable
+        # rejection as a transient network error.
+        try:
+            data = resp.json()
+        except ValueError:
+            resp.raise_for_status()
+            raise OKXAPIError(f"{path} failed: HTTP {resp.status_code} with non-JSON body: {resp.text[:200]}")
+
+        if 400 <= resp.status_code < 500:
+            raise OKXAPIError(
+                f"{path} failed: HTTP {resp.status_code} code={data.get('code')} msg={data.get('msg')}",
+                code=data.get("code"),
+                payload=data,
+            )
         resp.raise_for_status()
-        data = resp.json()
 
         code = data.get("code")
         if code != "0":
