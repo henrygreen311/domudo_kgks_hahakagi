@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Deque, Dict, List, Optional, Tuple
 
+from confidence_engine import ConfidenceEngine, ConfidenceEngineConfig, DEFAULT_CATEGORY_WEIGHTS
+
 
 class MarketDataStore:
     def __init__(self) -> None:
@@ -27,6 +29,20 @@ class MarketDataStore:
         except (TypeError, ValueError):
             return
 
+        # 24h high/low, used only by the Priority-7 overextension filter.
+        # Optional: feeds that omit these simply disable that filter rather
+        # than defaulting to a value that could look like a false extreme.
+        high_24h = low_24h = None
+        try:
+            high_raw = _first_present(payload, ("high_24h", "high24h", "high"))
+            if high_raw is not None:
+                high_24h = float(high_raw)
+            low_raw = _first_present(payload, ("low_24h", "low24h", "low"))
+            if low_raw is not None:
+                low_24h = float(low_raw)
+        except (TypeError, ValueError):
+            high_24h = low_24h = None
+
         entry = {
             "last_price": last_price,
             "mark_price": mark_price,
@@ -35,6 +51,8 @@ class MarketDataStore:
             "spread": best_ask - best_bid,
             "bid_volume": bid_volume,
             "ask_volume": ask_volume,
+            "high_24h": high_24h,
+            "low_24h": low_24h,
             "last_update": time.time(),
         }
 
@@ -490,6 +508,12 @@ class OrderFlowAnalyzer:
             per_window = self._metrics.get(symbol)
             return dict(per_window[window_ms]) if per_window and window_ms in per_window else None
 
+    async def get_recent_trades(self, symbol: str, window_ms: int) -> List[dict]:
+        """Raw trades backing the metrics above — used by the confidence
+        engine's VWAP indicator (Priority 6) and time-decay calc (Priority 2),
+        neither of which can be derived from the aggregated metrics dict."""
+        return await self._trade_store.get_window(symbol, window_ms)
+
     async def snapshot(self) -> Dict[str, Dict[int, dict]]:
         async with self._lock:
             return {symbol: {w: dict(m) for w, m in windows.items()} for symbol, windows in self._metrics.items()}
@@ -620,7 +644,7 @@ class SignalConfig:
     max_data_age_sec: float = 5.0
     min_liquidity: float = 0.0
     order_flow_window_ms: int = 1000
-    min_confirmations: int = 5
+    min_confirmations: int = 5  # deprecated: no longer used now that confidence is continuous, see min_confidence below
     take_profit_pct: float = 0.002
     stop_loss_pct: float = 0.005
     cooldown_sec: float = 5.0
@@ -648,6 +672,49 @@ class SignalConfig:
     book_imbalance_check_band: float = 0.001
     book_imbalance_ratio_threshold: float = 1.2
 
+    # --- Weighted confidence engine (replaces binary majority voting) ---
+    # Per-category weights for the continuous confidence model. Renormalized
+    # automatically if they don't sum to 1.0, so it's safe to tune any subset.
+    confidence_category_weights: Dict[str, float] = field(default_factory=lambda: dict(DEFAULT_CATEGORY_WEIGHTS))
+    # Bar a direction's weighted score must clear to produce a signal at all.
+    min_confidence: float = 0.55
+
+    # --- Priority 2: continuous confidence time decay ---
+    # Smooth exponential decay (half-life form) based on the age of the
+    # newest relevant trade, rather than a fixed staleness penalty.
+    confidence_half_life_ms: float = 2500.0
+
+    # --- Priority 3: signal persistence ---
+    # Confidence + direction must remain valid for this long before a
+    # signal is allowed through to EventConfirmationEngine.
+    signal_persistence_ms: float = 300.0
+
+    # --- Priority 4: confidence edge ---
+    # Minimum required gap between LONG and SHORT confidence.
+    min_confidence_edge: float = 0.15
+
+    # --- Priority 5: category agreement ---
+    # A category counts as "disagreeing" if its aligned-direction score
+    # minus its opposing-direction score falls below this (net negative
+    # means the category actually favors the other side).
+    category_disagreement_threshold: float = -0.35
+    category_agreement_penalty: float = 0.15  # fractional confidence reduction
+
+    # --- Priority 6: VWAP indicator (part of the Order Flow category) ---
+    enable_vwap_indicator: bool = False
+    vwap_window_ms: int = 60_000
+    vwap_max_deviation_pct: float = 0.003  # deviation from VWAP for full-strength signal
+    vwap_strength_cap: float = 0.6  # extra damping so VWAP can't dominate its category
+
+    # --- Priority 7: smart overextension filter ---
+    enable_overextension_filter: bool = True
+    overextension_proximity_pct: float = 0.0015  # how close to 24h high/low counts as "at the extreme"
+    overextension_weak_threshold: float = 0.25  # momentum/order-flow aligned score below this = "weak"
+    overextension_penalty: float = 0.25  # fractional confidence reduction when both conditions hold
+
+    # Ratio scale used by the plain aggressive buy/sell ratio indicator.
+    flow_ratio_scale: float = 1.5
+
 
 @dataclass
 class Signal:
@@ -660,6 +727,39 @@ class Signal:
     timestamp: float
     reasons: List[str] = field(default_factory=list)
     prerequisites: List[str] = field(default_factory=list)
+
+
+class SignalPersistenceTracker:
+    """Priority 3 — signal persistence.
+
+    Deliberately NOT part of ConfidenceEngine: that module's only job is
+    computing a confidence score, not deciding when a signal is "settled"
+    enough to execute. This tracker just watches, per symbol, whether a
+    direction has stayed valid continuously for `duration_ms` before
+    letting SignalGenerator hand anything to EventConfirmationEngine.
+    """
+
+    def __init__(self) -> None:
+        self._pending: Dict[str, Tuple[str, float]] = {}  # symbol -> (direction, first_seen_time)
+
+    def check(self, symbol: str, direction: Optional[str], now: float, duration_ms: float) -> bool:
+        """Returns True once `direction` has held continuously for
+        `duration_ms`. Any direction change or a None (confidence dropped
+        below threshold) resets/cancels the pending timer."""
+        if direction is None:
+            self._pending.pop(symbol, None)
+            return False
+
+        pending = self._pending.get(symbol)
+        if pending is None or pending[0] != direction:
+            self._pending[symbol] = (direction, now)
+            return False
+
+        first_seen = pending[1]
+        return (now - first_seen) * 1000.0 >= duration_ms
+
+    def clear(self, symbol: str) -> None:
+        self._pending.pop(symbol, None)
 
 
 class SignalGenerator:
@@ -678,6 +778,13 @@ class SignalGenerator:
         self.config = config or SignalConfig()
         self._price_history: Dict[str, Deque[Tuple[float, float]]] = defaultdict(deque)
         self._last_signal_time: Dict[str, float] = {}
+        self._confidence_engine = ConfidenceEngine(
+            ConfidenceEngineConfig(
+                category_weights=self.config.confidence_category_weights,
+                min_confidence=self.config.min_confidence,
+            )
+        )
+        self._persistence = SignalPersistenceTracker()
 
     def _update_price_history(self, symbol: str, price: float, now: float) -> None:
         history = self._price_history[symbol]
@@ -744,75 +851,37 @@ class SignalGenerator:
             return None
 
         # --- Section 2: directional signal layer (predictive, confidence-bearing) ---
-        buy_dominant = (flow["sell_volume"] == 0 and flow["buy_volume"] > 0) or (
-            flow["sell_volume"] > 0 and flow["buy_volume"] / flow["sell_volume"] >= cfg.volume_ratio_threshold
+        # Continuous, category-weighted confidence engine (see confidence_engine.py)
+        # replaces the old binary majority vote. Quality/prerequisite checks above
+        # already gated whether we got this far and never factor into this score.
+        # Raw trades feed the VWAP indicator and time-decay calc inside the
+        # engine; neither is derivable from the pre-aggregated `flow` dict.
+        recent_trades = await self._order_flow.get_recent_trades(
+            symbol, max(cfg.vwap_window_ms, cfg.order_flow_window_ms)
         )
-        sell_dominant = (flow["buy_volume"] == 0 and flow["sell_volume"] > 0) or (
-            flow["buy_volume"] > 0 and flow["sell_volume"] / flow["buy_volume"] >= cfg.volume_ratio_threshold
+        result = self._confidence_engine.evaluate(
+            flow=flow,
+            liquidity=liquidity,
+            book=book,
+            price_change_pct=price_change_pct,
+            cfg=cfg,
+            trades=recent_trades,
+            price=price,
+            market=market,
+            now_ms=now * 1000.0,
         )
 
-        long_checks = {
-            "buy volume exceeds sell volume": buy_dominant,
-            "bid liquidity exceeds ask liquidity": liquidity["bid_liquidity"] > liquidity["ask_liquidity"],
-            "price moving upward": price_change_pct is not None and price_change_pct >= cfg.min_price_move_pct,
-        }
-        short_checks = {
-            "sell volume exceeds buy volume": sell_dominant,
-            "ask liquidity exceeds bid liquidity": liquidity["ask_liquidity"] > liquidity["bid_liquidity"],
-            "price moving downward": price_change_pct is not None and price_change_pct <= -cfg.min_price_move_pct,
-        }
-
-        # --- Additional directional order-flow checks, each independently toggled ---
-        if cfg.enable_aggressive_order_detection:
-            long_checks["aggressive buyers in control"] = flow.get("aggressive_buy_pct", 0.0) >= cfg.aggressive_dominance_pct
-            short_checks["aggressive sellers in control"] = flow.get("aggressive_sell_pct", 0.0) >= cfg.aggressive_dominance_pct
-
-        if cfg.enable_whale_detection:
-            long_checks["whale buying detected"] = (
-                flow.get("whale_buy_count", 0) > 0 and flow.get("whale_buy_volume", 0.0) > flow.get("whale_sell_volume", 0.0)
-            )
-            short_checks["whale selling detected"] = (
-                flow.get("whale_sell_count", 0) > 0 and flow.get("whale_sell_volume", 0.0) > flow.get("whale_buy_volume", 0.0)
-            )
-
-        if cfg.enable_trade_intensity:
-            buy_tps = flow.get("buy_trades_per_sec", 0.0)
-            sell_tps = flow.get("sell_trades_per_sec", 0.0)
-            long_checks["buy trade intensity elevated"] = (sell_tps == 0 and buy_tps > 0) or (
-                sell_tps > 0 and buy_tps / sell_tps >= cfg.intensity_dominance_ratio
-            )
-            short_checks["sell trade intensity elevated"] = (buy_tps == 0 and sell_tps > 0) or (
-                buy_tps > 0 and sell_tps / buy_tps >= cfg.intensity_dominance_ratio
-            )
-
-        if cfg.enable_streak_detection:
-            long_checks["active buy streak"] = flow.get("current_buy_streak", 0) >= cfg.streak_confirmation_length
-            short_checks["active sell streak"] = flow.get("current_sell_streak", 0) >= cfg.streak_confirmation_length
-
-        if cfg.enable_book_imbalance_by_distance:
-            band = (liquidity.get("band_imbalance") or {}).get(cfg.book_imbalance_check_band)
-            if band:
-                long_checks["near-book liquidity favors bids"] = band["bid_ask_ratio"] >= cfg.book_imbalance_ratio_threshold
-                short_checks["near-book liquidity favors asks"] = band["ask_bid_ratio"] >= cfg.book_imbalance_ratio_threshold
-
-        long_count = sum(long_checks.values())
-        short_count = sum(short_checks.values())
-
-        if long_count >= cfg.min_confirmations and long_count > short_count:
-            direction = "long"
-            checks = long_checks
-            confirmations = long_count
-        elif short_count >= cfg.min_confirmations and short_count > long_count:
-            direction = "short"
-            checks = short_checks
-            confirmations = short_count
-        else:
+        # --- Priority 3: signal persistence ---
+        # ConfidenceEngine only reports the instantaneous score; whether it's
+        # held long enough to act on is this tracker's job alone, so that
+        # ConfidenceEngine stays purely a scoring module.
+        persisted = self._persistence.check(symbol, result.direction, now, cfg.signal_persistence_ms)
+        if result.direction is None or not persisted:
             return None
 
-        # Confidence reflects directional probability only — quality/prerequisite
-        # checks already gated whether we got this far and never factor in here.
-        confidence = confirmations / len(checks)
-        reasons = [name for name, passed in checks.items() if passed]
+        direction = result.direction
+        confidence = result.confidence
+        reasons = result.reason_lines()
         passed_prerequisites = [name for name, passed in prerequisite_checks.items() if passed]
 
         if direction == "long":
@@ -823,6 +892,7 @@ class SignalGenerator:
             stop_loss = price * (1 + cfg.stop_loss_pct)
 
         self._last_signal_time[symbol] = now
+        self._persistence.clear(symbol)
 
         return Signal(
             symbol=symbol,
