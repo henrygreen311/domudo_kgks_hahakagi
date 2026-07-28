@@ -66,6 +66,7 @@ class PositionHistoryStore:
         closing_fee: Optional[float],
         close_reason: str,
         closed_at: float,
+        net_pnl: Optional[float] = None,
     ) -> None:
         if row_id is None:
             log.warning("[position-store] skipping close update — no row id (insert must have failed earlier)")
@@ -78,6 +79,20 @@ class PositionHistoryStore:
             "closed_at": _iso(closed_at),
             "status": "closed",
         }
+        # net_pnl is now written directly from OKX's own realizedPnl
+        # figure (see execution_engine.py's _finalize_closed_position),
+        # which correctly includes any liquidation penalty. IMPORTANT:
+        # if `net_pnl` on `position_history` is currently a Postgres
+        # GENERATED ALWAYS AS (realized_pnl - opening_fee - closing_fee)
+        # STORED column, this write will be rejected (or silently ignored,
+        # depending on driver) — that formula is what under-counted losses
+        # on liquidated trades in the first place, since it has no way to
+        # know about liqPenalty. Run something like:
+        #   ALTER TABLE position_history ALTER COLUMN net_pnl DROP EXPRESSION;
+        # (or drop + re-add as a plain nullable numeric column) so this
+        # value actually lands.
+        if net_pnl is not None:
+            update["net_pnl"] = net_pnl
         try:
             await asyncio.to_thread(lambda: self._sb.table(TABLE).update(update).eq("id", row_id).execute())
         except Exception:

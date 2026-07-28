@@ -572,7 +572,17 @@ class OKXFuturesClient:
         as the closing fee double-counts the opening fee (this was the
         bug: it made closing_fee read ~2x too high and made net_pnl,
         computed downstream as realized_pnl - opening_fee - closing_fee,
-        subtract the opening fee twice)."""
+        subtract the opening fee twice).
+
+        This row also carries OKX's own `realizedPnl` field, which is
+        `pnl` (price PnL) plus `fee`, `fundingFee`, AND `liqPenalty`
+        (the liquidation penalty charged on a liquidated position) all
+        netted together by OKX itself — returned here as `net_pnl`.
+        Reconstructing net PnL locally from realized_pnl/opening_fee/
+        closing_fee alone silently drops `liqPenalty`, which is exactly
+        why locally-computed net_pnl read far less negative than reality
+        on liquidated trades. Prefer this field over any local
+        reconstruction whenever it's present."""
         data = await self._request(
             "GET",
             "/api/v5/account/positions-history",
@@ -601,6 +611,11 @@ class OKXFuturesClient:
             funding_fee = abs(float(row.get("fundingFee", 0) or 0))
         except (TypeError, ValueError):
             funding_fee = 0.0
+        raw_net_pnl = row.get("realizedPnl")
+        try:
+            net_pnl = float(raw_net_pnl) if raw_net_pnl not in (None, "") else None
+        except (TypeError, ValueError):
+            net_pnl = None
         return {
             "exit_price": row.get("closeAvgPx"),
             "realized_pnl": pnl,
@@ -609,6 +624,9 @@ class OKXFuturesClient:
             # caller must subtract the known opening_fee from this to get
             # the true closing_fee.
             "total_fee": trading_fee + funding_fee,
+            # OKX's own fully-netted realized PnL (pnl + fee + fundingFee +
+            # liqPenalty). None if the field wasn't present on this row.
+            "net_pnl": net_pnl,
             "close_type": row.get("type"),
             "raw": row,
         }
@@ -621,7 +639,9 @@ class OKXFuturesClient:
         rows = data or []
         return rows[0] if rows else {}
 
-    async def get_algo_order_status(self, symbol: str, algo_id: str) -> Optional[dict]:
+    async def get_algo_order_status(
+        self, symbol: str, algo_id: str, attempts: int = 3, retry_delay_sec: float = 1.0
+    ) -> Optional[dict]:
         """Looks up a TP/SL conditional algo order's status via
         /api/v5/trade/orders-algo-history. NOTE: the exact field OKX uses
         to report the ordId(s) a triggered conditional order spawned has
@@ -629,22 +649,47 @@ class OKXFuturesClient:
         best-guess `ordIdList`/`ordId` field defensively and returns
         `ord_id: None` if neither is present, in which case callers should
         fall back to a time/side-based fills scan instead of trusting this
-        linkage blindly."""
-        data = await self._request(
-            "GET",
-            "/api/v5/trade/orders-algo-history",
-            params={"instType": INST_TYPE, "ordType": "conditional", "algoId": str(algo_id), "instId": symbol},
-            auth=True,
-        )
-        rows = data or []
-        row = rows[0] if rows else None
-        if not row:
-            return None
-        ord_id = row.get("ordId")
-        if not ord_id:
-            ord_id_list = row.get("ordIdList") or []
-            ord_id = ord_id_list[0] if ord_id_list else None
-        return {"state": row.get("state"), "ord_id": ord_id, "raw": row}
+        linkage blindly.
+
+        Retries on code=51603 ("Order does not exist"): this endpoint's
+        index can lag a couple of seconds behind an algo order that was
+        JUST created, so querying it immediately after placing/triggering
+        a TP can spuriously come back "not found" even though the order
+        is live. `_request()` doesn't retry application-level errors by
+        design (retrying a genuinely bad request just repeats the
+        mistake), so that retry has to happen here, where we know 51603
+        specifically can be a transient indexing-lag artifact rather than
+        a real absence."""
+        last_exc: Optional[OKXAPIError] = None
+        for attempt in range(1, attempts + 1):
+            try:
+                data = await self._request(
+                    "GET",
+                    "/api/v5/trade/orders-algo-history",
+                    params={"instType": INST_TYPE, "ordType": "conditional", "algoId": str(algo_id), "instId": symbol},
+                    auth=True,
+                )
+                rows = data or []
+                row = rows[0] if rows else None
+                if not row:
+                    return None
+                ord_id = row.get("ordId")
+                if not ord_id:
+                    ord_id_list = row.get("ordIdList") or []
+                    ord_id = ord_id_list[0] if ord_id_list else None
+                return {"state": row.get("state"), "ord_id": ord_id, "raw": row}
+            except OKXAPIError as exc:
+                last_exc = exc
+                if str(exc.code) != "51603" or attempt >= attempts:
+                    raise
+                log.warning(
+                    f"[okx-api] orders-algo-history 51603 for {symbol} algoId={algo_id} "
+                    f"(attempt {attempt}/{attempts}) — likely index lag, retrying"
+                )
+                await asyncio.sleep(retry_delay_sec)
+        if last_exc is not None:
+            raise last_exc
+        return None
 
     async def cancel_algo_order(self, symbol: str, algo_id: str) -> dict:
         """Cancels a pending TP algo order (e.g. before manually closing a

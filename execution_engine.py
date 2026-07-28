@@ -69,6 +69,36 @@ class ExecutionConfig:
     # -0.5%, -1.0%, etc. — never more than once per step, so the log isn't
     # spammed on every monitor tick.
     alert_move_step_pct: float = 0.5
+    # Symbols that are NEVER traded, full stop — checked before every
+    # signal is even considered, regardless of what OKX's API says about
+    # them. Unlike `_blacklisted_symbols` (auto-populated only when OKX
+    # returns one of PERMANENTLY_UNTRADEABLE_OKX_CODES), this list exists
+    # for symbols where the order itself succeeds and OKX never returns an
+    # error at all — the position just gets liquidated near-instantly, so
+    # there's no error code to key off of.
+    #
+    # LINK-USDT-SWAP is seeded here on hard evidence: three MANUALLY
+    # placed long positions ($1, $2, and $8 margin — ruling out bot-side
+    # sizing/leverage bugs entirely) plus two earlier bot-placed shorts all
+    # liquidated within 0-1 second of opening. One of the manual longs
+    # had its liquidation price come back EXACTLY equal to its entry price
+    # (Closed PnL: 0 USDT) — a real leveraged position should always have
+    # some buffer before liquidation, however small; identical entry/liq
+    # price with zero underlying price movement points to OKX's maintenance
+    # margin calculation for this specific contract being broken (most
+    # likely a Demo Trading-specific data/config issue), not anything our
+    # code or position sizing is doing. 5/5 for 5 attempts, both directions,
+    # three very different margin sizes — this is the contract, not us.
+    permanently_denied_symbols: frozenset = frozenset({"LINK-USDT-SWAP"})
+    # If a position gets liquidated within this many seconds of opening
+    # with less than `instant_liquidation_price_move_pct` adverse price
+    # move, it's flagged as an "instant liquidation" — the same signature
+    # seen on LINK-USDT-SWAP — and the symbol is auto-blacklisted for the
+    # rest of this run (see _finalize_closed_position). This won't survive
+    # a restart; anything caught this way should also be added to
+    # `permanently_denied_symbols` by hand once confirmed.
+    instant_liquidation_window_sec: float = 10.0
+    instant_liquidation_price_move_pct: float = 0.3
 
 
 @dataclass
@@ -99,6 +129,30 @@ def _round_to_step(value: float, step_str: str, rounding=ROUND_DOWN) -> float:
     return float(quant)
 
 
+def _decimals_from_step(step_str: str) -> int:
+    """'0.0000001' -> 7, '0.01' -> 2, '1' -> 0."""
+    exponent = Decimal(str(step_str)).as_tuple().exponent
+    return max(-exponent, 0) if isinstance(exponent, int) else 0
+
+
+def _format_price(value: float, step_str: str) -> str:
+    """Format a price as a plain fixed-point decimal string for the OKX
+    API — never scientific notation — with the instrument's own price
+    precision.
+
+    str(float) breaks silently for very small numbers: str(2.931e-06) ==
+    '2.931e-06'. OKX's API rejects that outright (HTTP 400, code=51000,
+    "Parameter tpTriggerPx error") since it expects plain decimal, not
+    scientific notation. This is exactly what happened placing a PEPE
+    take-profit — PEPE's price is small enough (~0.0000029) that
+    Python's default float-to-str flips to exponential form. Python's
+    'f' format spec always produces plain decimal regardless of
+    magnitude, so formatting with an explicit decimal count avoids the
+    bug entirely."""
+    decimals = _decimals_from_step(step_str)
+    return f"{value:.{decimals}f}"
+
+
 class ExecutionEngineBase(ABC):
     """Common interface so a live-trading engine can be swapped in later
     with minimal changes to tracker.py."""
@@ -122,6 +176,12 @@ class ExecutionEngineBase(ABC):
 
 class DemoFuturesExecutionEngine(ExecutionEngineBase):
     """Executes signals as real orders against OKX Demo Trading."""
+
+    # A position isn't checked for closure until it's been open at least
+    # this long, and even then a "not found" reading is re-confirmed after
+    # this short delay before being trusted — see monitor_positions().
+    _MIN_AGE_BEFORE_CLOSE_CHECK_SEC = 5.0
+    _CLOSE_CONFIRM_DELAY_SEC = 2.0
 
     def __init__(
         self,
@@ -316,7 +376,35 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
             direction=direction,
             take_profit_price=take_profit_price,
             size_contracts=deal_size,
+            price_precision=price_precision,
         )
+
+        if tp_order_id is None:
+            # TP placement failed even after retries. Leaving a leveraged
+            # position open with zero protection is how PEPE sat naked for
+            # over 2 hours and rode a liquidation down to -0.66 USDT
+            # instead of failing fast — so fail safe here: flatten the
+            # position we just opened immediately rather than hoping the
+            # next monitor cycle notices anything is wrong (it wouldn't;
+            # nothing about a TP-less position looks abnormal to
+            # monitor_positions until it's already liquidated).
+            log.error(
+                f"[execution] {symbol} — TP could not be placed after retries; "
+                f"flattening the just-opened position immediately instead of "
+                f"leaving it unprotected"
+            )
+            close_side = 3 if direction == "long" else 2
+            try:
+                await self._client.submit_order(
+                    symbol=symbol, side=close_side, size=deal_size, order_type="market"
+                )
+                log.warning(f"[execution] {symbol} — fail-safe close submitted")
+            except OKXAPIError as exc:
+                log.error(
+                    f"[execution] {symbol} — fail-safe close ALSO failed ({exc}); "
+                    f"this position is genuinely unprotected and needs manual attention"
+                )
+            return None
 
         log.info(
             f"[execution] {symbol} filled entry={deal_avg_price} size={deal_size} "
@@ -438,27 +526,46 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
             return _round_to_step(raw_tp, price_precision, rounding=ROUND_DOWN)
 
     async def _place_take_profit(
-        self, symbol: str, direction: str, take_profit_price: float, size_contracts: float
+        self,
+        symbol: str,
+        direction: str,
+        take_profit_price: float,
+        size_contracts: float,
+        price_precision: str,
+        attempts: int = 3,
+        retry_delay_sec: float = 1.0,
     ) -> Optional[str]:
         # Hedge-mode close sides: 3 closes a long, 2 closes a short.
         close_side = 3 if direction == "long" else 2
-        price_str = str(take_profit_price)
-        try:
-            result = await self._client.submit_tp_sl_order(
-                symbol=symbol,
-                order_type="take_profit",
-                side=close_side,
-                trigger_price=price_str,
-                executive_price=price_str,
-                price_type=1,
-                size=size_contracts,
-                plan_category=2,
-                category="market",
-            )
-            return str(result.get("order_id")) if result else None
-        except OKXAPIError as exc:
-            log.error(f"[execution] failed to place take-profit for {symbol}: {exc}")
-            return None
+        # Plain fixed-point string, never scientific notation — see
+        # _format_price(). Using str(take_profit_price) here was the bug
+        # that broke TP placement for PEPE (str(2.931e-06) == '2.931e-06',
+        # which OKX rejects as a malformed tpTriggerPx).
+        price_str = _format_price(take_profit_price, price_precision)
+        last_exc: Optional[OKXAPIError] = None
+        for attempt in range(1, attempts + 1):
+            try:
+                result = await self._client.submit_tp_sl_order(
+                    symbol=symbol,
+                    order_type="take_profit",
+                    side=close_side,
+                    trigger_price=price_str,
+                    executive_price=price_str,
+                    price_type=1,
+                    size=size_contracts,
+                    plan_category=2,
+                    category="market",
+                )
+                return str(result.get("order_id")) if result else None
+            except OKXAPIError as exc:
+                last_exc = exc
+                log.warning(
+                    f"[execution] TP placement attempt {attempt}/{attempts} failed for {symbol}: {exc}"
+                )
+                if attempt < attempts:
+                    await asyncio.sleep(retry_delay_sec)
+        log.error(f"[execution] failed to place take-profit for {symbol} after {attempts} attempts: {last_exc}")
+        return None
 
     # ------------------------------------------------------------------
     # Monitoring open positions
@@ -473,11 +580,31 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
 
         While a position stays open, it's also checked for a significant
         price move (see `_check_price_alert`) so a trade running against —
-        or in favor of — us gets surfaced without flooding the log."""
+        or in favor of — us gets surfaced without flooding the log.
+
+        A position is only eligible to be declared closed once it's been
+        open at least `_MIN_AGE_BEFORE_CLOSE_CHECK_SEC`, and even then only
+        after a SECOND "not found" reading a moment later confirms the
+        first one. Both guards exist because of a real incident: two
+        LINK-USDT-SWAP trades were marked closed (reason=unknown, no exit
+        price, no realized_pnl at all) only 5-8 seconds after opening,
+        with no closing trade findable anywhere — in positions-history,
+        the TP algo order, or a fills scan. The only explanation that fits
+        is that OKX's own position endpoint hadn't yet reflected the
+        brand-new position on that single read (an exchange-side
+        propagation gap), and a single empty reading was trusted as an
+        authoritative close. Both positions were almost certainly still
+        genuinely open and simply got orphaned from our tracking — dropped
+        from `_open_positions` while still live (and still exposed) on
+        the real exchange."""
         async with self._lock:
             tracked = {s: p for s, p in self._open_positions.items() if p is not None}
 
+        now = time.time()
         for symbol, pos in tracked.items():
+            if now - pos.opened_at < self._MIN_AGE_BEFORE_CLOSE_CHECK_SEC:
+                continue
+
             try:
                 positions = await self._client.get_position(symbol=symbol)
             except OKXAPIError as exc:
@@ -487,6 +614,25 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
             active = next((p for p in positions if float(p.get("current_amount", 0)) > 0), None)
 
             if active is None:
+                # First reading says gone — don't trust it alone. Wait a
+                # beat and check again before treating this as a real close.
+                await asyncio.sleep(self._CLOSE_CONFIRM_DELAY_SEC)
+                try:
+                    positions_confirm = await self._client.get_position(symbol=symbol)
+                except OKXAPIError as exc:
+                    log.warning(f"[execution] position re-check failed for {symbol}: {exc}")
+                    continue
+                active_confirm = next(
+                    (p for p in positions_confirm if float(p.get("current_amount", 0)) > 0), None
+                )
+                if active_confirm is not None:
+                    log.info(
+                        f"[execution] {symbol} — first close check came back empty but the "
+                        f"confirming re-check found it still open; treating as a transient read"
+                    )
+                    await self._check_price_alert(symbol, pos, active_confirm)
+                    continue
+
                 async with self._lock:
                     closed = self._open_positions.pop(symbol, None)
                 if closed is not None:
@@ -496,14 +642,26 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
             await self._check_price_alert(symbol, pos, active)
 
     async def _finalize_closed_position(self, symbol: str, closed: OpenPosition) -> None:
-        exit_price, realized_pnl, closing_fee, close_reason = await self._get_close_details(symbol, closed)
+        exit_price, realized_pnl, closing_fee, close_reason, net_pnl = await self._get_close_details(symbol, closed)
         closed_at = time.time()
+
+        if net_pnl is None and realized_pnl is not None and closing_fee is not None:
+            # OKX's own realizedPnl wasn't available (fills-scan fallback
+            # path) — fall back to a local approximation. Note this can't
+            # account for a liquidation penalty the way OKX's own field
+            # does, so it's a strictly worse number than the real thing.
+            net_pnl = realized_pnl - closed.opening_fee - closing_fee
+            log.warning(
+                f"[execution] {symbol} — OKX's own net_pnl wasn't available; using a local "
+                f"approximation ({net_pnl:.8f}) that can't account for any liquidation penalty"
+            )
 
         log.info(
             f"[execution] {symbol} position closed (entry={closed.entry_price} exit={exit_price} "
-            f"take_profit={closed.take_profit_price} realized_pnl={realized_pnl} reason={close_reason}) — "
-            f"slot freed ({len(self._open_positions)}/{self.config.max_open_positions} open, "
-            f"{self._total_opened}/{self.config.max_total_trades} lifetime trades)"
+            f"take_profit={closed.take_profit_price} realized_pnl={realized_pnl} net_pnl={net_pnl} "
+            f"reason={close_reason}) — slot freed ({len(self._open_positions)}/"
+            f"{self.config.max_open_positions} open, {self._total_opened}/{self.config.max_total_trades} "
+            f"lifetime trades)"
         )
 
         if self._position_store is not None:
@@ -512,18 +670,24 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
                 exit_price=exit_price,
                 realized_pnl=realized_pnl,
                 closing_fee=closing_fee,
+                net_pnl=net_pnl,
                 close_reason=close_reason,
                 closed_at=closed_at,
             )
 
     async def _get_close_details(self, symbol: str, closed: OpenPosition):
         """Looks up the exchange's own closed-position record to get the
-        real exit price, realized PnL, and closing fee — never estimated.
+        real exit price, realized PnL, closing fee, and net PnL — never
+        estimated when OKX provides the real figure.
 
         This reads /api/v5/account/positions-history (via
         get_closed_position()), which is the endpoint OKX actually
         populates with a genuine realized-PnL field for closed swap
-        positions, plus a `close_type` that says exactly how it closed.
+        positions, plus a `close_type` that says exactly how it closed,
+        plus its own fully-netted `realizedPnl` (returned here as
+        net_pnl — see get_closed_position()'s docstring for why this is
+        preferred over reconstructing it from realized_pnl/fees locally:
+        that reconstruction silently drops any liquidation penalty).
         The record can lag a beat behind the position showing as closed
         in monitor_positions(), so this retries a few times first.
 
@@ -534,12 +698,24 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         the trade actually won or lost. That fallback is kept below only
         for the rare case positions-history hasn't produced a row yet,
         in which case exit_price/closing_fee can still be recovered from
-        fills, but realized_pnl will (as before) come back as 0 there —
-        logged clearly so it isn't mistaken for a real zero-PnL trade."""
+        fills, but realized_pnl and net_pnl will (as before) come back
+        as 0/None there — logged clearly so it isn't mistaken for a real
+        zero-PnL trade.
+
+        Retry budget: a real incident showed OKX can take longer than a
+        few seconds to index a liquidation into positions-history — two
+        LINK-USDT-SWAP positions were liquidated within the same second
+        they opened (confirmed after the fact in the exchange's own UI:
+        real liq price, real -0.02 fee, real -1.13/-1.06 realized PnL —
+        all of it), but this method exhausted its old, shorter retry
+        budget before that record became queryable and gave up with
+        close_reason="unknown" and every number null. The position really
+        was closed; we just stopped looking too early. Budget widened
+        accordingly below."""
         opened_at_ms = closed.opened_at * 1000.0
 
         history_row = None
-        for attempt in range(1, 4):
+        for attempt in range(1, 9):
             try:
                 history_row = await self._client.get_closed_position(symbol, opened_at_ms)
             except OKXAPIError as exc:
@@ -547,8 +723,8 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
                 history_row = None
             if history_row is not None:
                 break
-            if attempt < 3:
-                await asyncio.sleep(0.5)
+            if attempt < 8:
+                await asyncio.sleep(1.0)
 
         if history_row is not None and history_row.get("exit_price") not in (None, ""):
             close_type = str(history_row.get("close_type") or "")
@@ -585,6 +761,7 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
                 history_row["realized_pnl"],
                 closing_fee,
                 close_reason,
+                history_row.get("net_pnl"),
             )
 
         log.warning(
@@ -597,7 +774,9 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         """Fallback used only when positions-history hasn't produced a row
         for this close yet. Recovers exit_price/closing_fee/close_reason
         from raw fills, same as the original implementation — but cannot
-        recover a real realized_pnl this way (see _get_close_details)."""
+        recover a real realized_pnl or net_pnl this way (see
+        _get_close_details); net_pnl comes back None so the caller falls
+        back to a local approximation."""
         resolved_order_id = await self._resolve_tp_execution_order_id(symbol, closed)
 
         opened_at_ms = closed.opened_at * 1000.0
@@ -605,7 +784,7 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         closing_side = "sell" if closed.direction == "long" else "buy"
 
         closing_trades: List[dict] = []
-        for attempt in range(1, 4):
+        for attempt in range(1, 6):
             try:
                 if resolved_order_id:
                     trades = await self._client.get_trades(symbol=symbol, order_id=resolved_order_id)
@@ -624,22 +803,22 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
                 ]
             if closing_trades:
                 break
-            if attempt < 3:
-                await asyncio.sleep(0.5)
+            if attempt < 5:
+                await asyncio.sleep(1.0)
 
         if not closing_trades:
-            return None, None, None, "unknown"
+            return None, None, None, "unknown", None
 
         total_vol = sum(float(t.get("vol", 0) or 0) for t in closing_trades)
         if total_vol <= 0:
-            return None, None, None, "unknown"
+            return None, None, None, "unknown", None
 
         exit_price = sum(float(t.get("price", 0) or 0) * float(t.get("vol", 0) or 0) for t in closing_trades) / total_vol
         realized_pnl = sum(float(t.get("realised_profit", 0) or 0) for t in closing_trades)
         closing_fee = sum(float(t.get("paid_fees", 0) or 0) for t in closing_trades)
 
         close_reason = "take_profit" if resolved_order_id else "liquidation_or_other"
-        return exit_price, realized_pnl, closing_fee, close_reason
+        return exit_price, realized_pnl, closing_fee, close_reason, None
 
     async def _resolve_tp_execution_order_id(self, symbol: str, closed: OpenPosition) -> Optional[str]:
         """`closed.tp_order_id` is the algoId of the TP algo order placed at
