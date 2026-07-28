@@ -320,9 +320,13 @@ class OKXFuturesClient:
         this endpoint against a live response before trusting this in
         production; not double-checked against a live demo response here."""
         mgn_mode = "isolated" if open_type == "isolated" else "cross"
+        # OKX rejects this endpoint (code=50015) without instFamily or uly —
+        # instId alone isn't enough. instFamily is just instId with the
+        # "-SWAP" suffix dropped (e.g. "ETH-USDT-SWAP" -> "ETH-USDT").
+        inst_family = symbol[: -len("-SWAP")] if symbol.endswith("-SWAP") else symbol
         data = await self._request(
             "GET", "/api/v5/public/position-tiers",
-            params={"instType": INST_TYPE, "tdMode": mgn_mode, "instId": symbol},
+            params={"instType": INST_TYPE, "tdMode": mgn_mode, "instFamily": inst_family, "instId": symbol},
         )
         rows = data or []
         if not rows:
