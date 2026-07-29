@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Deque, Dict, List, Optional, Tuple
 
+from confidence_engine import ConfidenceEngine, ConfidenceEngineConfig, DEFAULT_CATEGORY_WEIGHTS
+
 
 class MarketDataStore:
     def __init__(self) -> None:
@@ -620,7 +622,7 @@ class SignalConfig:
     max_data_age_sec: float = 5.0
     min_liquidity: float = 0.0
     order_flow_window_ms: int = 1000
-    min_confirmations: int = 5
+    min_confirmations: int = 5  # deprecated: no longer used now that confidence is continuous, see min_confidence below
     take_profit_pct: float = 0.002
     stop_loss_pct: float = 0.005
     cooldown_sec: float = 5.0
@@ -647,6 +649,13 @@ class SignalConfig:
     book_imbalance_distance_bands: Tuple[float, ...] = (0.001, 0.0025, 0.005, 0.01)
     book_imbalance_check_band: float = 0.001
     book_imbalance_ratio_threshold: float = 1.2
+
+    # --- Weighted confidence engine (replaces binary majority voting) ---
+    # Per-category weights for the continuous confidence model. Renormalized
+    # automatically if they don't sum to 1.0, so it's safe to tune any subset.
+    confidence_category_weights: Dict[str, float] = field(default_factory=lambda: dict(DEFAULT_CATEGORY_WEIGHTS))
+    # Bar a direction's weighted score must clear to produce a signal at all.
+    min_confidence: float = 0.55
 
 
 @dataclass
@@ -678,6 +687,12 @@ class SignalGenerator:
         self.config = config or SignalConfig()
         self._price_history: Dict[str, Deque[Tuple[float, float]]] = defaultdict(deque)
         self._last_signal_time: Dict[str, float] = {}
+        self._confidence_engine = ConfidenceEngine(
+            ConfidenceEngineConfig(
+                category_weights=self.config.confidence_category_weights,
+                min_confidence=self.config.min_confidence,
+            )
+        )
 
     def _update_price_history(self, symbol: str, price: float, now: float) -> None:
         history = self._price_history[symbol]
@@ -744,75 +759,22 @@ class SignalGenerator:
             return None
 
         # --- Section 2: directional signal layer (predictive, confidence-bearing) ---
-        buy_dominant = (flow["sell_volume"] == 0 and flow["buy_volume"] > 0) or (
-            flow["sell_volume"] > 0 and flow["buy_volume"] / flow["sell_volume"] >= cfg.volume_ratio_threshold
+        # Continuous, category-weighted confidence engine (see confidence_engine.py)
+        # replaces the old binary majority vote. Quality/prerequisite checks above
+        # already gated whether we got this far and never factor into this score.
+        result = self._confidence_engine.evaluate(
+            flow=flow,
+            liquidity=liquidity,
+            book=book,
+            price_change_pct=price_change_pct,
+            cfg=cfg,
         )
-        sell_dominant = (flow["buy_volume"] == 0 and flow["sell_volume"] > 0) or (
-            flow["buy_volume"] > 0 and flow["sell_volume"] / flow["buy_volume"] >= cfg.volume_ratio_threshold
-        )
-
-        long_checks = {
-            "buy volume exceeds sell volume": buy_dominant,
-            "bid liquidity exceeds ask liquidity": liquidity["bid_liquidity"] > liquidity["ask_liquidity"],
-            "price moving upward": price_change_pct is not None and price_change_pct >= cfg.min_price_move_pct,
-        }
-        short_checks = {
-            "sell volume exceeds buy volume": sell_dominant,
-            "ask liquidity exceeds bid liquidity": liquidity["ask_liquidity"] > liquidity["bid_liquidity"],
-            "price moving downward": price_change_pct is not None and price_change_pct <= -cfg.min_price_move_pct,
-        }
-
-        # --- Additional directional order-flow checks, each independently toggled ---
-        if cfg.enable_aggressive_order_detection:
-            long_checks["aggressive buyers in control"] = flow.get("aggressive_buy_pct", 0.0) >= cfg.aggressive_dominance_pct
-            short_checks["aggressive sellers in control"] = flow.get("aggressive_sell_pct", 0.0) >= cfg.aggressive_dominance_pct
-
-        if cfg.enable_whale_detection:
-            long_checks["whale buying detected"] = (
-                flow.get("whale_buy_count", 0) > 0 and flow.get("whale_buy_volume", 0.0) > flow.get("whale_sell_volume", 0.0)
-            )
-            short_checks["whale selling detected"] = (
-                flow.get("whale_sell_count", 0) > 0 and flow.get("whale_sell_volume", 0.0) > flow.get("whale_buy_volume", 0.0)
-            )
-
-        if cfg.enable_trade_intensity:
-            buy_tps = flow.get("buy_trades_per_sec", 0.0)
-            sell_tps = flow.get("sell_trades_per_sec", 0.0)
-            long_checks["buy trade intensity elevated"] = (sell_tps == 0 and buy_tps > 0) or (
-                sell_tps > 0 and buy_tps / sell_tps >= cfg.intensity_dominance_ratio
-            )
-            short_checks["sell trade intensity elevated"] = (buy_tps == 0 and sell_tps > 0) or (
-                buy_tps > 0 and sell_tps / buy_tps >= cfg.intensity_dominance_ratio
-            )
-
-        if cfg.enable_streak_detection:
-            long_checks["active buy streak"] = flow.get("current_buy_streak", 0) >= cfg.streak_confirmation_length
-            short_checks["active sell streak"] = flow.get("current_sell_streak", 0) >= cfg.streak_confirmation_length
-
-        if cfg.enable_book_imbalance_by_distance:
-            band = (liquidity.get("band_imbalance") or {}).get(cfg.book_imbalance_check_band)
-            if band:
-                long_checks["near-book liquidity favors bids"] = band["bid_ask_ratio"] >= cfg.book_imbalance_ratio_threshold
-                short_checks["near-book liquidity favors asks"] = band["ask_bid_ratio"] >= cfg.book_imbalance_ratio_threshold
-
-        long_count = sum(long_checks.values())
-        short_count = sum(short_checks.values())
-
-        if long_count >= cfg.min_confirmations and long_count > short_count:
-            direction = "long"
-            checks = long_checks
-            confirmations = long_count
-        elif short_count >= cfg.min_confirmations and short_count > long_count:
-            direction = "short"
-            checks = short_checks
-            confirmations = short_count
-        else:
+        if result.direction is None:
             return None
 
-        # Confidence reflects directional probability only — quality/prerequisite
-        # checks already gated whether we got this far and never factor in here.
-        confidence = confirmations / len(checks)
-        reasons = [name for name, passed in checks.items() if passed]
+        direction = result.direction
+        confidence = result.confidence
+        reasons = result.reason_lines()
         passed_prerequisites = [name for name, passed in prerequisite_checks.items() if passed]
 
         if direction == "long":
