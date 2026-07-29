@@ -690,8 +690,27 @@ class SignalConfig:
     signal_persistence_ms: float = 300.0
 
     # --- Priority 4: confidence edge ---
-    # Minimum required gap between LONG and SHORT confidence.
-    min_confidence_edge: float = 0.15
+    # Minimum required gap between LONG and SHORT confidence for a signal to
+    # pass at full strength. Lowered from 0.15: at 0.15 the bot waited for
+    # the two sides' scores to separate by a lot before acting, which is a
+    # direct cause of "predicts the right side but enters late" — the edge
+    # widens as a move develops, so a high hard bar means the easy, early
+    # part of the move is already gone by the time it clears. Below
+    # min_confidence_edge but above min_confidence_edge_floor, confidence is
+    # now damped smoothly (see ConfidenceEngine) rather than rejected
+    # outright, so this number is a "full strength" threshold, not a wall.
+    min_confidence_edge: float = 0.10
+    # Below this, LONG and SHORT are genuinely too close to call and the
+    # signal is dropped outright — this is the actual conflict-detection
+    # floor (objective 6). Defaults to 40% of min_confidence_edge.
+    min_confidence_edge_floor: float = 0.04
+    # Exponent applied when no corroborating trades exist in the analysis
+    # window at all (see ConfidenceEngine._decay_factor). Lower = less
+    # punishing. Previously hardcoded to 4 (~0.06x multiplier), which could
+    # zero out otherwise-valid order-book/liquidity-driven signals on
+    # quieter symbols; 1.5 (~0.35x) still penalizes staleness but doesn't
+    # bury the signal entirely.
+    no_trades_decay_exponent: float = 1.5
 
     # --- Priority 5: category agreement ---
     # A category counts as "disagreeing" if its aligned-direction score

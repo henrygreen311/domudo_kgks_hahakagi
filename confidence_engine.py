@@ -134,6 +134,7 @@ class ConfidenceResult:
     decay_factor: float = 1.0
     agreement_penalty_applied: bool = False
     overextension_penalty_applied: bool = False
+    edge_ramp_penalty_applied: bool = False  # PRIORITY 4 (revised): soft edge ramp instead of hard cutoff
 
     def explain(self) -> str:
         """Human-readable breakdown, in the format from the design doc."""
@@ -150,6 +151,8 @@ class ConfidenceResult:
         lines.append(f"SHORT confidence: {self.short_confidence:.0%}")
         lines.append(f"Edge: {self.edge:.0%}")
         lines.append(f"Time decay factor: {self.decay_factor:.2f}")
+        if self.edge_ramp_penalty_applied:
+            lines.append("Edge ramp penalty applied (edge below min but above floor)")
         if self.agreement_penalty_applied:
             lines.append("Category agreement penalty applied")
         if self.overextension_penalty_applied:
@@ -174,6 +177,8 @@ class ConfidenceResult:
             lines.append(f"{cat.name} ({side_score:.2f}, weight {cat.weight:.2f}): {metric_bits}")
         lines.append(f"long={self.long_confidence:.2f} short={self.short_confidence:.2f} edge={self.edge:.2f}")
         lines.append(f"time_decay={self.decay_factor:.2f}")
+        if self.edge_ramp_penalty_applied:
+            lines.append("edge_ramp_penalty=applied")
         if self.agreement_penalty_applied:
             lines.append("category_agreement_penalty=applied")
         if self.overextension_penalty_applied:
@@ -494,8 +499,29 @@ class ConfidenceEngine:
                 confidence, by_name, direction, price, market, cfg,
             )
 
+        # --- PRIORITY 4 (revised): soft edge ramp instead of a hard cutoff ---
+        # A hard "edge < min_edge -> reject" rule throws away signals that
+        # are correct-but-early: edge naturally starts small and widens as
+        # a move develops, so a hard gate forces the bot to wait until the
+        # move is already well underway (the "enters too late" complaint).
+        # Below `edge_floor` the two sides are genuinely too close to call
+        # and we still reject outright (this is the actual conflict-detection
+        # behavior from objective 6). Between the floor and min_edge, confidence
+        # is damped proportionally to how thin the edge is, rather than
+        # binary pass/fail — a strong, well-corroborated signal can still
+        # clear min_confidence even with a modest edge; a weak one won't.
+        edge_ramp_penalty_applied = False
+        edge_floor = getattr(cfg, "min_confidence_edge_floor", min_edge * 0.4)
+        if direction is not None and edge < min_edge:
+            if edge <= edge_floor:
+                direction = None
+            else:
+                ramp = (edge - edge_floor) / (min_edge - edge_floor)
+                confidence *= (0.6 + 0.4 * ramp)  # damp 60-100% of confidence, never fully zeroed here
+                edge_ramp_penalty_applied = True
+
         min_confidence = getattr(cfg, "min_confidence", self.config.min_confidence)
-        if direction is not None and (confidence < min_confidence or edge < min_edge):
+        if direction is not None and confidence < min_confidence:
             direction = None
 
         return ConfidenceResult(
@@ -508,6 +534,7 @@ class ConfidenceEngine:
             decay_factor=decay_factor,
             agreement_penalty_applied=agreement_penalty_applied,
             overextension_penalty_applied=overextension_penalty_applied,
+            edge_ramp_penalty_applied=edge_ramp_penalty_applied,
         )
 
     @staticmethod
@@ -515,8 +542,14 @@ class ConfidenceEngine:
         half_life_ms = getattr(cfg, "confidence_half_life_ms", 2500.0) or 2500.0
         if not trades:
             # No corroborating trades at all within the analysis window:
-            # treat as maximally stale rather than silently full-strength.
-            return 0.5 ** 4
+            # treat as stale rather than silently full-strength, but not so
+            # stale it effectively zeroes out order-book/liquidity-only
+            # setups on quieter symbols (previously 0.5**4 ~= 0.06x, which
+            # buried almost every quiet-symbol signal regardless of how
+            # strong the book/liquidity evidence was). Configurable so it
+            # can be tuned per symbol tier without touching this module.
+            exponent = getattr(cfg, "no_trades_decay_exponent", 1.5)
+            return 0.5 ** exponent
         newest_ts = max(t["timestamp"] for t in trades)
         age_ms = max(0.0, now_ms - newest_ts)
         return 0.5 ** (age_ms / half_life_ms)
