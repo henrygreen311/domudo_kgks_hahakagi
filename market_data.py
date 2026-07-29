@@ -29,6 +29,20 @@ class MarketDataStore:
         except (TypeError, ValueError):
             return
 
+        # 24h high/low, used only by the Priority-7 overextension filter.
+        # Optional: feeds that omit these simply disable that filter rather
+        # than defaulting to a value that could look like a false extreme.
+        high_24h = low_24h = None
+        try:
+            high_raw = _first_present(payload, ("high_24h", "high24h", "high"))
+            if high_raw is not None:
+                high_24h = float(high_raw)
+            low_raw = _first_present(payload, ("low_24h", "low24h", "low"))
+            if low_raw is not None:
+                low_24h = float(low_raw)
+        except (TypeError, ValueError):
+            high_24h = low_24h = None
+
         entry = {
             "last_price": last_price,
             "mark_price": mark_price,
@@ -37,6 +51,8 @@ class MarketDataStore:
             "spread": best_ask - best_bid,
             "bid_volume": bid_volume,
             "ask_volume": ask_volume,
+            "high_24h": high_24h,
+            "low_24h": low_24h,
             "last_update": time.time(),
         }
 
@@ -492,6 +508,12 @@ class OrderFlowAnalyzer:
             per_window = self._metrics.get(symbol)
             return dict(per_window[window_ms]) if per_window and window_ms in per_window else None
 
+    async def get_recent_trades(self, symbol: str, window_ms: int) -> List[dict]:
+        """Raw trades backing the metrics above — used by the confidence
+        engine's VWAP indicator (Priority 6) and time-decay calc (Priority 2),
+        neither of which can be derived from the aggregated metrics dict."""
+        return await self._trade_store.get_window(symbol, window_ms)
+
     async def snapshot(self) -> Dict[str, Dict[int, dict]]:
         async with self._lock:
             return {symbol: {w: dict(m) for w, m in windows.items()} for symbol, windows in self._metrics.items()}
@@ -657,6 +679,42 @@ class SignalConfig:
     # Bar a direction's weighted score must clear to produce a signal at all.
     min_confidence: float = 0.55
 
+    # --- Priority 2: continuous confidence time decay ---
+    # Smooth exponential decay (half-life form) based on the age of the
+    # newest relevant trade, rather than a fixed staleness penalty.
+    confidence_half_life_ms: float = 2500.0
+
+    # --- Priority 3: signal persistence ---
+    # Confidence + direction must remain valid for this long before a
+    # signal is allowed through to EventConfirmationEngine.
+    signal_persistence_ms: float = 300.0
+
+    # --- Priority 4: confidence edge ---
+    # Minimum required gap between LONG and SHORT confidence.
+    min_confidence_edge: float = 0.15
+
+    # --- Priority 5: category agreement ---
+    # A category counts as "disagreeing" if its aligned-direction score
+    # minus its opposing-direction score falls below this (net negative
+    # means the category actually favors the other side).
+    category_disagreement_threshold: float = -0.35
+    category_agreement_penalty: float = 0.15  # fractional confidence reduction
+
+    # --- Priority 6: VWAP indicator (part of the Order Flow category) ---
+    enable_vwap_indicator: bool = False
+    vwap_window_ms: int = 60_000
+    vwap_max_deviation_pct: float = 0.003  # deviation from VWAP for full-strength signal
+    vwap_strength_cap: float = 0.6  # extra damping so VWAP can't dominate its category
+
+    # --- Priority 7: smart overextension filter ---
+    enable_overextension_filter: bool = True
+    overextension_proximity_pct: float = 0.0015  # how close to 24h high/low counts as "at the extreme"
+    overextension_weak_threshold: float = 0.25  # momentum/order-flow aligned score below this = "weak"
+    overextension_penalty: float = 0.25  # fractional confidence reduction when both conditions hold
+
+    # Ratio scale used by the plain aggressive buy/sell ratio indicator.
+    flow_ratio_scale: float = 1.5
+
 
 @dataclass
 class Signal:
@@ -669,6 +727,39 @@ class Signal:
     timestamp: float
     reasons: List[str] = field(default_factory=list)
     prerequisites: List[str] = field(default_factory=list)
+
+
+class SignalPersistenceTracker:
+    """Priority 3 — signal persistence.
+
+    Deliberately NOT part of ConfidenceEngine: that module's only job is
+    computing a confidence score, not deciding when a signal is "settled"
+    enough to execute. This tracker just watches, per symbol, whether a
+    direction has stayed valid continuously for `duration_ms` before
+    letting SignalGenerator hand anything to EventConfirmationEngine.
+    """
+
+    def __init__(self) -> None:
+        self._pending: Dict[str, Tuple[str, float]] = {}  # symbol -> (direction, first_seen_time)
+
+    def check(self, symbol: str, direction: Optional[str], now: float, duration_ms: float) -> bool:
+        """Returns True once `direction` has held continuously for
+        `duration_ms`. Any direction change or a None (confidence dropped
+        below threshold) resets/cancels the pending timer."""
+        if direction is None:
+            self._pending.pop(symbol, None)
+            return False
+
+        pending = self._pending.get(symbol)
+        if pending is None or pending[0] != direction:
+            self._pending[symbol] = (direction, now)
+            return False
+
+        first_seen = pending[1]
+        return (now - first_seen) * 1000.0 >= duration_ms
+
+    def clear(self, symbol: str) -> None:
+        self._pending.pop(symbol, None)
 
 
 class SignalGenerator:
@@ -693,6 +784,7 @@ class SignalGenerator:
                 min_confidence=self.config.min_confidence,
             )
         )
+        self._persistence = SignalPersistenceTracker()
 
     def _update_price_history(self, symbol: str, price: float, now: float) -> None:
         history = self._price_history[symbol]
@@ -762,14 +854,29 @@ class SignalGenerator:
         # Continuous, category-weighted confidence engine (see confidence_engine.py)
         # replaces the old binary majority vote. Quality/prerequisite checks above
         # already gated whether we got this far and never factor into this score.
+        # Raw trades feed the VWAP indicator and time-decay calc inside the
+        # engine; neither is derivable from the pre-aggregated `flow` dict.
+        recent_trades = await self._order_flow.get_recent_trades(
+            symbol, max(cfg.vwap_window_ms, cfg.order_flow_window_ms)
+        )
         result = self._confidence_engine.evaluate(
             flow=flow,
             liquidity=liquidity,
             book=book,
             price_change_pct=price_change_pct,
             cfg=cfg,
+            trades=recent_trades,
+            price=price,
+            market=market,
+            now_ms=now * 1000.0,
         )
-        if result.direction is None:
+
+        # --- Priority 3: signal persistence ---
+        # ConfidenceEngine only reports the instantaneous score; whether it's
+        # held long enough to act on is this tracker's job alone, so that
+        # ConfidenceEngine stays purely a scoring module.
+        persisted = self._persistence.check(symbol, result.direction, now, cfg.signal_persistence_ms)
+        if result.direction is None or not persisted:
             return None
 
         direction = result.direction
@@ -785,6 +892,7 @@ class SignalGenerator:
             stop_loss = price * (1 + cfg.stop_loss_pct)
 
         self._last_signal_time[symbol] = now
+        self._persistence.clear(symbol)
 
         return Signal(
             symbol=symbol,
