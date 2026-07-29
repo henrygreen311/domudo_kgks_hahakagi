@@ -749,21 +749,12 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         all of it), but this method exhausted its old, shorter retry
         budget before that record became queryable and gave up with
         close_reason="unknown" and every number null. The position really
-        was closed; we just stopped looking too early.
-
-        That first widening (8 attempts, 1s apart — ~8s total) turned out
-        to still be too short: a full day of live trades (see the 07/28
-        log) hit "no positions-history record yet" on every single close,
-        with the fills-scan fallback below also timing out on every one
-        of them. OKX's indexing lag here is apparently tens of seconds,
-        not single-digit — so this now spreads 12 attempts over roughly
-        90s (backing off from 2s up to a 10s ceiling) instead of hammering
-        every second for 8 seconds and giving up."""
+        was closed; we just stopped looking too early. Budget widened
+        accordingly below."""
         opened_at_ms = closed.opened_at * 1000.0
 
         history_row = None
-        delay = 2.0
-        for attempt in range(1, 13):
+        for attempt in range(1, 9):
             try:
                 history_row = await self._client.get_closed_position(symbol, opened_at_ms)
             except OKXAPIError as exc:
@@ -771,9 +762,8 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
                 history_row = None
             if history_row is not None:
                 break
-            if attempt < 12:
-                await asyncio.sleep(delay)
-                delay = min(delay * 1.3, 10.0)
+            if attempt < 8:
+                await asyncio.sleep(1.0)
 
         if history_row is not None and history_row.get("exit_price") not in (None, ""):
             close_type = str(history_row.get("close_type") or "")
@@ -825,13 +815,7 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         from raw fills, same as the original implementation — but cannot
         recover a real realized_pnl or net_pnl this way (see
         _get_close_details); net_pnl comes back None so the caller falls
-        back to a local approximation.
-
-        Retry budget widened alongside _get_close_details's, for the same
-        reason: every close in the 07/28 log ran this out too (5 attempts,
-        1s apart), meaning /trade/fills was also still empty by the time
-        we gave up. 8 attempts backing off from 2s to a 6s ceiling gives
-        this a real chance without stalling monitor_positions() forever."""
+        back to a local approximation."""
         resolved_order_id = await self._resolve_tp_execution_order_id(symbol, closed)
 
         opened_at_ms = closed.opened_at * 1000.0
@@ -839,8 +823,7 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         closing_side = "sell" if closed.direction == "long" else "buy"
 
         closing_trades: List[dict] = []
-        delay = 2.0
-        for attempt in range(1, 9):
+        for attempt in range(1, 6):
             try:
                 if resolved_order_id:
                     trades = await self._client.get_trades(symbol=symbol, order_id=resolved_order_id)
@@ -859,9 +842,8 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
                 ]
             if closing_trades:
                 break
-            if attempt < 8:
-                await asyncio.sleep(delay)
-                delay = min(delay * 1.3, 6.0)
+            if attempt < 5:
+                await asyncio.sleep(1.0)
 
         if not closing_trades:
             return None, None, None, "unknown", None

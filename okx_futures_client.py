@@ -349,13 +349,8 @@ class OKXFuturesClient:
         return _f(sorted_rows[-1], "mmr")
 
     async def get_trade_fee_rate(self, symbol: str) -> dict:
-        # Same class of bug as position-tiers: OKX rejects this endpoint
-        # (code=50016 "instId and instType don't match") for instType=SWAP
-        # without instFamily. instId alone isn't sufficient.
-        inst_family = symbol[: -len("-SWAP")] if symbol.endswith("-SWAP") else symbol
         data = await self._request(
-            "GET", "/api/v5/account/trade-fee",
-            params={"instType": INST_TYPE, "instFamily": inst_family, "instId": symbol}, auth=True
+            "GET", "/api/v5/account/trade-fee", params={"instType": INST_TYPE, "instId": symbol}, auth=True
         )
         rows = data or []
         row = rows[0] if rows else {}
