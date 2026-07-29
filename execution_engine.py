@@ -30,7 +30,6 @@ from typing import Dict, List, Optional
 
 from okx_futures_client import OKXAPIError, OKXFuturesClient
 from market_data import Signal
-from liquidation_guard import check_liquidation_distance
 
 log = logging.getLogger("okx_futures.execution")
 
@@ -100,17 +99,6 @@ class ExecutionConfig:
     # `permanently_denied_symbols` by hand once confirmed.
     instant_liquidation_window_sec: float = 10.0
     instant_liquidation_price_move_pct: float = 0.3
-
-    # --- Pre-trade liquidation-distance guard ---
-    # Before ever submitting an order, estimate how many price ticks
-    # separate the entry price from the estimated liquidation price; if
-    # it's fewer than min_liquidation_distance_ticks, discard the signal.
-    # This is what OP-USDT-SWAP order #181 needed: it opened and closed in
-    # the same second, liquidated just 13 ticks from its entry price — a
-    # trade that close to liquidation before it even opens isn't a real
-    # trade, it's a coin-flip against noise. See liquidation_guard.py.
-    enable_liquidation_guard: bool = True
-    min_liquidation_distance_ticks: float = 100.0
 
 
 @dataclass
@@ -327,33 +315,6 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
                 f"${cfg.margin_per_trade_usdt} margin at {leverage}x can buy — signal discarded"
             )
             return None
-
-        if cfg.enable_liquidation_guard:
-            try:
-                mmr = await self._client.get_position_tier_mmr(symbol, cfg.open_type, notional_usdt)
-            except OKXAPIError as exc:
-                log.warning(
-                    f"[execution] {symbol} — could not fetch maintenance margin rate for the "
-                    f"liquidation guard ({exc}); discarding rather than trading blind"
-                )
-                return None
-
-            liq_check = check_liquidation_distance(
-                entry_price=signal.entry_price,
-                leverage=leverage,
-                mmr=mmr,
-                direction=direction,
-                tick_size=price_precision,
-                min_distance_ticks=cfg.min_liquidation_distance_ticks,
-            )
-            if not liq_check.approved:
-                log.info(f"[execution] {symbol} {direction.upper()} — {liq_check.reason}")
-                return None
-            log.info(
-                f"[execution] {symbol} {direction.upper()} liquidation guard passed — "
-                f"est. liq={liq_check.liquidation_price:.8f} "
-                f"({liq_check.distance_ticks:.1f} ticks from entry {signal.entry_price})"
-            )
 
         try:
             await self._client.submit_leverage(symbol, leverage, cfg.open_type, direction=direction)

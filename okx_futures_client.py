@@ -302,52 +302,6 @@ class OKXFuturesClient:
     # Account / private GET
     # ------------------------------------------------------------------
 
-    async def get_position_tier_mmr(self, symbol: str, open_type: str, notional_usdt: float) -> float:
-        """Returns the maintenance margin rate (mmr, e.g. 0.005 = 0.5%) OKX
-        would apply to a position of `notional_usdt` on `symbol`, via
-        /api/v5/public/position-tiers.
-
-        MMR is tiered by position notional — larger positions sit in
-        higher tiers with a higher mmr — so this picks the tier whose
-        [minSz, maxSz] bracket actually contains notional_usdt rather than
-        always assuming tier 1. Falls back to the highest tier if
-        notional_usdt exceeds every bracket.
-
-        Used only by the pre-trade liquidation-distance guard
-        (liquidation_guard.py) — never for anything that needs to be
-        exact to the tick, since it's an estimate going into an estimate.
-        VERIFY minSz/maxSz's exact units (USDT notional vs. contracts) on
-        this endpoint against a live response before trusting this in
-        production; not double-checked against a live demo response here."""
-        mgn_mode = "isolated" if open_type == "isolated" else "cross"
-        # OKX rejects this endpoint (code=50015) without instFamily or uly —
-        # instId alone isn't enough. instFamily is just instId with the
-        # "-SWAP" suffix dropped (e.g. "ETH-USDT-SWAP" -> "ETH-USDT").
-        inst_family = symbol[: -len("-SWAP")] if symbol.endswith("-SWAP") else symbol
-        data = await self._request(
-            "GET", "/api/v5/public/position-tiers",
-            params={"instType": INST_TYPE, "tdMode": mgn_mode, "instFamily": inst_family, "instId": symbol},
-        )
-        rows = data or []
-        if not rows:
-            raise OKXAPIError(f"No position-tier data returned for {symbol}")
-
-        def _f(row, key, default=0.0):
-            try:
-                return float(row.get(key, default) or default)
-            except (TypeError, ValueError):
-                return default
-
-        sorted_rows = sorted(rows, key=lambda r: _f(r, "minSz"))
-        for row in sorted_rows:
-            min_sz, max_sz = _f(row, "minSz"), _f(row, "maxSz")
-            upper_bound = max_sz if max_sz > 0 else float("inf")
-            if min_sz <= notional_usdt <= upper_bound:
-                return _f(row, "mmr")
-        # notional_usdt fell outside every bracket (e.g. above the top
-        # tier's maxSz) — use the highest tier's rate rather than guessing.
-        return _f(sorted_rows[-1], "mmr")
-
     async def get_trade_fee_rate(self, symbol: str) -> dict:
         data = await self._request(
             "GET", "/api/v5/account/trade-fee", params={"instType": INST_TYPE, "instId": symbol}, auth=True
