@@ -54,23 +54,50 @@ Direction = Optional[str]  # "long" | "short" | None
 class RollingEvidenceConfig:
     rolling_window_seconds: float = 60.0
 
-    # --- Entry conditions (design doc items 1-7) ---
-    confidence_average_threshold: float = 0.75
-    confidence_peak_threshold: float = 0.85
-    direction_consistency_threshold: float = 0.80
+    # --- Scoring targets ---
+    # These are no longer hard pass/fail gates (see EvidenceSummary.score()
+    # below) — each is the level at which that dimension earns full credit.
+    # Falling short earns partial credit rather than an outright rejection,
+    # so one weak metric can be outweighed by strong ones elsewhere instead
+    # of vetoing an otherwise-excellent setup.
+    confidence_average_threshold: float = 0.60
+    confidence_peak_threshold: float = 0.75
+    direction_consistency_threshold: float = 0.60
     minimum_confirmation_events: int = 2
     minimum_whale_events: int = 1
     minimum_aggressive_volume_ratio: float = 0.60
-    maximum_allowed_direction_flips: int = 2
-    # Order book imbalance sign reversals allowed in the window before it
-    # counts as "strongly reversed" (item 6).
-    maximum_allowed_liquidity_reversals: int = 1
+    # Liquidity reversals score inversely (fewer = better); this is the
+    # count at/above which that dimension earns zero credit rather than a
+    # hard reject. 10-20 is realistic for live order-book noise even with
+    # debouncing — 1 (the old default) was unreachable in practice.
+    maximum_allowed_liquidity_reversals: int = 15
     # Deadzone around zero so noise-level imbalance readings don't count as
     # a "side" at all (avoids phantom reversals from near-zero noise).
     liquidity_imbalance_deadzone: float = 0.05
+    # A sign flip only counts as a real reversal once the new sign has held
+    # for this many consecutive samples — at a 150ms tick cadence, single-
+    # tick sign flips are usually order-book microstructure noise, not an
+    # actual reversal of pressure. Without this, a genuinely stable book
+    # can rack up dozens of "reversals" in 60s from noise alone.
+    liquidity_reversal_debounce_samples: int = 3
+    # direction_flips is still computed and logged (see EvidenceSummary)
+    # but no longer gates on its own — it's a close cousin of
+    # direction_consistency and double-penalizing the same underlying
+    # behavior worked against the "let strong signals compensate" goal.
+
+    # --- Scoring weights (must sum to 100 for score to read as a percentage) ---
+    avg_confidence_weight: float = 20.0
+    peak_confidence_weight: float = 20.0
+    consistency_weight: float = 20.0
+    whale_weight: float = 15.0
+    confirmation_weight: float = 10.0
+    aggressive_weight: float = 10.0
+    liquidity_weight: float = 5.0
+    # Minimum total score (out of 100, assuming default weights) to trade.
+    min_score_threshold: float = 75.0
 
     # --- Signal persistence (separate stage, see PersistenceValidator) ---
-    signal_persistence_seconds: float = 15.0
+    signal_persistence_seconds: float = 7.0
 
 
 # ---------------------------------------------------------------------------
@@ -92,6 +119,25 @@ class _Sample:
 
 
 @dataclass
+class ScoreComponent:
+    """One line of the weighted scoring breakdown — mirrors exactly what
+    gets logged, so the log and the scoring math can never drift apart."""
+    name: str
+    value: float
+    target: float
+    weight: float
+    points: float
+    met_target: bool  # informational only — doesn't gate anything on its own
+    is_ratio: bool = True  # True -> format as a percentage; False -> plain count
+
+    def format_value(self) -> str:
+        return f"{self.value:.0%}" if self.is_ratio else f"{self.value:g}"
+
+    def format_target(self) -> str:
+        return f"{self.target:.0%}" if self.is_ratio else f"{self.target:g}"
+
+
+@dataclass
 class EvidenceSummary:
     symbol: str
     sample_count: int
@@ -107,39 +153,115 @@ class EvidenceSummary:
     liquidity_reversals: int = 0
     latest_signal: Optional[Signal] = None
 
+    def score_breakdown(self, cfg: RollingEvidenceConfig) -> List[ScoreComponent]:
+        """Each dimension earns partial credit toward its weight, scaling
+        linearly from 0 up to full credit at its target (capped at the
+        weight — exceeding the target doesn't earn bonus points). Liquidity
+        reversals score inversely: 0 reversals = full credit, at-or-above
+        the max = zero credit. This is what lets one weak metric be offset
+        by strong ones elsewhere instead of vetoing the whole signal."""
+
+        def scaled(value: float, target: float, weight: float) -> float:
+            if target <= 0:
+                return weight
+            return weight * max(0.0, min(1.0, value / target))
+
+        def inverse_scaled(value: float, cap: float, weight: float) -> float:
+            if cap <= 0:
+                return 0.0 if value > 0 else weight
+            return weight * max(0.0, min(1.0, 1.0 - value / cap))
+
+        return [
+            ScoreComponent(
+                "avg confidence", self.avg_confidence, cfg.confidence_average_threshold,
+                cfg.avg_confidence_weight,
+                scaled(self.avg_confidence, cfg.confidence_average_threshold, cfg.avg_confidence_weight),
+                self.avg_confidence >= cfg.confidence_average_threshold,
+            ),
+            ScoreComponent(
+                "peak confidence", self.peak_confidence, cfg.confidence_peak_threshold,
+                cfg.peak_confidence_weight,
+                scaled(self.peak_confidence, cfg.confidence_peak_threshold, cfg.peak_confidence_weight),
+                self.peak_confidence >= cfg.confidence_peak_threshold,
+            ),
+            ScoreComponent(
+                "direction consistency", self.direction_consistency, cfg.direction_consistency_threshold,
+                cfg.consistency_weight,
+                scaled(self.direction_consistency, cfg.direction_consistency_threshold, cfg.consistency_weight),
+                self.direction_consistency >= cfg.direction_consistency_threshold,
+            ),
+            ScoreComponent(
+                "whale confirmations", float(self.whale_event_count), float(cfg.minimum_whale_events),
+                cfg.whale_weight,
+                scaled(self.whale_event_count, cfg.minimum_whale_events, cfg.whale_weight),
+                self.whale_event_count >= cfg.minimum_whale_events,
+                is_ratio=False,
+            ),
+            ScoreComponent(
+                "event confirmations", float(self.confirmation_event_count), float(cfg.minimum_confirmation_events),
+                cfg.confirmation_weight,
+                scaled(self.confirmation_event_count, cfg.minimum_confirmation_events, cfg.confirmation_weight),
+                self.confirmation_event_count >= cfg.minimum_confirmation_events,
+                is_ratio=False,
+            ),
+            ScoreComponent(
+                "aggressive volume", self.aggressive_dominance_ratio, cfg.minimum_aggressive_volume_ratio,
+                cfg.aggressive_weight,
+                scaled(self.aggressive_dominance_ratio, cfg.minimum_aggressive_volume_ratio, cfg.aggressive_weight),
+                self.aggressive_dominance_ratio >= cfg.minimum_aggressive_volume_ratio,
+            ),
+            ScoreComponent(
+                "liquidity reversals", float(self.liquidity_reversals), float(cfg.maximum_allowed_liquidity_reversals),
+                cfg.liquidity_weight,
+                inverse_scaled(self.liquidity_reversals, cfg.maximum_allowed_liquidity_reversals, cfg.liquidity_weight),
+                self.liquidity_reversals <= cfg.maximum_allowed_liquidity_reversals,
+                is_ratio=False,
+            ),
+        ]
+
+    def score(self, cfg: RollingEvidenceConfig) -> float:
+        if self.dominant_direction is None or self.sample_count == 0:
+            return 0.0
+        return sum(c.points for c in self.score_breakdown(cfg))
+
     def passes(self, cfg: RollingEvidenceConfig) -> bool:
-        """All of the design doc's entry conditions (1-6); condition 7,
-        aggressive pressure dominance, is folded into
-        aggressive_dominance_ratio below."""
         if self.dominant_direction is None or self.sample_count == 0:
             return False
-        return (
-            self.avg_confidence >= cfg.confidence_average_threshold
-            and self.peak_confidence >= cfg.confidence_peak_threshold
-            and self.direction_consistency >= cfg.direction_consistency_threshold
-            and self.direction_flips <= cfg.maximum_allowed_direction_flips
-            and self.confirmation_event_count >= cfg.minimum_confirmation_events
-            and self.whale_event_count >= cfg.minimum_whale_events
-            and self.aggressive_dominance_ratio >= cfg.minimum_aggressive_volume_ratio
-            and self.liquidity_reversals <= cfg.maximum_allowed_liquidity_reversals
-        )
+        return self.score(cfg) >= cfg.min_score_threshold
 
     def explain(self, cfg: RollingEvidenceConfig) -> str:
-        """Human-readable breakdown, same spirit as ConfidenceResult.explain()
-        in confidence_engine.py — every accept/reject should be traceable."""
-        d = self.dominant_direction or "none"
-        lines = [
-            f"Rolling window: {self.symbol} direction={d.upper()} samples={self.sample_count}",
-            f"  avg_confidence={self.avg_confidence:.2f} (need >= {cfg.confidence_average_threshold:.2f})",
-            f"  peak_confidence={self.peak_confidence:.2f} (need >= {cfg.confidence_peak_threshold:.2f})",
-            f"  direction_consistency={self.direction_consistency:.0%} (need >= {cfg.direction_consistency_threshold:.0%})",
-            f"  direction_flips={self.direction_flips} (max {cfg.maximum_allowed_direction_flips})",
-            f"  confirmation_events={self.confirmation_event_count} (need >= {cfg.minimum_confirmation_events})",
-            f"  whale_events={self.whale_event_count} (need >= {cfg.minimum_whale_events})",
-            f"  aggressive_dominance_ratio={self.aggressive_dominance_ratio:.0%} (need >= {cfg.minimum_aggressive_volume_ratio:.0%})",
-            f"  liquidity_reversals={self.liquidity_reversals} (max {cfg.maximum_allowed_liquidity_reversals})",
-            f"  PASSES={self.passes(cfg)}",
-        ]
+        """Full weighted breakdown, one line per component, always shown —
+        so a rejection says exactly which dimensions fell short and by how
+        much, not just PASSES=False."""
+        if self.dominant_direction is None or self.sample_count == 0:
+            return f"{self.symbol}: no directional evidence in window — REJECTED (score=0/100)"
+
+        components = self.score_breakdown(cfg)
+        total = sum(c.points for c in components)
+        threshold = cfg.min_score_threshold
+        decision = "ACCEPTED" if total >= threshold else "REJECTED"
+
+        lines = [f"{self.symbol} — direction={self.dominant_direction.upper()} samples={self.sample_count} flips={self.direction_flips}"]
+        for c in components:
+            verdict = "PASS" if c.met_target else "FAIL"
+            lines.append(
+                f"  {c.name}: {c.format_value()} (target {c.format_target()}) "
+                f"-> {c.points:.1f}/{c.weight:.0f} pts [{verdict}]"
+            )
+        lines.append(f"  Total score: {total:.1f}/100 (need >= {threshold:.0f})")
+        lines.append(f"  Decision: {decision}")
+
+        if decision == "REJECTED":
+            # Name the biggest shortfalls — components below target, ranked
+            # by how many points they left on the table.
+            shortfalls = sorted(
+                (c for c in components if not c.met_target),
+                key=lambda c: c.weight - c.points,
+                reverse=True,
+            )
+            if shortfalls:
+                reason = ", ".join(f"{c.name} below target" for c in shortfalls[:2])
+                lines.append(f"  Reason: {reason}")
         return "\n".join(lines)
 
 
@@ -228,11 +350,17 @@ class RollingEvidenceAccumulator:
         avg_conf = sum(s.confidence for s in dominant_samples) / len(dominant_samples)
         peak_conf = max(s.confidence for s in dominant_samples)
 
-        # Consistency is measured against the *whole* window (including
-        # no-signal ticks), not just the directional subset — a window full
-        # of gaps shouldn't read as "100% consistent" just because every
-        # directional sample happened to agree.
-        consistency = len(dominant_samples) / len(buf)
+        # Consistency is measured against the *directional* samples only
+        # (ticks where SignalGenerator actually produced a reading), not
+        # every tick in the buffer. SignalGenerator only fires occasionally
+        # relative to the 150ms accumulator cadence, so a denominator of
+        # "every tick" made this unreachable regardless of signal quality —
+        # real data showed 1% consistency on signals that were, in fact,
+        # 100% agreeing every time they fired. Flip-flopping is still
+        # caught by `direction_flips` below; this metric now answers "when
+        # we had an opinion, did it stay the same" rather than "did we have
+        # an opinion nearly every tick".
+        consistency = len(dominant_samples) / len(directional)
 
         flips = sum(1 for a, b in zip(directional, directional[1:]) if a.direction != b.direction)
 
@@ -245,7 +373,7 @@ class RollingEvidenceAccumulator:
 
         signs = [s.book_imbalance_sign for s in buf if s.book_imbalance_sign is not None]
         non_zero_signs = [s for s in signs if s != 0]
-        reversals = sum(1 for a, b in zip(non_zero_signs, non_zero_signs[1:]) if a != b)
+        reversals = self._count_debounced_reversals(non_zero_signs)
 
         latest_signal = next((s.signal for s in reversed(dominant_samples) if s.signal is not None), None)
 
@@ -267,6 +395,31 @@ class RollingEvidenceAccumulator:
 
     def clear(self, symbol: str) -> None:
         self._samples.pop(symbol, None)
+
+    def _count_debounced_reversals(self, signs: List[int]) -> int:
+        """Count real regime changes in a sign sequence, ignoring flips
+        that don't hold for at least `liquidity_reversal_debounce_samples`
+        consecutive samples. E.g. with debounce=3: [1,1,1,-1,1,1,1,1,-1,-1,-1]
+        -> only the run starting at index 8 counts (1 reversal); the lone
+        -1 at index 3 is noise and is ignored."""
+        debounce = max(1, self.config.liquidity_reversal_debounce_samples)
+        if not signs:
+            return 0
+
+        reversals = 0
+        confirmed = signs[0]
+        run_sign = signs[0]
+        run_len = 1
+        for s in signs[1:]:
+            if s == run_sign:
+                run_len += 1
+            else:
+                run_sign = s
+                run_len = 1
+            if run_len >= debounce and run_sign != confirmed:
+                reversals += 1
+                confirmed = run_sign
+        return reversals
 
 
 # ---------------------------------------------------------------------------
