@@ -54,13 +54,6 @@ class ExecutionConfig:
     max_open_positions: int = 5
     max_total_trades: int = 10
     target_net_profit_usdt: float = 0.10
-    # Extra fractional price cushion applied on top of the TP price that
-    # would exactly hit target_net_profit_usdt after fees. The TP order
-    # fills at market once triggered (tpOrdPx="-1"), so the actual fill
-    # price can land worse than the trigger price if the market moves fast
-    # between the two — e.g. a computed TP of 0.02510 becomes 0.02515 with
-    # the default 0.1% buffer. Set to 0 to disable.
-    tp_slippage_buffer_pct: float = 0.001
     open_type: str = "isolated"
     fill_poll_interval_sec: float = 0.5
     fill_timeout_sec: float = 15.0
@@ -200,10 +193,12 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         client: OKXFuturesClient,
         config: Optional[ExecutionConfig] = None,
         position_store=None,
+        movement_tracker=None,
     ) -> None:
         self._client = client
         self.config = config or ExecutionConfig()
         self._position_store = position_store
+        self._movement_tracker = movement_tracker
         self._open_positions: Dict[str, OpenPosition] = {}
         self._total_opened = 0
         self._lock = asyncio.Lock()
@@ -467,6 +462,11 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         if self._position_store is not None:
             position.db_id = await self._position_store.record_open(position)
 
+        if self._movement_tracker is not None:
+            # Observer only — MovementTracker never influences this
+            # return value or anything else in the open path.
+            await self._movement_tracker.start_tracking(position)
+
         return position
 
     async def _wait_for_fill(self, symbol: str, order_id: str) -> Optional[dict]:
@@ -543,19 +543,12 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         """Take profit is derived entirely from real, exchange-reported
         numbers: the actual filled entry price/size and the actual opening
         fee (doubled to estimate the matching closing fee), targeting a net
-        realized profit of `target_net_profit_usdt` after both fees. On top
-        of that, the price itself is nudged a little further from entry by
-        `tp_slippage_buffer_pct` — e.g. a computed TP of 0.02510 becomes
-        0.02515 with the default 0.1% buffer — to absorb the gap between
-        the TP trigger price and its actual market-filled price (the TP
-        fills at market once triggered, so it can execute worse than the
-        trigger if the market moves fast)."""
+        realized profit of `target_net_profit_usdt` after both fees."""
         cfg = self.config
         estimated_total_fees = opening_fee * 2.0
         notional = size_contracts * contract_size * entry_price
         required_gross_profit = cfg.target_net_profit_usdt + estimated_total_fees
         price_move_frac = required_gross_profit / notional if notional > 0 else 0.0
-        price_move_frac += cfg.tp_slippage_buffer_pct
 
         if direction == "long":
             raw_tp = entry_price * (1 + price_move_frac)
@@ -714,6 +707,17 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
                 closed_at=closed_at,
             )
 
+        if self._movement_tracker is not None:
+            await self._movement_tracker.stop_tracking(
+                symbol,
+                exit_price=exit_price,
+                realized_pnl=realized_pnl,
+                closing_fee=closing_fee,
+                net_pnl=net_pnl,
+                close_reason=close_reason,
+                closed_at=closed_at,
+            )
+
     async def _get_close_details(self, symbol: str, closed: OpenPosition):
         """Looks up the exchange's own closed-position record to get the
         real exit price, realized PnL, closing fee, and net PnL — never
@@ -770,10 +774,10 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
             if close_type in ("3", "4", "5", "6"):
                 # 3/4 = liquidation, 5/6 = ADL — exchange-driven closes,
                 # same bucket the rest of the codebase already uses.
-                close_reason = "liquidation_or_other"
+                close_reason = "liquidated"
             else:
                 resolved_order_id = await self._resolve_tp_execution_order_id(symbol, closed)
-                close_reason = "take_profit" if resolved_order_id else "liquidation_or_other"
+                close_reason = "take_profit" if resolved_order_id else "liquidated"
 
             # `total_fee` from positions-history is CUMULATIVE for the whole
             # position (opening fee + closing fee + any funding fee) — see
@@ -856,7 +860,7 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         realized_pnl = sum(float(t.get("realised_profit", 0) or 0) for t in closing_trades)
         closing_fee = sum(float(t.get("paid_fees", 0) or 0) for t in closing_trades)
 
-        close_reason = "take_profit" if resolved_order_id else "liquidation_or_other"
+        close_reason = "take_profit" if resolved_order_id else "liquidated"
         return exit_price, realized_pnl, closing_fee, close_reason, None
 
     async def _resolve_tp_execution_order_id(self, symbol: str, closed: OpenPosition) -> Optional[str]:
