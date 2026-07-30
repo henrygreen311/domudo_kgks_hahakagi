@@ -29,13 +29,11 @@ open trade would mean up to ~7 inserts/sec per trade (and up to
 max_open_positions of those concurrently) — that's real, ongoing database
 load and cost for resolution nobody will look at row-by-row. So: full
 150ms-resolution stats are kept in memory (cheap — just arithmetic on a
-dataclass) and used to build a bounded in-memory timeline; only a
-throttled subset of that gets written to `trade_snapshots` while the trade
-is open (`db_snapshot_interval_sec`, default 3s — configurable down to
-100-250ms if you want row-per-tick after all), plus always the final
-summary row when the trade closes. This keeps "efficient insert
-performance" and "minimal CPU/RAM" both genuinely true rather than just
-stated.
+dataclass) and used to build a bounded in-memory timeline. A single
+`trade_snapshots` row is created for the trade on its first throttled tick
+and then updated in place on every subsequent one (`db_snapshot_interval_sec`,
+default 30s) — never a new row per tick — so each trade maintains exactly
+one row while open, which then becomes the final summary row on close.
 """
 
 from __future__ import annotations
@@ -65,7 +63,7 @@ def _iso(ts: float) -> str:
 @dataclass
 class MovementTrackerConfig:
     tick_interval_sec: float = 0.15  # 100-250ms design target
-    db_snapshot_interval_sec: float = 9.0  # throttled DB write cadence while open
+    db_snapshot_interval_sec: float = 30.0  # throttled DB write cadence while open — one row per trade, updated in place
     timeline_max_points: int = 2000  # bounded in-memory timeline per trade
 
 
@@ -354,6 +352,24 @@ class TradeSnapshotStore:
         data = getattr(result, "data", None) or []
         return data[0].get("id") if data else None
 
+    async def update_snapshot(self, row_id: int, trade: TrackedTrade) -> None:
+        """Updates the trade's single existing row in place — this is what
+        keeps `trade_snapshots` at exactly one row per trade instead of
+        one row per tick. Only called once `insert_snapshot` has already
+        created that row (see MovementTracker.run_forever)."""
+        row = {
+            "current_price": trade.current_price,
+            "unrealized_pnl": trade.unrealized_pnl_usdt(trade.current_price),
+            "price_change_from_entry": trade.directional_pct(trade.current_price),
+            "distance_to_take_profit": trade.distance_to_take_profit_pct(trade.current_price),
+            "trade_duration": trade.last_tick_at - trade.opened_at,
+            "timestamp": _iso(trade.last_tick_at),
+        }
+        try:
+            await asyncio.to_thread(lambda: self._sb.table(TABLE).update(row).eq("id", row_id).execute())
+        except Exception:
+            log.exception(f"[movement-tracker] failed to update snapshot for {trade.symbol} (row {row_id})")
+
     async def write_final_summary(
         self,
         row_id: Optional[int],
@@ -543,6 +559,9 @@ class MovementTracker:
 
                 if self._store is not None and now - trade.last_db_snapshot_at >= self.config.db_snapshot_interval_sec:
                     trade.last_db_snapshot_at = now
-                    row_id = await self._store.insert_snapshot(trade)
-                    if row_id is not None:
-                        trade.last_snapshot_row_id = row_id
+                    if trade.last_snapshot_row_id is None:
+                        row_id = await self._store.insert_snapshot(trade)
+                        if row_id is not None:
+                            trade.last_snapshot_row_id = row_id
+                    else:
+                        await self._store.update_snapshot(trade.last_snapshot_row_id, trade)

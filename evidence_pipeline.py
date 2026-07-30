@@ -97,6 +97,22 @@ class RollingEvidenceConfig:
     # it. Below this count, passes() rejects outright regardless of score.
     minimum_directional_samples: int = 3
 
+    # How long the buffer must have actually been accumulating for this
+    # symbol before a trade is allowed — separate from
+    # minimum_directional_samples above. That gate checks *how many*
+    # readings agree; this one checks *how long* the window has genuinely
+    # existed. Without it, 3 agreeing signals arriving within the first
+    # 15-20s of a symbol being tracked can still pass — the buffer just
+    # hasn't been running long enough to call it a real 60-second window
+    # yet. Defaults to the full rolling_window_seconds (see __post_init__)
+    # so "60-second rolling window" is actually true by the time a trade
+    # fires, not just "whatever we've seen so far."
+    minimum_window_age_seconds: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        if self.minimum_window_age_seconds is None:
+            self.minimum_window_age_seconds = self.rolling_window_seconds
+
     # --- Scoring weights (must sum to 100 for score to read as a percentage) ---
     avg_confidence_weight: float = 20.0
     peak_confidence_weight: float = 20.0
@@ -165,6 +181,7 @@ class EvidenceSummary:
     liquidity_reversals: int = 0
     latest_signal: Optional[Signal] = None
     directional_sample_count: int = 0  # how many raw SignalGenerator readings agreed on dominant_direction
+    window_age_seconds: float = 0.0  # how long the buffer has actually been accumulating, oldest-to-newest sample
 
     def score_breakdown(self, cfg: RollingEvidenceConfig) -> List[ScoreComponent]:
         """Each dimension earns partial credit toward its weight, scaling
@@ -242,6 +259,8 @@ class EvidenceSummary:
             return False
         if self.directional_sample_count < cfg.minimum_directional_samples:
             return False
+        if self.window_age_seconds < cfg.minimum_window_age_seconds:
+            return False
         return self.score(cfg) >= cfg.min_score_threshold
 
     def explain(self, cfg: RollingEvidenceConfig) -> str:
@@ -257,6 +276,13 @@ class EvidenceSummary:
                 f"directional_samples={self.directional_sample_count} (need >= {cfg.minimum_directional_samples}) "
                 f"— REJECTED before scoring: not enough independent readings yet, "
                 f"regardless of how strong the ones seen so far look"
+            )
+
+        if self.window_age_seconds < cfg.minimum_window_age_seconds:
+            return (
+                f"{self.symbol} — direction={self.dominant_direction.upper()} "
+                f"window_age={self.window_age_seconds:.1f}s (need >= {cfg.minimum_window_age_seconds:.1f}s) "
+                f"— REJECTED before scoring: still warming up, buffer hasn't spanned a full window yet"
             )
 
         components = self.score_breakdown(cfg)
@@ -399,6 +425,7 @@ class RollingEvidenceAccumulator:
         reversals = self._count_debounced_reversals(non_zero_signs)
 
         latest_signal = next((s.signal for s in reversed(dominant_samples) if s.signal is not None), None)
+        window_age_seconds = (buf[-1].ts_ms - buf[0].ts_ms) / 1000.0 if len(buf) >= 2 else 0.0
 
         return EvidenceSummary(
             symbol=symbol,
@@ -415,6 +442,7 @@ class RollingEvidenceAccumulator:
             liquidity_reversals=reversals,
             latest_signal=latest_signal,
             directional_sample_count=len(dominant_samples),
+            window_age_seconds=window_age_seconds,
         )
 
     def clear(self, symbol: str) -> None:
