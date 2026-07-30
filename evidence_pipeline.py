@@ -101,17 +101,22 @@ class RollingEvidenceConfig:
     # symbol before a trade is allowed — separate from
     # minimum_directional_samples above. That gate checks *how many*
     # readings agree; this one checks *how long* the window has genuinely
-    # existed. Without it, 3 agreeing signals arriving within the first
-    # 15-20s of a symbol being tracked can still pass — the buffer just
-    # hasn't been running long enough to call it a real 60-second window
-    # yet. Defaults to the full rolling_window_seconds (see __post_init__)
-    # so "60-second rolling window" is actually true by the time a trade
-    # fires, not just "whatever we've seen so far."
-    minimum_window_age_seconds: Optional[float] = None
-
-    def __post_init__(self) -> None:
-        if self.minimum_window_age_seconds is None:
-            self.minimum_window_age_seconds = self.rolling_window_seconds
+    # existed.
+    #
+    # NOTE: this used to default to the full rolling_window_seconds (i.e.
+    # require a literal 60-second wait before a symbol could ever be
+    # scored, regardless of how much evidence had already accumulated).
+    # That's not what was asked for — the requirement is "gather evidence
+    # in a rolling window and open once direction/whale/confidence checks
+    # clear the bar," not "refuse to look until the buffer is a full
+    # rolling_window_seconds old." It also turned out to be structurally
+    # unreachable in practice: the buffer is pruned to rolling_window_seconds
+    # on every tick (see update() below), which caps window_age_seconds at
+    # just under rolling_window_seconds forever — so the old default was
+    # both wrong in intent and impossible to satisfy. Default is now 0
+    # (no extra time-based wait beyond minimum_directional_samples); set
+    # explicitly if a genuine minimum warm-up period is wanted.
+    minimum_window_age_seconds: float = 0.0
 
     # --- Scoring weights (must sum to 100 for score to read as a percentage) ---
     avg_confidence_weight: float = 20.0
@@ -330,6 +335,14 @@ class RollingEvidenceAccumulator:
     def __init__(self, config: Optional[RollingEvidenceConfig] = None) -> None:
         self.config = config or RollingEvidenceConfig()
         self._samples: Dict[str, Deque[_Sample]] = {}
+        # First tick timestamp per symbol, set once and never touched by
+        # pruning. buf[0].ts_ms is NOT usable for "how long have we been
+        # watching this symbol" — the rolling-window prune in update()
+        # guarantees buf[0].ts_ms >= now_ms - rolling_window_seconds*1000
+        # at all times, which caps (buf[-1] - buf[0]) at just under
+        # rolling_window_seconds forever, regardless of how long the
+        # symbol has actually been tracked.
+        self._first_seen_ms: Dict[str, float] = {}
 
     def update(
         self,
@@ -350,6 +363,7 @@ class RollingEvidenceAccumulator:
         that check is simply skipped.
         """
         buf = self._samples.setdefault(symbol, deque())
+        self._first_seen_ms.setdefault(symbol, now_ms)
 
         direction = signal.direction if signal else None
         confidence = signal.confidence if signal else 0.0
@@ -425,7 +439,8 @@ class RollingEvidenceAccumulator:
         reversals = self._count_debounced_reversals(non_zero_signs)
 
         latest_signal = next((s.signal for s in reversed(dominant_samples) if s.signal is not None), None)
-        window_age_seconds = (buf[-1].ts_ms - buf[0].ts_ms) / 1000.0 if len(buf) >= 2 else 0.0
+        first_seen_ms = self._first_seen_ms.get(symbol, buf[0].ts_ms)
+        window_age_seconds = (buf[-1].ts_ms - first_seen_ms) / 1000.0
 
         return EvidenceSummary(
             symbol=symbol,
@@ -447,6 +462,7 @@ class RollingEvidenceAccumulator:
 
     def clear(self, symbol: str) -> None:
         self._samples.pop(symbol, None)
+        self._first_seen_ms.pop(symbol, None)
 
     def _count_debounced_reversals(self, signs: List[int]) -> int:
         """Count real regime changes in a sign sequence, ignoring flips
