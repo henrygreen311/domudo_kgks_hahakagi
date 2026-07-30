@@ -65,7 +65,7 @@ def _iso(ts: float) -> str:
 @dataclass
 class MovementTrackerConfig:
     tick_interval_sec: float = 0.15  # 100-250ms design target
-    db_snapshot_interval_sec: float = 30  # throttled DB write cadence while open
+    db_snapshot_interval_sec: float = 9.0  # throttled DB write cadence while open
     timeline_max_points: int = 2000  # bounded in-memory timeline per trade
 
 

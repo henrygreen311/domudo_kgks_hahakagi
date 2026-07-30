@@ -85,6 +85,18 @@ class RollingEvidenceConfig:
     # direction_consistency and double-penalizing the same underlying
     # behavior worked against the "let strong signals compensate" goal.
 
+    # Minimum number of independent SignalGenerator readings (agreeing on
+    # the winning direction) that must exist in the window before scoring
+    # even applies. This is NOT a scored/weighted dimension — it's a
+    # sample-size floor. Without it, a single lucky tick's confidence and
+    # confirmation numbers get echoed back unchanged on every subsequent
+    # summarize() call for up to rolling_window_seconds, since nothing new
+    # arrives to contradict them — so one strong reading can satisfy both
+    # the "60s window" and the "7s persistence" checks despite reflecting
+    # a few hundred milliseconds of real evidence, not 60 real seconds of
+    # it. Below this count, passes() rejects outright regardless of score.
+    minimum_directional_samples: int = 3
+
     # --- Scoring weights (must sum to 100 for score to read as a percentage) ---
     avg_confidence_weight: float = 20.0
     peak_confidence_weight: float = 20.0
@@ -152,6 +164,7 @@ class EvidenceSummary:
     aggressive_dominance_ratio: float = 0.0
     liquidity_reversals: int = 0
     latest_signal: Optional[Signal] = None
+    directional_sample_count: int = 0  # how many raw SignalGenerator readings agreed on dominant_direction
 
     def score_breakdown(self, cfg: RollingEvidenceConfig) -> List[ScoreComponent]:
         """Each dimension earns partial credit toward its weight, scaling
@@ -227,6 +240,8 @@ class EvidenceSummary:
     def passes(self, cfg: RollingEvidenceConfig) -> bool:
         if self.dominant_direction is None or self.sample_count == 0:
             return False
+        if self.directional_sample_count < cfg.minimum_directional_samples:
+            return False
         return self.score(cfg) >= cfg.min_score_threshold
 
     def explain(self, cfg: RollingEvidenceConfig) -> str:
@@ -235,6 +250,14 @@ class EvidenceSummary:
         much, not just PASSES=False."""
         if self.dominant_direction is None or self.sample_count == 0:
             return f"{self.symbol}: no directional evidence in window — REJECTED (score=0/100)"
+
+        if self.directional_sample_count < cfg.minimum_directional_samples:
+            return (
+                f"{self.symbol} — direction={self.dominant_direction.upper()} "
+                f"directional_samples={self.directional_sample_count} (need >= {cfg.minimum_directional_samples}) "
+                f"— REJECTED before scoring: not enough independent readings yet, "
+                f"regardless of how strong the ones seen so far look"
+            )
 
         components = self.score_breakdown(cfg)
         total = sum(c.points for c in components)
@@ -391,6 +414,7 @@ class RollingEvidenceAccumulator:
             aggressive_dominance_ratio=aggressive_ratio,
             liquidity_reversals=reversals,
             latest_signal=latest_signal,
+            directional_sample_count=len(dominant_samples),
         )
 
     def clear(self, symbol: str) -> None:
