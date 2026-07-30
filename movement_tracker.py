@@ -55,6 +55,38 @@ def _iso(ts: float) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
 
 
+def _format_duration(seconds: Optional[float]) -> Optional[str]:
+    """Renders a raw seconds value as '5s', '5m 2s', or '1h 3m 10s' instead
+    of a bare float — much easier to scan in position_history/trade_snapshots
+    than e.g. 3286.3174872398376. Sub-second precision is dropped (whole
+    seconds only) since it doesn't add anything readable at this scale.
+    Note: this changes trade_duration from a numeric column to a string —
+    if the DB column is currently numeric/float, its type needs to change
+    to text before this can be written."""
+    if seconds is None:
+        return None
+    total = int(round(seconds))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes}m {secs}s"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+
+def _signed(value: Optional[float], sign: str) -> Optional[str]:
+    """Prefixes a raw (always non-negative) magnitude with an explicit
+    '+' or '-' so profit-side vs loss-side columns are distinguishable at
+    a glance (e.g. time_to_first_profit -> '+79.835...', time_to_first_loss
+    -> '-4.671...'). None is passed through unchanged — a trade that never
+    went into loss genuinely has no time_to_first_loss, and forcing a sign
+    onto that would misrepresent it as a real (zero) value."""
+    if value is None:
+        return None
+    return f"{sign}{abs(value)}"
+
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -341,7 +373,7 @@ class TradeSnapshotStore:
             "unrealized_pnl": trade.unrealized_pnl_usdt(trade.current_price),
             "price_change_from_entry": trade.directional_pct(trade.current_price),
             "distance_to_take_profit": trade.distance_to_take_profit_pct(trade.current_price),
-            "trade_duration": trade.last_tick_at - trade.opened_at,
+            "trade_duration": _format_duration(trade.last_tick_at - trade.opened_at),
             "is_final_snapshot": False,
         }
         try:
@@ -362,7 +394,7 @@ class TradeSnapshotStore:
             "unrealized_pnl": trade.unrealized_pnl_usdt(trade.current_price),
             "price_change_from_entry": trade.directional_pct(trade.current_price),
             "distance_to_take_profit": trade.distance_to_take_profit_pct(trade.current_price),
-            "trade_duration": trade.last_tick_at - trade.opened_at,
+            "trade_duration": _format_duration(trade.last_tick_at - trade.opened_at),
             "timestamp": _iso(trade.last_tick_at),
         }
         try:
@@ -394,23 +426,23 @@ class TradeSnapshotStore:
             "unrealized_pnl": 0.0,
             "price_change_from_entry": final_pct,
             "distance_to_take_profit": 0.0,
-            "trade_duration": duration_sec,
+            "trade_duration": _format_duration(duration_sec),
             "entry_price": trade.entry_price,
             "exit_price": exit_price,
             "highest_price": trade.highest_price,
             "lowest_price": trade.lowest_price,
-            "maximum_favorable_excursion": trade.max_favorable_excursion_pct,
-            "maximum_adverse_excursion": trade.max_adverse_excursion_pct,
-            "maximum_unrealized_profit": trade.max_unrealized_profit_usdt,
-            "maximum_unrealized_loss": trade.max_unrealized_loss_usdt,
-            "maximum_drawdown": trade.max_drawdown_pct,
-            "maximum_runup": trade.max_runup_pct,
-            "time_to_first_profit": trade.time_to_first_profit_sec,
-            "time_to_first_loss": trade.time_to_first_loss_sec,
-            "time_profitable": trade.time_profitable_sec,
-            "time_losing": trade.time_losing_sec,
-            "time_to_max_profit": trade.seconds_until_max_profit,
-            "time_to_max_loss": trade.seconds_until_max_loss,
+            "maximum_favorable_excursion": _signed(trade.max_favorable_excursion_pct, "+"),
+            "maximum_adverse_excursion": _signed(trade.max_adverse_excursion_pct, "-"),
+            "maximum_unrealized_profit": _signed(trade.max_unrealized_profit_usdt, "+"),
+            "maximum_unrealized_loss": _signed(trade.max_unrealized_loss_usdt, "-"),
+            "maximum_drawdown": _signed(trade.max_drawdown_pct, "-"),
+            "maximum_runup": _signed(trade.max_runup_pct, "+"),
+            "time_to_first_profit": _signed(trade.time_to_first_profit_sec, "+"),
+            "time_to_first_loss": _signed(trade.time_to_first_loss_sec, "-"),
+            "time_profitable": _signed(trade.time_profitable_sec, "+"),
+            "time_losing": _signed(trade.time_losing_sec, "-"),
+            "time_to_max_profit": _signed(trade.seconds_until_max_profit, "+"),
+            "time_to_max_loss": _signed(trade.seconds_until_max_loss, "-"),
             "movement_score": movement_score,
             "entry_quality": entry_quality,
             "realized_profit": realized_pnl,
