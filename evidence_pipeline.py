@@ -129,6 +129,33 @@ class RollingEvidenceConfig:
     # Minimum total score (out of 100, assuming default weights) to trade.
     min_score_threshold: float = 75.0
 
+    # Direction-specific override of min_score_threshold above. Added
+    # after analysis of the first ~40 live trades in position_history
+    # showed long entries scoring just as high pre-trade (avg/peak
+    # confidence, whale/event confirmations) as shorts, but landing
+    # "Late Entry" 6x more often (6 of 7 Late Entry trades were long) and
+    # liquidating at a 40% rate vs 25% for shorts. The pre-trade score
+    # isn't distinguishing "direction confirmed" from "direction
+    # confirmed after most of the move already happened" — crypto pumps
+    # (longs) tend to get confirmed by trailing buy-volume signals only
+    # after price has already run, while drops (shorts) show up earlier
+    # in order-book/whale-sell signals. Raising the long-side bar is a
+    # blunt first pass at compensating for that until signals_histories
+    # (see the SQL for that table) has enough rows to fit something
+    # better — e.g. a "how much of the move already happened" freshness
+    # check. Re-tune these numbers once that data exists; they come from
+    # "accepted longs in the sample ranged 79.9-94.2 and still
+    # liquidated 40% of the time, so require meaningfully more margin
+    # above the base bar," not from a proper fit.
+    min_score_threshold_by_direction: Dict[str, float] = field(
+        default_factory=lambda: {"long": 88.0, "short": 75.0}
+    )
+
+    def min_score_for(self, direction: str) -> float:
+        return self.min_score_threshold_by_direction.get(
+            direction.lower(), self.min_score_threshold
+        )
+
     # --- Signal persistence (separate stage, see PersistenceValidator) ---
     signal_persistence_seconds: float = 7.0
 
@@ -259,6 +286,48 @@ class EvidenceSummary:
             return 0.0
         return sum(c.points for c in self.score_breakdown(cfg))
 
+    def to_signal_record(self, cfg: RollingEvidenceConfig, raw_signal_count: int = 0) -> dict:
+        """Flat dict matching signals_histories' schema (see
+        create_signals_histories.sql) — the exact same numbers explain()
+        would log, captured once at accept time so they exist as queryable
+        rows instead of only ever living in log text. Caller (tracker.py)
+        still needs to add trade_id, entry_price, price_at_decision, and
+        evaluated_at once the trade has actually opened; this covers
+        everything derivable from the summary itself."""
+        by_name = {c.name: c for c in self.score_breakdown(cfg)}
+
+        def value(name: str) -> float:
+            return by_name[name].value
+
+        def points(name: str) -> float:
+            return by_name[name].points
+
+        return {
+            "symbol": self.symbol,
+            "direction": (self.dominant_direction or "").lower(),
+            "decision": "accepted",
+            "raw_signal_count": raw_signal_count,
+            "directional_sample_count": self.directional_sample_count,
+            "direction_flips": self.direction_flips,
+            "window_age_seconds": self.window_age_seconds,
+            "avg_confidence_pct": value("avg confidence"),
+            "peak_confidence_pct": value("peak confidence"),
+            "direction_consistency_pct": value("direction consistency"),
+            "whale_confirmations": int(value("whale confirmations")),
+            "event_confirmations": int(value("event confirmations")),
+            "aggressive_volume_pct": value("aggressive volume"),
+            "liquidity_reversals": int(value("liquidity reversals")),
+            "avg_confidence_score": points("avg confidence"),
+            "peak_confidence_score": points("peak confidence"),
+            "direction_consistency_score": points("direction consistency"),
+            "whale_confirmations_score": points("whale confirmations"),
+            "event_confirmations_score": points("event confirmations"),
+            "aggressive_volume_score": points("aggressive volume"),
+            "liquidity_reversals_score": points("liquidity reversals"),
+            "total_score": self.score(cfg),
+            "score_threshold_used": cfg.min_score_for(self.dominant_direction or ""),
+        }
+
     def passes(self, cfg: RollingEvidenceConfig) -> bool:
         if self.dominant_direction is None or self.sample_count == 0:
             return False
@@ -266,7 +335,7 @@ class EvidenceSummary:
             return False
         if self.window_age_seconds < cfg.minimum_window_age_seconds:
             return False
-        return self.score(cfg) >= cfg.min_score_threshold
+        return self.score(cfg) >= cfg.min_score_for(self.dominant_direction)
 
     def explain(self, cfg: RollingEvidenceConfig) -> str:
         """Full weighted breakdown, one line per component, always shown —
@@ -292,7 +361,7 @@ class EvidenceSummary:
 
         components = self.score_breakdown(cfg)
         total = sum(c.points for c in components)
-        threshold = cfg.min_score_threshold
+        threshold = cfg.min_score_for(self.dominant_direction)
         decision = "ACCEPTED" if total >= threshold else "REJECTED"
 
         lines = [f"{self.symbol} — direction={self.dominant_direction.upper()} samples={self.sample_count} flips={self.direction_flips}"]
