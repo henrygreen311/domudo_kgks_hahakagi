@@ -605,18 +605,28 @@ async def evaluate_tick(
     validator: PersistenceValidator,
     book_imbalance: Optional[float] = None,
     now_ms: Optional[float] = None,
-) -> Optional[Signal]:
+) -> Optional[Tuple[Signal, EvidenceSummary]]:
     """One tick of the new stage: fold this tick's evidence into the rolling
     window, then check whether the accumulated + persisted picture clears
-    the bar to trade. Returns the Signal to execute once persistence is
-    satisfied, otherwise None. Call this every 100-200ms per watchlist
-    symbol; it's cheap (bounded deque append + a handful of sums over a
-    window of ~300-600 samples at that cadence).
+    the bar to trade. Returns (Signal, EvidenceSummary) to execute once
+    persistence is satisfied, otherwise None. Call this every 100-200ms
+    per watchlist symbol; it's cheap (bounded deque append + a handful of
+    sums over a window of ~300-600 samples at that cadence).
 
     SignalGenerator and EventConfirmationEngine are both called exactly as
     they already are elsewhere in the codebase — this function doesn't
     change how either one decides anything, it only remembers and times
     their outputs.
+
+    The EvidenceSummary returned here is the one that actually cleared
+    the bar — captured before clear() below resets the accumulator for
+    this symbol. Callers needing the breakdown for persistence (e.g.
+    signals_histories) must use this returned summary rather than calling
+    accumulator.summarize(symbol) again afterward: by then clear() has
+    already wiped it, which silently produces an empty/all-zero summary
+    (dominant_direction=None) instead of raising — this was found live
+    when signal_store.record_signal() started rejecting rows with an
+    empty `direction` that violated signals_histories' check constraint.
     """
     now_ms = now_ms if now_ms is not None else time.time() * 1000.0
 
@@ -630,4 +640,4 @@ async def evaluate_tick(
 
     validator.clear(symbol)
     accumulator.clear(symbol)
-    return summary.latest_signal
+    return summary.latest_signal, summary
