@@ -1,37 +1,3 @@
-"""
-Rolling Evidence Accumulator + Persistence Validator.
-
-    SignalGenerator -> RollingEvidenceAccumulator -> PersistenceValidator -> EventConfirmationEngine -> ExecutionEngine
-
-This module inserts between the existing directional/confidence layer and
-the execution engine. It does NOT reimplement anything SignalGenerator,
-ConfidenceEngine, or EventConfirmationEngine already do — it only *remembers
-their outputs over a rolling 60-second window* and decides whether the
-evidence has been sustained for long enough to trade, instead of trading on
-a single instantaneous read.
-
-Design notes:
-
-- EventConfirmationEngine.confirm() is normally called once, right before
-  opening a trade. Here it's called on every tick (see `evaluate_tick`
-  below), and its results are folded into the rolling window. This is what
-  lets "the Event Confirmation Engine continued confirming the same
-  direction throughout the observation period" and "multiple confirmation
-  events over the window" be checked — those aren't new detections, they're
-  the existing confirm() output sampled repeatedly and counted.
-
-- The buffer is a per-symbol deque pruned by *time*, not by count, so memory
-  is bounded by (update_rate x window_seconds) regardless of how long the
-  bot runs — satisfies the "efficient rolling buffer, constant memory"
-  requirement.
-
-- RollingEvidenceAccumulator only answers "what do the last 60 seconds look
-  like". PersistenceValidator only answers "has that picture been true, and
-  stable, for the configured persistence duration". Keeping those separate
-  mirrors the existing ConfidenceEngine / SignalPersistenceTracker split in
-  market_data.py, so the same mental model applies here.
-"""
-
 from __future__ import annotations
 
 import time
@@ -316,7 +282,7 @@ class EvidenceSummary:
         so a rejection says exactly which dimensions fell short and by how
         much, not just PASSES=False."""
         if self.dominant_direction is None or self.sample_count == 0:
-            return f"{self.symbol}: no directional evidence in window — REJECTED (score=0/100)"
+            #return f"{self.symbol}: no directional evidence in window — REJECTED (score=0/100)"
 
         if self.directional_sample_count < cfg.minimum_directional_samples:
             return (
@@ -580,28 +546,7 @@ async def evaluate_tick(
     book_imbalance: Optional[float] = None,
     now_ms: Optional[float] = None,
 ) -> Optional[Tuple[Signal, EvidenceSummary]]:
-    """One tick of the new stage: fold this tick's evidence into the rolling
-    window, then check whether the accumulated + persisted picture clears
-    the bar to trade. Returns (Signal, EvidenceSummary) to execute once
-    persistence is satisfied, otherwise None. Call this every 100-200ms
-    per watchlist symbol; it's cheap (bounded deque append + a handful of
-    sums over a window of ~300-600 samples at that cadence).
-
-    SignalGenerator and EventConfirmationEngine are both called exactly as
-    they already are elsewhere in the codebase — this function doesn't
-    change how either one decides anything, it only remembers and times
-    their outputs.
-
-    The EvidenceSummary returned here is the one that actually cleared
-    the bar — captured before clear() below resets the accumulator for
-    this symbol. Callers needing the breakdown for persistence (e.g.
-    signals_histories) must use this returned summary rather than calling
-    accumulator.summarize(symbol) again afterward: by then clear() has
-    already wiped it, which silently produces an empty/all-zero summary
-    (dominant_direction=None) instead of raising — this was found live
-    when signal_store.record_signal() started rejecting rows with an
-    empty `direction` that violated signals_histories' check constraint.
-    """
+    
     now_ms = now_ms if now_ms is not None else time.time() * 1000.0
 
     confirmation = await confirmation_engine.confirm(signal) if signal is not None else None
