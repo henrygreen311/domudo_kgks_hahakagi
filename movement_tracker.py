@@ -78,10 +78,15 @@ def _format_duration(seconds: Optional[float]) -> Optional[str]:
 def _signed(value: Optional[float], sign: str) -> Optional[str]:
     """Prefixes a raw (always non-negative) magnitude with an explicit
     '+' or '-' so profit-side vs loss-side columns are distinguishable at
-    a glance (e.g. time_to_first_profit -> '+79.835...', time_to_first_loss
-    -> '-4.671...'). None is passed through unchanged — a trade that never
-    went into loss genuinely has no time_to_first_loss, and forcing a sign
-    onto that would misrepresent it as a real (zero) value."""
+    a glance (e.g. maximum_favorable_excursion -> '+0.00306...',
+    maximum_adverse_excursion -> '-0.00980...'). Used for excursion/USD
+    magnitude columns only — every time_* column (time_to_first_profit,
+    time_profitable, time_to_max_profit, etc.) uses _format_duration
+    instead, matching trade_duration's '1h 3m 10s' format for consistency
+    across every column that stores a duration. None is passed through
+    unchanged — a trade that never went into loss genuinely has no
+    time_to_first_loss/maximum_adverse_excursion, and forcing a value onto
+    that would misrepresent it as real."""
     if value is None:
         return None
     return f"{sign}{abs(value)}"
@@ -437,12 +442,12 @@ class TradeSnapshotStore:
             "maximum_unrealized_loss": _signed(trade.max_unrealized_loss_usdt, "-"),
             "maximum_drawdown": _signed(trade.max_drawdown_pct, "-"),
             "maximum_runup": _signed(trade.max_runup_pct, "+"),
-            "time_to_first_profit": _signed(trade.time_to_first_profit_sec, "+"),
-            "time_to_first_loss": _signed(trade.time_to_first_loss_sec, "-"),
-            "time_profitable": _signed(trade.time_profitable_sec, "+"),
-            "time_losing": _signed(trade.time_losing_sec, "-"),
-            "time_to_max_profit": _signed(trade.seconds_until_max_profit, "+"),
-            "time_to_max_loss": _signed(trade.seconds_until_max_loss, "-"),
+            "time_to_first_profit": _format_duration(trade.time_to_first_profit_sec),
+            "time_to_first_loss": _format_duration(trade.time_to_first_loss_sec),
+            "time_profitable": _format_duration(trade.time_profitable_sec),
+            "time_losing": _format_duration(trade.time_losing_sec),
+            "time_to_max_profit": _format_duration(trade.seconds_until_max_profit),
+            "time_to_max_loss": _format_duration(trade.seconds_until_max_loss),
             "movement_score": movement_score,
             "entry_quality": entry_quality,
             "realized_profit": realized_pnl,
