@@ -127,34 +127,8 @@ class RollingEvidenceConfig:
     aggressive_weight: float = 10.0
     liquidity_weight: float = 5.0
     # Minimum total score (out of 100, assuming default weights) to trade.
+    # Same bar for both directions.
     min_score_threshold: float = 75.0
-
-    # Direction-specific override of min_score_threshold above. Added
-    # after analysis of the first ~40 live trades in position_history
-    # showed long entries scoring just as high pre-trade (avg/peak
-    # confidence, whale/event confirmations) as shorts, but landing
-    # "Late Entry" 6x more often (6 of 7 Late Entry trades were long) and
-    # liquidating at a 40% rate vs 25% for shorts. The pre-trade score
-    # isn't distinguishing "direction confirmed" from "direction
-    # confirmed after most of the move already happened" — crypto pumps
-    # (longs) tend to get confirmed by trailing buy-volume signals only
-    # after price has already run, while drops (shorts) show up earlier
-    # in order-book/whale-sell signals. Raising the long-side bar is a
-    # blunt first pass at compensating for that until signals_histories
-    # (see the SQL for that table) has enough rows to fit something
-    # better — e.g. a "how much of the move already happened" freshness
-    # check. Re-tune these numbers once that data exists; they come from
-    # "accepted longs in the sample ranged 79.9-94.2 and still
-    # liquidated 40% of the time, so require meaningfully more margin
-    # above the base bar," not from a proper fit.
-    min_score_threshold_by_direction: Dict[str, float] = field(
-        default_factory=lambda: {"long": 88.0, "short": 75.0}
-    )
-
-    def min_score_for(self, direction: str) -> float:
-        return self.min_score_threshold_by_direction.get(
-            direction.lower(), self.min_score_threshold
-        )
 
     # --- Signal persistence (separate stage, see PersistenceValidator) ---
     signal_persistence_seconds: float = 7.0
@@ -325,7 +299,7 @@ class EvidenceSummary:
             "aggressive_volume_score": points("aggressive volume"),
             "liquidity_reversals_score": points("liquidity reversals"),
             "total_score": self.score(cfg),
-            "score_threshold_used": cfg.min_score_for(self.dominant_direction or ""),
+            "score_threshold_used": cfg.min_score_threshold,
         }
 
     def passes(self, cfg: RollingEvidenceConfig) -> bool:
@@ -335,7 +309,7 @@ class EvidenceSummary:
             return False
         if self.window_age_seconds < cfg.minimum_window_age_seconds:
             return False
-        return self.score(cfg) >= cfg.min_score_for(self.dominant_direction)
+        return self.score(cfg) >= cfg.min_score_threshold
 
     def explain(self, cfg: RollingEvidenceConfig) -> str:
         """Full weighted breakdown, one line per component, always shown —
@@ -361,7 +335,7 @@ class EvidenceSummary:
 
         components = self.score_breakdown(cfg)
         total = sum(c.points for c in components)
-        threshold = cfg.min_score_for(self.dominant_direction)
+        threshold = cfg.min_score_threshold
         decision = "ACCEPTED" if total >= threshold else "REJECTED"
 
         lines = [f"{self.symbol} — direction={self.dominant_direction.upper()} samples={self.sample_count} flips={self.direction_flips}"]
