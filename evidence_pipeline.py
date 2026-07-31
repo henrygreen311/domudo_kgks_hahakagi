@@ -282,7 +282,7 @@ class EvidenceSummary:
         so a rejection says exactly which dimensions fell short and by how
         much, not just PASSES=False."""
         if self.dominant_direction is None or self.sample_count == 0:
-            #return f"{self.symbol}: no directional evidence in window — REJECTED (score=0/100)"
+            return " "
 
         if self.directional_sample_count < cfg.minimum_directional_samples:
             return (
