@@ -401,6 +401,13 @@ class _ExchangeConnector:
     ws_url = ""
     SUPPORTS_LIQUIDATIONS = False
     LIQUIDATIONS_GLOBAL = False
+    # websockets' default is 1 MiB, which Coinbase's level2_batch full
+    # order-book snapshot for a busy pair (BTC-USD) exceeds — this was
+    # killing the connection mid-message every single time
+    # (ConnectionClosedError: 1009 message too big) and looping forever
+    # since the very next reconnect just failed the same way. 20 MiB
+    # covers every exchange here with plenty of room.
+    MAX_MESSAGE_SIZE = 20 * 1024 * 1024
 
     def __init__(self, config: CrossExchangeConfig) -> None:
         self.config = config
@@ -531,7 +538,7 @@ class _ExchangeConnector:
         while True:
             self._health = ExchangeHealth()
             try:
-                async with websockets.connect(self.ws_url, open_timeout=10) as ws:
+                async with websockets.connect(self.ws_url, open_timeout=10, max_size=self.MAX_MESSAGE_SIZE) as ws:
                     self._online = True
                     self._health.connected = True
                     backoff = self.config.reconnect_backoff_sec
@@ -568,6 +575,7 @@ class _ExchangeConnector:
                 if symbol in self._subscribed:
                     continue
                 self._subscribed.add(symbol)
+            ok, failed = [], []
             for channel_key, builder in self._channel_builders().items():
                 if channel_key == "liquidations" and self.LIQUIDATIONS_GLOBAL:
                     async with self._lock:
@@ -578,10 +586,14 @@ class _ExchangeConnector:
                     payload = builder(symbol)
                     await ws.send(json.dumps(payload))
                     self.channel_health(channel_key).subscribed = True
-                    log.info(f"[cross_exchange:{self.name}] subscribed {symbol} [{channel_key}]")
+                    ok.append(channel_key)
                 except Exception as e:
                     self.channel_health(channel_key).last_error = f"subscribe failed: {e}"
-                    log.warning(f"[cross_exchange:{self.name}] failed to subscribe {symbol} [{channel_key}]: {e}")
+                    failed.append(f"{channel_key}: {type(e).__name__}")
+            if ok:
+                log.info(f"[cross_exchange:{self.name}] {symbol} subscribed ({', '.join(ok)})")
+            if failed:
+                log.warning(f"[cross_exchange:{self.name}] {symbol} subscribe FAILED ({'; '.join(failed)})")
 
     async def _recv_loop(self, ws) -> None:
         async for raw in ws:
@@ -1321,10 +1333,6 @@ def _log_result(okx_symbol: str, candidate_direction: str, result: CrossExchange
     log.info("\n".join(lines))
 
 
-def _mark(ok: bool) -> str:
-    return "✓" if ok else "✗"
-
-
 class CrossExchangeValidator:
     def __init__(self, config: Optional[CrossExchangeConfig] = None) -> None:
         self.config = config or CrossExchangeConfig()
@@ -1413,33 +1421,25 @@ class CrossExchangeValidator:
                 break
             await asyncio.sleep(0.2)
 
-        lines = ["========== Cross Exchange Validation ==========", ""]
+        lines = ["[cross_exchange] startup check:"]
         all_ready = True
+        failing: List[str] = []
         for name, connector in self._connectors.items():
-            lines.append(EXCHANGE_LABELS.get(name, name.upper()))
+            label = EXCHANGE_LABELS.get(name, name.upper())
             connected = connector.is_connected
-            lines.append(f"{_mark(connected)} Connected")
-
-            channel_ok = {}
-            for label, key in (("Ticker", "ticker"), ("Order Book", "book"), ("Trades", "trades")):
-                ok = connected and connector.channel_verified(key)
-                channel_ok[key] = ok
-                lines.append(f"{_mark(ok)} {label}")
-
-            if connector.SUPPORTS_LIQUIDATIONS:
-                liq_ok = connected and connector.channel_verified("liquidations")
-                lines.append(f"{_mark(liq_ok)} Liquidations")
-            else:
-                lines.append("— Liquidations (not offered on this public feed)")
-
+            channel_ok = {key: connected and connector.channel_verified(key) for key in ("ticker", "book", "trades")}
             parser_ok = connected and all(channel_ok.values())
-            lines.append(f"{_mark(parser_ok)} Parser Verified")
             all_ready = all_ready and parser_ok
-            lines.append("")
 
-        lines.append("--------------------------------")
-        lines.append("System Status")
-        lines.append("READY" if all_ready else "DEGRADED")
+            if parser_ok:
+                lines.append(f"  {label:<9} OK")
+            else:
+                bad = ["not connected"] if not connected else [k for k, ok in channel_ok.items() if not ok]
+                lines.append(f"  {label:<9} FAIL ({', '.join(bad)})")
+                failing.append(label)
+
+        status_line = "READY" if all_ready else f"DEGRADED — failing: {', '.join(failing)}"
+        lines.append(f"System: {status_line}")
 
         report = "\n".join(lines)
         log.info(report)
