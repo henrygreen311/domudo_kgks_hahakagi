@@ -37,6 +37,7 @@ tracks OKX's real behavior closely enough to gate on.
 
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
+from typing import List, Optional, Tuple
 
 
 @dataclass
@@ -45,6 +46,12 @@ class LiquidationCheckResult:
     liquidation_price: float
     distance_ticks: float
     reason: str = ""
+    # Populated by check_liquidation_distance_pct()/select_leverage_with_safe_liquidation()
+    # below; left None by the original tick-based check_liquidation_distance()
+    # above, which doesn't have a notion of "chosen leverage" since it's
+    # only ever given one to check.
+    leverage: Optional[float] = None
+    distance_pct: Optional[float] = None
 
 
 def estimate_liquidation_price(entry_price: float, leverage: float, mmr: float, direction: str) -> float:
@@ -96,3 +103,94 @@ def check_liquidation_distance(
             ),
         )
     return LiquidationCheckResult(approved=True, liquidation_price=liq_price, distance_ticks=distance_ticks)
+
+
+def check_liquidation_distance_pct(
+    entry_price: float,
+    leverage: float,
+    mmr: float,
+    direction: str,
+    min_distance_pct: float,
+) -> LiquidationCheckResult:
+    """Percentage-distance counterpart to check_liquidation_distance()
+    above — same estimate_liquidation_price() math, but gates on how far
+    the liquidation price sits as a *fraction of entry_price* rather than
+    a fixed tick count. A fixed tick count means very different things in
+    relative terms across symbols and leverages — see
+    select_leverage_with_safe_liquidation() below for why that mattered
+    here specifically."""
+    if entry_price <= 0 or leverage <= 0:
+        return LiquidationCheckResult(
+            approved=False, liquidation_price=0.0, distance_ticks=0.0, leverage=leverage,
+            reason="invalid entry_price/leverage — cannot evaluate, rejecting to be safe",
+        )
+
+    liq_price = estimate_liquidation_price(entry_price, leverage, mmr, direction)
+    distance_pct = abs(entry_price - liq_price) / entry_price
+
+    if distance_pct < min_distance_pct:
+        return LiquidationCheckResult(
+            approved=False, liquidation_price=liq_price, distance_ticks=0.0,
+            leverage=leverage, distance_pct=distance_pct,
+            reason=(
+                f"at {leverage:.0f}x, estimated liquidation is only {distance_pct:.2%} from entry "
+                f"(need >= {min_distance_pct:.0%})"
+            ),
+        )
+    return LiquidationCheckResult(
+        approved=True, liquidation_price=liq_price, distance_ticks=0.0,
+        leverage=leverage, distance_pct=distance_pct,
+    )
+
+
+def select_leverage_with_safe_liquidation(
+    entry_price: float,
+    direction: str,
+    candidates: List[Tuple[float, float]],  # [(leverage, mmr), ...], most-preferred first
+    min_distance_pct: float,
+) -> LiquidationCheckResult:
+    """Tries each (leverage, mmr) candidate in the order given — most
+    preferred first, e.g. [(50, mmr_at_50x), (10, mmr_at_10x)] — and
+    returns the first whose estimated liquidation price sits at least
+    min_distance_pct away from entry_price. If none qualify, returns
+    approved=False carrying the closest miss's numbers, so the rejection
+    log says something concrete instead of just "nothing worked".
+
+    Why per-symbol dynamic leverage instead of one fixed leverage for
+    everything: position_history showed KAITO-USDT-SWAP liquidating
+    repeatedly at 50x (entry ~1.22, liquidated after roughly a 1%
+    adverse move) while ETH-USDT-SWAP survived the same 50x fine — they
+    don't carry the same maintenance margin rate or typical volatility,
+    so "50x" isn't the same safety margin across pairs. Blanket-forcing
+    50x everywhere reliably liquidates the volatile ones; blanket-capping
+    everything at a lower leverage gives up real size on pairs where 50x
+    genuinely is safe (matches the original "50x is fine for ETH"
+    observation). Trying 50x first and only falling back to a lower
+    leverage when 50x isn't safe *for this specific symbol* keeps both.
+
+    mmr is fetched by the caller (ExecutionEngine, which talks to the
+    exchange) for each candidate's resulting notional and passed in
+    already resolved — this module stays exchange-agnostic per its own
+    stated design (see module docstring), so it never calls the
+    exchange itself.
+    """
+    if not candidates:
+        return LiquidationCheckResult(
+            approved=False, liquidation_price=0.0, distance_ticks=0.0,
+            reason="no candidate leverages available to evaluate",
+        )
+
+    closest: Optional[LiquidationCheckResult] = None
+    for leverage, mmr in candidates:
+        result = check_liquidation_distance_pct(entry_price, leverage, mmr, direction, min_distance_pct)
+        if result.approved:
+            return result
+        if closest is None or (result.distance_pct or 0.0) > (closest.distance_pct or 0.0):
+            closest = result
+
+    tried = ", ".join(f"{lev:.0f}x" for lev, _ in candidates)
+    closest.reason = (
+        f"none of the tried leverages ({tried}) keep liquidation >= {min_distance_pct:.0%} from entry — "
+        f"closest was {closest.reason}"
+    )
+    return closest

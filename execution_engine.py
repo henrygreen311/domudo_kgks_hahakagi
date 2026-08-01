@@ -30,7 +30,7 @@ from typing import Dict, List, Optional
 
 from okx_futures_client import OKXAPIError, OKXFuturesClient
 from market_data import Signal
-from liquidation_guard import check_liquidation_distance
+from liquidation_guard import check_liquidation_distance, select_leverage_with_safe_liquidation
 
 log = logging.getLogger("okx_futures.execution")
 
@@ -95,15 +95,23 @@ class ExecutionConfig:
     instant_liquidation_price_move_pct: float = 0.3
 
     # --- Pre-trade liquidation-distance guard ---
-    # Before ever submitting an order, estimate how many price ticks
-    # separate the entry price from the estimated liquidation price; if
-    # it's fewer than min_liquidation_distance_ticks, discard the signal.
-    # This is what OP-USDT-SWAP order #181 needed: it opened and closed in
-    # the same second, liquidated just 13 ticks from its entry price — a
-    # trade that close to liquidation before it even opens isn't a real
-    # trade, it's a coin-flip against noise. See liquidation_guard.py.
+    # Before ever submitting an order, estimate the liquidation price and
+    # require it to sit at least min_liquidation_distance_pct away from
+    # entry (as a fraction of entry_price). This used to be a fixed tick
+    # count at a single fixed leverage; replaced with a percentage check
+    # tried across candidate leverages (see fallback_leverage below)
+    # because a fixed tick count means very different things across
+    # symbols, and position_history showed exactly that: KAITO-USDT-SWAP
+    # kept liquidating at 50x (~1% adverse move) while ETH-USDT-SWAP was
+    # fine at the same leverage. See liquidation_guard.py.
     enable_liquidation_guard: bool = True
-    min_liquidation_distance_ticks: float = 100.0
+    min_liquidation_distance_pct: float = 0.06
+    # Tried in order (requested_leverage first) against
+    # min_liquidation_distance_pct; the first one that keeps liquidation
+    # far enough away is used. Only relevant while enable_liquidation_guard
+    # is True — with the guard off, leverage is just
+    # min(exchange_max, requested_leverage) as before.
+    fallback_leverage: int = 10
 
 
 @dataclass
@@ -328,7 +336,6 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
             )
             return None
 
-        leverage = min(max_leverage_symbol, cfg.requested_leverage)
         contract_size = float(contract.get("contract_size", 0))
         price_precision = contract.get("price_precision", "0.01")
         vol_precision = contract.get("vol_precision", "1")
@@ -336,6 +343,59 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         if contract_size <= 0:
             log.error(f"[execution] {symbol} has invalid contract_size — skipping")
             return None
+
+        if cfg.enable_liquidation_guard:
+            # Try requested_leverage first, fall back to fallback_leverage
+            # — highest (most capital-efficient) leverage that's actually
+            # safe for THIS symbol, not a single fixed leverage applied
+            # everywhere. Each candidate gets its own mmr lookup since
+            # notional (and therefore the maintenance-margin tier) differs
+            # by leverage even at the same margin_per_trade_usdt.
+            candidate_leverages = []
+            for lev in (cfg.requested_leverage, cfg.fallback_leverage):
+                lev = min(lev, max_leverage_symbol)
+                if lev >= cfg.min_leverage_required and lev not in candidate_leverages:
+                    candidate_leverages.append(lev)
+            candidate_leverages.sort(reverse=True)
+
+            candidates_with_mmr = []
+            for lev in candidate_leverages:
+                notional_at_lev = cfg.margin_per_trade_usdt * lev
+                try:
+                    mmr = await self._client.get_position_tier_mmr(symbol, cfg.open_type, notional_at_lev)
+                except OKXAPIError as exc:
+                    log.warning(
+                        f"[execution] {symbol} — could not fetch maintenance margin rate at {lev}x "
+                        f"for the liquidation guard ({exc}); skipping this leverage option"
+                    )
+                    continue
+                candidates_with_mmr.append((lev, mmr))
+
+            if not candidates_with_mmr:
+                log.warning(
+                    f"[execution] {symbol} {direction.upper()} — could not fetch maintenance margin "
+                    f"rate for any candidate leverage; discarding rather than trading blind"
+                )
+                return None
+
+            liq_check = select_leverage_with_safe_liquidation(
+                entry_price=signal.entry_price,
+                direction=direction,
+                candidates=candidates_with_mmr,
+                min_distance_pct=cfg.min_liquidation_distance_pct,
+            )
+            if not liq_check.approved:
+                log.info(f"[execution] {symbol} {direction.upper()} — {liq_check.reason}")
+                return None
+
+            leverage = liq_check.leverage
+            log.info(
+                f"[execution] {symbol} {direction.upper()} liquidation guard passed at {leverage:.0f}x — "
+                f"est. liq={liq_check.liquidation_price:.8f} "
+                f"({liq_check.distance_pct:.2%} from entry {signal.entry_price})"
+            )
+        else:
+            leverage = min(max_leverage_symbol, cfg.requested_leverage)
 
         notional_usdt = cfg.margin_per_trade_usdt * leverage
         qty_base = notional_usdt / signal.entry_price
@@ -347,33 +407,6 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
                 f"${cfg.margin_per_trade_usdt} margin at {leverage}x can buy — signal discarded"
             )
             return None
-
-        if cfg.enable_liquidation_guard:
-            try:
-                mmr = await self._client.get_position_tier_mmr(symbol, cfg.open_type, notional_usdt)
-            except OKXAPIError as exc:
-                log.warning(
-                    f"[execution] {symbol} — could not fetch maintenance margin rate for the "
-                    f"liquidation guard ({exc}); discarding rather than trading blind"
-                )
-                return None
-
-            liq_check = check_liquidation_distance(
-                entry_price=signal.entry_price,
-                leverage=leverage,
-                mmr=mmr,
-                direction=direction,
-                tick_size=price_precision,
-                min_distance_ticks=cfg.min_liquidation_distance_ticks,
-            )
-            if not liq_check.approved:
-                log.info(f"[execution] {symbol} {direction.upper()} — {liq_check.reason}")
-                return None
-            log.info(
-                f"[execution] {symbol} {direction.upper()} liquidation guard passed — "
-                f"est. liq={liq_check.liquidation_price:.8f} "
-                f"({liq_check.distance_ticks:.1f} ticks from entry {signal.entry_price})"
-            )
 
         try:
             await self._client.submit_leverage(symbol, leverage, cfg.open_type, direction=direction)
