@@ -116,7 +116,7 @@ class CrossExchangeConfig:
     window_size: int = 40
     trade_window_size: int = 100
     liquidation_window_size: int = 30
-    snapshot_wait_timeout_sec: float = 4.0
+    snapshot_wait_timeout_sec: float = 6.0
     max_snapshot_age_sec: float = 8.0
     subscription_idle_ttl_sec: float = 300.0
     reconnect_backoff_sec: float = 3.0
@@ -1377,26 +1377,28 @@ def _build_consensus(
 
 
 def _log_result(okx_symbol: str, candidate_direction: str, result: CrossExchangeResult) -> None:
-    lines = [f"[cross_exchange] {okx_symbol} candidate={candidate_direction.upper()}", ""]
+    """Matches the requested inline style: one line listing every
+    exchange as 'NAME= RESULT', comma-separated, instead of one line per
+    field per exchange."""
+    per_exchange = []
     for name, o in result.exchange_results.items():
         if o.error is not None:
-            lines.append(f"{name.upper()}\n{o.error.upper()}")
+            per_exchange.append(f"{name.upper()}= {o.error.upper()}")
         else:
-            extra = f" (unavailable: {', '.join(o.unavailable_metrics)})" if o.unavailable_metrics else ""
-            lines.append(f"{name.upper()}\n{o.direction.upper()}\n{o.confidence:.0f}{extra}")
-    lines.append("")
-    lines.append(f"Agreement:\n\n{result.agreeing_exchanges} / {result.total_exchanges}")
-    lines.append("")
-    lines.append(f"Consensus:\n\n{result.consensus_pct:.2f}%")
-    if result.decision == "accepted":
-        lines.append("")
-        lines.append(f"Average Confidence:\n\n{result.average_confidence}")
-    lines.append("")
-    lines.append(f"Decision:\n\n{result.decision.upper()}")
-    if result.reason:
-        lines.append("")
-        lines.append(f"Reason:\n\n{result.reason}")
-    log.info("\n".join(lines))
+            extra = f" (unavailable: {'+'.join(o.unavailable_metrics)})" if o.unavailable_metrics else ""
+            per_exchange.append(f"{name.upper()}= {o.direction.upper()} {o.confidence:.0f}{extra}")
+
+    summary = (
+        f"agreement={result.agreeing_exchanges}/{result.total_exchanges} "
+        f"consensus={result.consensus_pct:.2f}% "
+        + (f"avg_confidence={result.average_confidence} " if result.decision == "accepted" else "")
+        + f"decision={result.decision.upper()}"
+        + (f" reason=\"{result.reason}\"" if result.reason else "")
+    )
+
+    log.info(f"[cross_exchange] {okx_symbol} candidate={candidate_direction.upper()}")
+    log.info(f"[cross_exchange] {', '.join(per_exchange)}")
+    log.info(f"[cross_exchange] {summary}")
 
 
 class CrossExchangeValidator:
@@ -1431,12 +1433,24 @@ class CrossExchangeValidator:
                 continue
             await connector.ensure_subscribed(symbols_by_exchange[name])
 
+        # Wait for enough exchanges to actually have analyzable data —
+        # not just "received one message ever". _analyze() needs at
+        # least 2 ticks to compute anything (momentum needs a start and
+        # an end point); checking last_seen > 0 alone let this loop exit
+        # after ~300ms once a handful of exchanges got their very first
+        # tick, long before the 4s budget was used, which is exactly why
+        # freshly-subscribed symbols were showing NO FRESH DATA /
+        # INSUFFICIENT TICKS for nearly every candidate — the loop had
+        # already moved on to analysis before there was anything to
+        # analyze.
+        min_ticks_for_analysis = 2
         deadline = time.time() + cfg.snapshot_wait_timeout_sec
         while time.time() < deadline:
             ready = sum(
                 1
                 for name, connector in self._connectors.items()
-                if connector.is_verified_online and connector.last_seen(symbols_by_exchange.get(name, "")) > 0
+                if connector.is_verified_online
+                and len(connector.get_state(symbols_by_exchange.get(name, "")).ticks) >= min_ticks_for_analysis
             )
             if ready >= cfg.min_online_exchanges:
                 break

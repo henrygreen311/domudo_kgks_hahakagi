@@ -54,23 +54,6 @@ class ExecutionConfig:
     max_open_positions: int = 5
     max_total_trades: int = 10
     target_net_profit_usdt: float = 0.10
-    # Extra gross-profit cushion required on top of fees when computing
-    # the take-profit price, sized to absorb ordinary execution slippage
-    # between the moment price crosses the TP trigger and the moment the
-    # resulting market order actually fills. Without this, the TP price
-    # was computed at the exact fee-break-even-plus-target level with
-    # zero margin — real fills observed in position_history landed
-    # anywhere from ~0.02% to ~0.48% short of the calculated TP price
-    # (see e.g. KAITO trade 257: designed move 0.0028, actual fill only
-    # 0.0004 — a 0.21% shortfall), which was enough on its own to erase
-    # target_net_profit_usdt and land several trades net-negative despite
-    # close_reason correctly reading "take_profit". 0.20% is set from the
-    # observed shortfall distribution in that data (covers most cases;
-    # trades 260/266 slipped further than this during a fast adverse
-    # move, so this reduces but does not eliminate the risk — a resolute
-    # fix would be switching the TP order to a real limit fill instead of
-    # trigger+market; see _place_take_profit).
-    tp_slippage_buffer_frac: float = 0.0020
     open_type: str = "isolated"
     fill_poll_interval_sec: float = 0.5
     fill_timeout_sec: float = 15.0
@@ -585,15 +568,16 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         """Take profit is derived entirely from real, exchange-reported
         numbers: the actual filled entry price/size and the actual opening
         fee (doubled to estimate the matching closing fee), targeting a net
-        realized profit of `target_net_profit_usdt` after both fees — plus
-        `tp_slippage_buffer_frac` extra gross profit to survive ordinary
-        slippage on the trigger-then-market TP fill (see ExecutionConfig)."""
+        realized profit of exactly `target_net_profit_usdt` after both fees
+        — no added cushion. A prior version added a slippage buffer here
+        (0.20% extra required price move), which pushed the TP price out
+        to ~0.30-0.39 USDT of required profit against a $0.07 target,
+        defeating the scalp — removed per explicit instruction."""
         cfg = self.config
         estimated_total_fees = opening_fee * 2.0
         notional = size_contracts * contract_size * entry_price
         required_gross_profit = cfg.target_net_profit_usdt + estimated_total_fees
         price_move_frac = required_gross_profit / notional if notional > 0 else 0.0
-        price_move_frac += cfg.tp_slippage_buffer_frac
 
         if direction == "long":
             raw_tp = entry_price * (1 + price_move_frac)
