@@ -409,6 +409,35 @@ class _ExchangeConnector:
     # covers every exchange here with plenty of room.
     MAX_MESSAGE_SIZE = 20 * 1024 * 1024
 
+    # App-level keepalive. websockets' own protocol-level ping/pong isn't
+    # enough for exchanges that require a text/JSON *data frame* at the
+    # application layer — Bitget and MEXC both silently drop connections
+    # that never send one (confirmed against their docs: Bitget wants a
+    # literal "ping" string every 30s, disconnects after 2 min of
+    # silence; MEXC wants {"method": "ping"} every <=60s, recommends
+    # 10-20s). None here means "no app-level ping needed" — Coinbase,
+    # Kraken, and BingX don't require one per their public docs.
+    PING_INTERVAL_SEC: Optional[float] = None
+
+    def build_ping_message(self):
+        """Returns a str or dict to send verbatim as the keepalive ping,
+        or None if this exchange doesn't need one. Only called when
+        PING_INTERVAL_SEC is set."""
+        return None
+
+    async def _ping_loop(self, ws) -> None:
+        if self.PING_INTERVAL_SEC is None:
+            return
+        while True:
+            await asyncio.sleep(self.PING_INTERVAL_SEC)
+            msg = self.build_ping_message()
+            if msg is None:
+                continue
+            try:
+                await ws.send(msg if isinstance(msg, str) else json.dumps(msg))
+            except Exception:
+                return  # _recv_loop hitting the same dead socket triggers the reconnect
+
     def __init__(self, config: CrossExchangeConfig) -> None:
         self.config = config
         self._online = False
@@ -554,6 +583,7 @@ class _ExchangeConnector:
                     await asyncio.gather(
                         self._subscribe_consumer(ws),
                         self._recv_loop(ws),
+                        self._ping_loop(ws),
                     )
             except asyncio.CancelledError:
                 raise
@@ -668,6 +698,10 @@ class OKXConnector(_ExchangeConnector):
     ws_url = OKX_PUBLIC_WS_URL
     SUPPORTS_LIQUIDATIONS = True
     LIQUIDATIONS_GLOBAL = True
+    PING_INTERVAL_SEC = 25.0  # OKX docs: send literal "ping" if no message sent in 30s
+
+    def build_ping_message(self):
+        return "ping"
 
     def build_ticker_sub(self, symbol: str) -> dict:
         return {"op": "subscribe", "args": [{"channel": "tickers", "instId": symbol}]}
@@ -916,6 +950,12 @@ class MEXCConnector(_ExchangeConnector):
     ws_url = "wss://contract.mexc.com/edge"
     SUPPORTS_LIQUIDATIONS = True
     LIQUIDATIONS_GLOBAL = False
+    # Confirmed via MEXC contract API docs: server disconnects if no ping
+    # is received within 1 minute; docs recommend sending one every 10-20s.
+    PING_INTERVAL_SEC = 15.0
+
+    def build_ping_message(self):
+        return {"method": "ping"}
 
     def build_ticker_sub(self, symbol: str) -> dict:
         return {"method": "sub.ticker", "param": {"symbol": symbol}}
@@ -1003,6 +1043,16 @@ class BitgetConnector(_ExchangeConnector):
     ws_url = "wss://ws.bitget.com/v2/ws/public"
     SUPPORTS_LIQUIDATIONS = True
     LIQUIDATIONS_GLOBAL = False
+    # This is the actual fix for the "connection lost ... no close frame
+    # received or sent" / repeated-reconnect-then-immediately-fail
+    # pattern observed in production: Bitget's docs are explicit —
+    # clients must send a literal "ping" string every 30s or the server
+    # disconnects after 2 minutes of receiving none. We never sent one,
+    # so every connection was silently doomed from the moment it opened.
+    PING_INTERVAL_SEC = 25.0
+
+    def build_ping_message(self):
+        return "ping"
 
     def build_ticker_sub(self, symbol: str) -> dict:
         return {"op": "subscribe", "args": [{"instType": "USDT-FUTURES", "channel": "ticker", "instId": symbol}]}
@@ -1084,6 +1134,13 @@ class GateioConnector(_ExchangeConnector):
     ws_url = "wss://fx-ws.gateio.ws/v4/ws/usdt"
     SUPPORTS_LIQUIDATIONS = True
     LIQUIDATIONS_GLOBAL = False
+    # Gate.io's own docs describe this as optional ("if you want to
+    # actively detect the connection status") rather than mandatory, but
+    # it's cheap and matches their documented format exactly.
+    PING_INTERVAL_SEC = 20.0
+
+    def build_ping_message(self):
+        return {"time": int(time.time()), "channel": "futures.ping"}
 
     def build_ticker_sub(self, symbol: str) -> dict:
         return {"time": int(time.time()), "channel": "futures.tickers", "event": "subscribe", "payload": [symbol]}
@@ -1100,7 +1157,16 @@ class GateioConnector(_ExchangeConnector):
     def parse_message(self, raw) -> List[ParsedEvent]:
         msg = json.loads(raw)
         channel = msg.get("channel")
-        if msg.get("event") != "update" or "result" not in msg:
+        event = msg.get("event")
+        # Confirmed via Gate.io's official Futures WebSocket docs
+        # (gate.com/docs/developers/futures/): ticker/trades data
+        # notifications use event:"update", but futures.order_book's data
+        # notification uses event:"all" — a different value for the same
+        # "here's a real message" meaning, not a subscribe ack. The old
+        # code only accepted "update" here, which silently dropped every
+        # order-book message while ticker/trades kept working — exactly
+        # the observed "Gate.io FAIL (book)" with ticker/trades verified.
+        if event not in ("update", "all") or "result" not in msg:
             return []
         result = msg["result"]
         items = result if isinstance(result, list) else [result]
