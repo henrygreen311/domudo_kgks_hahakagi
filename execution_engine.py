@@ -155,7 +155,7 @@ class ExecutionEngineBase(ABC):
         ...
 
     @abstractmethod
-    async def try_open_trade(self, signal: Signal, signal_snapshot: Optional[dict] = None) -> bool:
+    async def try_open_trade(self, signal: Signal) -> bool:
         ...
 
     @abstractmethod
@@ -174,13 +174,11 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         config: Optional[ExecutionConfig] = None,
         position_store=None,
         movement_tracker=None,
-        signal_store=None,
     ) -> None:
         self._client = client
         self.config = config or ExecutionConfig()
         self._position_store = position_store
         self._movement_tracker = movement_tracker
-        self._signal_store = signal_store
         self._open_positions: Dict[str, OpenPosition] = {}
         self._total_opened = 0
         self._lock = asyncio.Lock()
@@ -231,7 +229,7 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         async with self._lock:
             return symbol in self._open_positions
 
-    async def try_open_trade(self, signal: Signal, signal_snapshot: Optional[dict] = None) -> bool:
+    async def try_open_trade(self, signal: Signal) -> bool:
         cfg = self.config
         symbol = signal.symbol
 
@@ -259,29 +257,7 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
             self._open_positions[symbol] = opened
             self._total_opened += 1
 
-        if signal_snapshot is not None:
-            await self._record_signal_history(opened, signal_snapshot)
         return True
-
-    async def _record_signal_history(self, opened: OpenPosition, signal_snapshot: dict) -> None:
-        """Persists the evidence-pipeline breakdown captured at accept
-        time (see EvidenceSummary.to_signal_record()) now that the trade
-        actually has a trade_id/entry_price to attach it to. Best-effort,
-        same as position_store/movement_tracker calls elsewhere — a
-        signal-history write failing must never take trading down with
-        it."""
-        if self._signal_store is None:
-            return
-        try:
-            record = dict(signal_snapshot)
-            record["trade_id"] = opened.db_id
-            record["entry_price"] = opened.entry_price
-            await self._signal_store.record_signal(record)
-        except Exception:
-            log.exception(
-                f"[signal-store] failed to record signal history for "
-                f"{opened.symbol} (trade_id={opened.db_id})"
-            )
 
     async def _open_position(self, signal: Signal) -> Optional[OpenPosition]:
         cfg = self.config

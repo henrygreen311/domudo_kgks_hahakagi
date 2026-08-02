@@ -13,6 +13,8 @@ from typing import Deque, Dict, List, Optional, Tuple
 
 import websockets
 
+from observation_engine import classify_trend, compute_buy_sell_ratio, compute_net_aggressive_delta_ok, compute_volume_expansion_ok
+
 log = logging.getLogger(__name__)
 
 DEMO_TRADING = True
@@ -113,9 +115,6 @@ class CrossExchangeConfig:
     min_agreeing: int = 5
     min_online_exchanges: int = 5
 
-    window_size: int = 40
-    trade_window_size: int = 100
-    liquidation_window_size: int = 30
     snapshot_wait_timeout_sec: float = 6.0
     max_snapshot_age_sec: float = 8.0
     subscription_idle_ttl_sec: float = 300.0
@@ -124,17 +123,29 @@ class CrossExchangeConfig:
     self_test_symbol: str = "BTC-USDT-SWAP"
     self_test_timeout_sec: float = 20.0
 
-    weights: Dict[str, float] = field(
-        default_factory=lambda: {
-            "momentum": 0.30,
-            "order_book_imbalance": 0.20,
-            "aggressive_flow": 0.20,
-            "trend_continuation": 0.15,
-            "breakout": 0.10,
-            "whale_activity": 0.05,
-        }
-    )
-    neutral_band: float = 0.05
+    # How long local per-symbol tick/trade history is retained. Needs to
+    # comfortably cover the longest lookback any of the four signals below
+    # uses (volume_baseline_window_sec, 30 min) — 35 min gives headroom.
+    tick_retention_sec: float = 2100.0
+    trade_retention_sec: float = 2100.0
+    liquidation_window_size: int = 30  # kept for the (currently unused-in-decisions) liquidations feed
+
+    # --- The same four required signals as observation_engine.py, checked
+    # per-exchange against the OKX-side candidate's direction. Defaults
+    # intentionally match ObservationConfig's — these two should be tuned
+    # together if either changes. ---
+    trend_bucket_sec: float = 300.0  # 5-minute synthetic candles, bucketed from raw ticks (see _build_candles_from_ticks)
+    trend_bucket_count: int = 6  # ~30 minutes
+    trend_move_threshold_pct: float = 0.003
+
+    ratio_window_sec: float = 300.0
+    min_buy_sell_ratio: float = 0.70
+
+    delta_bucket_count: int = 3
+
+    volume_recent_window_sec: float = 300.0
+    volume_baseline_window_sec: float = 1800.0
+    volume_expansion_multiplier: float = 1.5
 
 
 @dataclass
@@ -206,16 +217,14 @@ class ExchangeHealth:
 class ExchangeOpinion:
     exchange: str
     symbol: str
-    direction: str
-    confidence: float
-    momentum: float
-    order_book_imbalance: float
-    aggressive_buying: float
-    aggressive_selling: float
-    whale_activity: float
-    breakout_confirmation: bool
-    trend_continuation: float
-    unavailable_metrics: Tuple[str, ...] = ()
+    direction: str  # this exchange's own trend reading: "long" / "short" / "neutral" (sideways or no data)
+    trend: str
+    trend_ok: bool
+    buy_sell_ratio: float
+    ratio_ok: bool
+    net_aggressive_delta_ok: bool
+    volume_expansion_ok: bool
+    conditions_met: bool
     error: Optional[str] = None
 
 
@@ -227,7 +236,7 @@ class CrossExchangeResult:
     total_exchanges: int
     online_exchanges: int
     consensus_pct: float
-    average_confidence: float
+    average_buy_sell_ratio: float
     reason: Optional[str]
     exchange_results: Dict[str, ExchangeOpinion]
 
@@ -239,21 +248,19 @@ class CrossExchangeResult:
             "total_exchanges": self.total_exchanges,
             "online_exchanges": self.online_exchanges,
             "consensus_pct": self.consensus_pct,
-            "average_confidence": self.average_confidence,
+            "average_buy_sell_ratio": self.average_buy_sell_ratio,
             "reason": self.reason,
             "exchange_results": {
                 name: {
                     "symbol": o.symbol,
                     "direction": o.direction,
-                    "confidence": o.confidence,
-                    "momentum": o.momentum,
-                    "order_book_imbalance": o.order_book_imbalance,
-                    "aggressive_buying": o.aggressive_buying,
-                    "aggressive_selling": o.aggressive_selling,
-                    "whale_activity": o.whale_activity,
-                    "breakout_confirmation": o.breakout_confirmation,
-                    "trend_continuation": o.trend_continuation,
-                    "unavailable_metrics": list(o.unavailable_metrics),
+                    "trend": o.trend,
+                    "trend_ok": o.trend_ok,
+                    "buy_sell_ratio": o.buy_sell_ratio,
+                    "ratio_ok": o.ratio_ok,
+                    "net_aggressive_delta_ok": o.net_aggressive_delta_ok,
+                    "volume_expansion_ok": o.volume_expansion_ok,
+                    "conditions_met": o.conditions_met,
                     "error": o.error,
                 }
                 for name, o in self.exchange_results.items()
@@ -263,135 +270,91 @@ class CrossExchangeResult:
 
 def _offline_opinion(exchange: str, symbol: str, error: str) -> ExchangeOpinion:
     return ExchangeOpinion(
-        exchange=exchange, symbol=symbol, direction="neutral", confidence=0.0,
-        momentum=0.0, order_book_imbalance=0.0, aggressive_buying=0.0,
-        aggressive_selling=0.0, whale_activity=0.0, breakout_confirmation=False,
-        trend_continuation=0.0, unavailable_metrics=(), error=error,
+        exchange=exchange, symbol=symbol, direction="neutral", trend="sideways", trend_ok=False,
+        buy_sell_ratio=0.0, ratio_ok=False, net_aggressive_delta_ok=False, volume_expansion_ok=False,
+        conditions_met=False, error=error,
     )
+
+
+def _build_candles_from_ticks(ticks: List["Tick"], bucket_sec: float, num_buckets: int) -> List[dict]:
+    """Synthesizes up to `num_buckets` {"ts","open","close"} candles from
+    raw tick history. These external connectors stream ticks/trades over
+    their own websocket feeds rather than exposing a REST OHLCV endpoint
+    the way okx_futures_client.get_candles() does for the OKX/local side,
+    so the same trend check (classify_trend) is fed synthetic candles
+    built from whatever ticks fall in each `bucket_sec`-wide slice of the
+    last `bucket_sec * num_buckets` seconds instead of real exchange
+    candles. Only open/close are populated (classify_trend doesn't use
+    high/low)."""
+    if not ticks:
+        return []
+    now = time.time()
+    cutoff = now - (bucket_sec * num_buckets)
+    windowed = [t for t in ticks if t.ts >= cutoff and t.last]
+    if len(windowed) < 2:
+        return []
+    buckets: Dict[int, List["Tick"]] = {}
+    for t in windowed:
+        idx = min(int((t.ts - cutoff) // bucket_sec), num_buckets - 1)
+        buckets.setdefault(idx, []).append(t)
+    candles = []
+    for idx in sorted(buckets):
+        bucket_ticks = sorted(buckets[idx], key=lambda t: t.ts)
+        candles.append({"ts": bucket_ticks[0].ts, "open": bucket_ticks[0].last, "close": bucket_ticks[-1].last})
+    return candles
+
+
+def _trade_prints_to_dicts(prints: List["TradePrint"]) -> List[dict]:
+    """Adapts TradePrint (this module's shape) to the {"qty","side",
+    "timestamp"} shape observation_engine.py's shared signal functions
+    expect (market_data.TradeStore's native shape) — lets both modules
+    check the exact same logic against the exact same thresholds instead
+    of two parallel reimplementations that could quietly drift apart."""
+    return [{"qty": p.size, "side": p.side, "timestamp": p.ts} for p in prints if p.size and p.side]
 
 
 def _analyze(
-    exchange: str, symbol: str, state: SymbolState, health: ExchangeHealth, cfg: CrossExchangeConfig
+    exchange: str, symbol: str, state: SymbolState, health: ExchangeHealth, cfg: CrossExchangeConfig, candidate_direction: str
 ) -> Optional[ExchangeOpinion]:
-    ticks = state.ticks
+    ticks = list(state.ticks)
     if len(ticks) < 2:
         return None
-    first, last = ticks[0], ticks[-1]
-    if not first.last or not last.last:
-        return None
 
-    momentum_raw = (last.last - first.last) / first.last
-    momentum = max(-1.0, min(1.0, momentum_raw / 0.003))
-
-    unavailable: List[str] = []
-
-    book_verified = health.channel("book").verified
-    imbalance_samples = (
-        [
-            (t.bid_sz - t.ask_sz) / (t.bid_sz + t.ask_sz)
-            for t in ticks
-            if t.bid_sz and t.ask_sz and (t.bid_sz + t.ask_sz) > 0
-        ]
-        if book_verified
-        else []
-    )
-    if imbalance_samples:
-        order_book_imbalance = sum(imbalance_samples) / len(imbalance_samples)
-    else:
-        order_book_imbalance = 0.0
-        unavailable.append("order_book_imbalance")
-
+    book_verified = health.channel("book").verified  # kept: still gates whether book-derived fields would be trustworthy if added later
     trades_verified = health.channel("trades").verified
-    trade_list = [t for t in state.trades if t.price and t.size]
-    if trades_verified and trade_list:
-        buy_vol = sum(t.size for t in trade_list if t.side == "buy")
-        sell_vol = sum(t.size for t in trade_list if t.side == "sell")
-        total_vol = buy_vol + sell_vol
-        if total_vol > 0:
-            aggressive_buying = buy_vol / total_vol
-            aggressive_selling = sell_vol / total_vol
-        else:
-            aggressive_buying = aggressive_selling = 0.0
-            unavailable.append("aggressive_flow")
-    else:
-        aggressive_buying = aggressive_selling = 0.0
-        unavailable.append("aggressive_flow")
-    aggressive_flow = aggressive_buying - aggressive_selling
 
-    whale_activity = 0.0
-    whale_signal_found = False
-    sizes = [t.size for t in trade_list]
-    if len(sizes) >= 3:
-        avg = sum(sizes) / len(sizes)
-        mx = max(sizes)
-        if avg > 0:
-            whale_activity = max(whale_activity, max(0.0, min(1.0, mx / (avg * 6.0) - 1.0)))
-            whale_signal_found = True
-    if state.liquidations:
-        whale_activity = max(whale_activity, min(1.0, len(state.liquidations) / 5.0))
-        whale_signal_found = True
-    if not whale_signal_found:
-        unavailable.append("whale_activity")
+    candles = _build_candles_from_ticks(ticks, cfg.trend_bucket_sec, cfg.trend_bucket_count)
+    trend = classify_trend(candles, cfg.trend_move_threshold_pct)
+    trend_ok = trend == candidate_direction
 
-    prior = [t.last for t in list(ticks)[:-1]]
-    breakout_up = bool(prior) and last.last > max(prior)
-    breakout_down = bool(prior) and last.last < min(prior)
-    breakout_confirmation = breakout_up or breakout_down
+    now = time.time()
+    all_trades = [t for t in state.trades if t.price and t.size] if trades_verified else []
+    ratio_trades = _trade_prints_to_dicts([t for t in all_trades if t.ts >= now - cfg.ratio_window_sec])
+    recent_trades = _trade_prints_to_dicts([t for t in all_trades if t.ts >= now - cfg.volume_recent_window_sec])
+    baseline_trades = _trade_prints_to_dicts([t for t in all_trades if t.ts >= now - cfg.volume_baseline_window_sec])
 
-    overall_up = last.last >= first.last
-    agree = total = 0
-    prev = None
-    for t in ticks:
-        if prev is not None and t.last != prev.last:
-            total += 1
-            if (t.last > prev.last) == overall_up:
-                agree += 1
-        prev = t
-    trend_continuation = (agree / total) if total else 0.5
-
-    weights = dict(cfg.weights)
-    for key in ("order_book_imbalance", "aggressive_flow", "whale_activity"):
-        if key in unavailable:
-            weights[key] = 0.0
-    weight_total = sum(weights.values())
-    if weight_total > 0:
-        weights = {k: v / weight_total for k, v in weights.items()}
-
-    direction_signal = (
-        weights["momentum"] * momentum
-        + weights["order_book_imbalance"] * order_book_imbalance
-        + weights["aggressive_flow"] * aggressive_flow
-        + weights["trend_continuation"] * (trend_continuation - 0.5) * 2.0 * (1.0 if overall_up else -1.0)
+    dominant_side, ratio = compute_buy_sell_ratio(ratio_trades)
+    ratio_ok = dominant_side == candidate_direction and ratio >= cfg.min_buy_sell_ratio
+    delta_ok = compute_net_aggressive_delta_ok(ratio_trades, candidate_direction, cfg.delta_bucket_count)
+    volume_ok = compute_volume_expansion_ok(
+        recent_trades, baseline_trades, candidate_direction,
+        cfg.volume_recent_window_sec * 1000.0, cfg.volume_baseline_window_sec * 1000.0, cfg.volume_expansion_multiplier,
     )
-    if breakout_up:
-        direction_signal += weights["breakout"]
-    elif breakout_down:
-        direction_signal -= weights["breakout"]
-    if whale_activity > 0.3:
-        direction_signal *= 1.0 + weights["whale_activity"] * whale_activity
 
-    direction_signal = max(-1.0, min(1.0, direction_signal))
-
-    if direction_signal > cfg.neutral_band:
-        direction = "long"
-    elif direction_signal < -cfg.neutral_band:
-        direction = "short"
-    else:
-        direction = "neutral"
+    conditions_met = trend_ok and ratio_ok and delta_ok and volume_ok
+    direction = trend if trend != "sideways" else "neutral"
 
     return ExchangeOpinion(
         exchange=exchange,
         symbol=symbol,
         direction=direction,
-        confidence=round(abs(direction_signal) * 100.0, 1),
-        momentum=round(momentum, 4),
-        order_book_imbalance=round(order_book_imbalance, 4),
-        aggressive_buying=round(aggressive_buying, 4),
-        aggressive_selling=round(aggressive_selling, 4),
-        whale_activity=round(whale_activity, 4),
-        breakout_confirmation=breakout_confirmation,
-        trend_continuation=round(trend_continuation, 4),
-        unavailable_metrics=tuple(unavailable),
+        trend=trend,
+        trend_ok=trend_ok,
+        buy_sell_ratio=round(ratio, 4),
+        ratio_ok=ratio_ok,
+        net_aggressive_delta_ok=delta_ok,
+        volume_expansion_ok=volume_ok,
+        conditions_met=conditions_met,
         error=None,
     )
 
@@ -511,8 +474,8 @@ class _ExchangeConnector:
         return self._state.setdefault(
             symbol,
             SymbolState(
-                ticks=deque(maxlen=self.config.window_size),
-                trades=deque(maxlen=self.config.trade_window_size),
+                ticks=deque(),
+                trades=deque(),
                 liquidations=deque(maxlen=self.config.liquidation_window_size),
             ),
         )
@@ -668,6 +631,9 @@ class _ExchangeConnector:
             volume=fields.get("volume"),
         )
         state.ticks.append(tick)
+        cutoff = time.time() - self.config.tick_retention_sec
+        while state.ticks and state.ticks[0].ts < cutoff:
+            state.ticks.popleft()
         state.last_seen = time.time()
 
     def _apply_book(self, symbol: str, fields: dict) -> None:
@@ -683,6 +649,9 @@ class _ExchangeConnector:
         state.trades.append(
             TradePrint(ts=fields["timestamp"], price=fields.get("price"), size=fields.get("size"), side=fields.get("side"))
         )
+        cutoff = time.time() - self.config.trade_retention_sec
+        while state.trades and state.trades[0].ts < cutoff:
+            state.trades.popleft()
         state.last_seen = time.time()
 
     def _apply_liquidation(self, symbol: str, fields: dict) -> None:
@@ -1328,13 +1297,13 @@ class BingXConnector(_ExchangeConnector):
         return []
 
 
-def _avg_confidence(exchange_results: Dict[str, ExchangeOpinion], direction: Optional[str]) -> float:
-    vals = [o.confidence for o in exchange_results.values() if o.error is None and o.direction == direction]
-    return round(sum(vals) / len(vals), 1) if vals else 0.0
+def _avg_buy_sell_ratio(exchange_results: Dict[str, ExchangeOpinion], direction: Optional[str]) -> float:
+    vals = [o.buy_sell_ratio for o in exchange_results.values() if o.error is None and o.direction == direction]
+    return round(sum(vals) / len(vals), 4) if vals else 0.0
 
 
 def _build_consensus(
-    exchange_results: Dict[str, ExchangeOpinion], online_exchanges: int, cfg: CrossExchangeConfig
+    exchange_results: Dict[str, ExchangeOpinion], online_exchanges: int, candidate_direction: str, cfg: CrossExchangeConfig
 ) -> CrossExchangeResult:
     total = len(exchange_results)
 
@@ -1342,7 +1311,7 @@ def _build_consensus(
         return CrossExchangeResult(
             decision="rejected", final_direction=None, agreeing_exchanges=0,
             total_exchanges=total, online_exchanges=online_exchanges,
-            consensus_pct=0.0, average_confidence=0.0,
+            consensus_pct=0.0, average_buy_sell_ratio=0.0,
             reason=(
                 f"Insufficient exchanges online ({online_exchanges}/{total}, need >= "
                 f"{cfg.min_online_exchanges} reporting to evaluate the {cfg.min_agreeing}-of-{total} rule)."
@@ -1350,48 +1319,44 @@ def _build_consensus(
             exchange_results=exchange_results,
         )
 
-    counts = {"long": 0, "short": 0, "neutral": 0}
-    for o in exchange_results.values():
-        if o.error is None:
-            counts[o.direction] = counts.get(o.direction, 0) + 1
-
-    final_direction, agreeing = max(counts.items(), key=lambda kv: kv[1])
+    agreeing = sum(
+        1 for o in exchange_results.values()
+        if o.error is None and o.direction == candidate_direction and o.conditions_met
+    )
     consensus_pct = round(100.0 * agreeing / total, 2)
 
-    if final_direction == "neutral" or agreeing < cfg.min_agreeing:
+    if agreeing < cfg.min_agreeing:
         return CrossExchangeResult(
-            decision="rejected",
-            final_direction=final_direction if agreeing >= cfg.min_agreeing else None,
+            decision="rejected", final_direction=None,
             agreeing_exchanges=agreeing, total_exchanges=total, online_exchanges=online_exchanges,
-            consensus_pct=consensus_pct, average_confidence=_avg_confidence(exchange_results, final_direction),
+            consensus_pct=consensus_pct, average_buy_sell_ratio=_avg_buy_sell_ratio(exchange_results, candidate_direction),
             reason=f"Insufficient cross-exchange confirmation (minimum required: {cfg.min_agreeing} of {total}).",
             exchange_results=exchange_results,
         )
 
     return CrossExchangeResult(
-        decision="accepted", final_direction=final_direction,
+        decision="accepted", final_direction=candidate_direction,
         agreeing_exchanges=agreeing, total_exchanges=total, online_exchanges=online_exchanges,
-        consensus_pct=consensus_pct, average_confidence=_avg_confidence(exchange_results, final_direction),
+        consensus_pct=consensus_pct, average_buy_sell_ratio=_avg_buy_sell_ratio(exchange_results, candidate_direction),
         reason=None, exchange_results=exchange_results,
     )
 
 
 def _log_result(okx_symbol: str, candidate_direction: str, result: CrossExchangeResult) -> None:
-    """Matches the requested inline style: one line listing every
-    exchange as 'NAME= RESULT', comma-separated, instead of one line per
-    field per exchange."""
     per_exchange = []
     for name, o in result.exchange_results.items():
         if o.error is not None:
             per_exchange.append(f"{name.upper()}= {o.error.upper()}")
         else:
-            extra = f" (unavailable: {'+'.join(o.unavailable_metrics)})" if o.unavailable_metrics else ""
-            per_exchange.append(f"{name.upper()}= {o.direction.upper()} {o.confidence:.0f}{extra}")
+            per_exchange.append(
+                f"{name.upper()}= {o.direction.upper()} trend={o.trend}({'OK' if o.trend_ok else 'no'}) "
+                f"ratio={o.buy_sell_ratio:.2f}({'OK' if o.ratio_ok else 'no'}) "
+                f"delta={'OK' if o.net_aggressive_delta_ok else 'no'} volume={'OK' if o.volume_expansion_ok else 'no'}"
+            )
 
     summary = (
         f"agreement={result.agreeing_exchanges}/{result.total_exchanges} "
         f"consensus={result.consensus_pct:.2f}% "
-        + (f"avg_confidence={result.average_confidence} " if result.decision == "accepted" else "")
         + f"decision={result.decision.upper()}"
         + (f" reason=\"{result.reason}\"" if result.reason else "")
     )
@@ -1435,12 +1400,13 @@ class CrossExchangeValidator:
 
         # Wait for enough exchanges to actually have analyzable data —
         # not just "received one message ever". _analyze() needs at
-        # least 2 ticks to compute anything (momentum needs a start and
-        # an end point); checking last_seen > 0 alone let this loop exit
-        # after ~300ms once a handful of exchanges got their very first
-        # tick, long before the 4s budget was used, which is exactly why
-        # freshly-subscribed symbols were showing NO FRESH DATA /
-        # INSUFFICIENT TICKS for nearly every candidate — the loop had
+        # least 2 ticks to bucket into candles for the trend check (a
+        # single tick has no open-to-close move to read); checking
+        # last_seen > 0 alone let this loop exit after ~300ms once a
+        # handful of exchanges got their very first tick, long before
+        # the 4s budget was used, which is exactly why freshly-subscribed
+        # symbols were showing NO FRESH DATA / INSUFFICIENT TICKS for
+        # nearly every candidate — the loop had
         # already moved on to analysis before there was anything to
         # analyze.
         min_ticks_for_analysis = 2
@@ -1472,11 +1438,11 @@ class CrossExchangeValidator:
                 exchange_results[name] = _offline_opinion(name, symbol, "no fresh data")
                 continue
 
-            opinion = _analyze(name, symbol, connector.get_state(symbol), connector.health, cfg)
+            opinion = _analyze(name, symbol, connector.get_state(symbol), connector.health, cfg, candidate_direction)
             exchange_results[name] = opinion if opinion is not None else _offline_opinion(name, symbol, "insufficient ticks")
 
         online_exchanges = sum(1 for o in exchange_results.values() if o.error is None)
-        result = _build_consensus(exchange_results, online_exchanges, cfg)
+        result = _build_consensus(exchange_results, online_exchanges, candidate_direction, cfg)
         _log_result(okx_symbol, candidate_direction, result)
         return result
 
