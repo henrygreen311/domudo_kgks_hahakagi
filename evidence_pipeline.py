@@ -1,3 +1,37 @@
+"""
+Rolling Evidence Accumulator + Persistence Validator.
+
+    SignalGenerator -> RollingEvidenceAccumulator -> PersistenceValidator -> EventConfirmationEngine -> ExecutionEngine
+
+This module inserts between the existing directional/confidence layer and
+the execution engine. It does NOT reimplement anything SignalGenerator,
+ConfidenceEngine, or EventConfirmationEngine already do — it only *remembers
+their outputs over a rolling 60-second window* and decides whether the
+evidence has been sustained for long enough to trade, instead of trading on
+a single instantaneous read.
+
+Design notes:
+
+- EventConfirmationEngine.confirm() is normally called once, right before
+  opening a trade. Here it's called on every tick (see `evaluate_tick`
+  below), and its results are folded into the rolling window. This is what
+  lets "the Event Confirmation Engine continued confirming the same
+  direction throughout the observation period" and "multiple confirmation
+  events over the window" be checked — those aren't new detections, they're
+  the existing confirm() output sampled repeatedly and counted.
+
+- The buffer is a per-symbol deque pruned by *time*, not by count, so memory
+  is bounded by (update_rate x window_seconds) regardless of how long the
+  bot runs — satisfies the "efficient rolling buffer, constant memory"
+  requirement.
+
+- RollingEvidenceAccumulator only answers "what do the last 60 seconds look
+  like". PersistenceValidator only answers "has that picture been true, and
+  stable, for the configured persistence duration". Keeping those separate
+  mirrors the existing ConfidenceEngine / SignalPersistenceTracker split in
+  market_data.py, so the same mental model applies here.
+"""
+
 from __future__ import annotations
 
 import time
@@ -155,6 +189,19 @@ class EvidenceSummary:
     directional_sample_count: int = 0  # how many raw SignalGenerator readings agreed on dominant_direction
     window_age_seconds: float = 0.0  # how long the buffer has actually been accumulating, oldest-to-newest sample
 
+    @property
+    def is_quiet(self) -> bool:
+        """True when this window has no real directional evidence at all —
+        every tick recorded was a non-directional read (SignalGenerator
+        produced nothing). `sample_count` alone can't tell you this: update()
+        appends a sample every tick regardless of whether SignalGenerator
+        fired, so sample_count is almost always > 0 for any symbol that's
+        been on the watchlist for a while, even when nothing meaningful has
+        ever happened for it. Callers doing per-symbol log throttling (e.g.
+        tracker.py's per-interval [evidence] dump) should check this instead
+        of sample_count == 0."""
+        return self.directional_sample_count == 0
+
     def score_breakdown(self, cfg: RollingEvidenceConfig) -> List[ScoreComponent]:
         """Each dimension earns partial credit toward its weight, scaling
         linearly from 0 up to full credit at its target (capped at the
@@ -278,25 +325,28 @@ class EvidenceSummary:
         return self.score(cfg) >= cfg.min_score_threshold
 
     def explain(self, cfg: RollingEvidenceConfig) -> str:
-        """Full weighted breakdown, one line per component, always shown —
-        so a rejection says exactly which dimensions fell short and by how
-        much, not just PASSES=False."""
+        """Same information as before, reformatted to match [signal]'s
+        dense style: one summary line, one 'Components: [...]' line
+        (Python-list-repr, same pattern as [signal]'s 'Reasons: [...]'),
+        and an optional Reason line — instead of one log line per
+        component (8-11 lines per candidate, most of it repeated
+        boilerplate like ' -> X/Y pts ['), so a scan of the log reads
+        the same way [signal] does."""
         if self.dominant_direction is None or self.sample_count == 0:
-            return " "
+            return f"{self.symbol}: no directional evidence in window — REJECTED (score=0/100)"
 
         if self.directional_sample_count < cfg.minimum_directional_samples:
             return (
-                f"{self.symbol} — direction={self.dominant_direction.upper()} "
-                f"directional_samples={self.directional_sample_count} (need >= {cfg.minimum_directional_samples}) "
-                f"— REJECTED before scoring: not enough independent readings yet, "
-                f"regardless of how strong the ones seen so far look"
+                f"{self.symbol} direction={self.dominant_direction.upper()} "
+                f"directional_samples={self.directional_sample_count}/{cfg.minimum_directional_samples} "
+                f"decision=REJECTED reason=\"not enough independent readings yet\""
             )
 
         if self.window_age_seconds < cfg.minimum_window_age_seconds:
             return (
-                f"{self.symbol} — direction={self.dominant_direction.upper()} "
-                f"window_age={self.window_age_seconds:.1f}s (need >= {cfg.minimum_window_age_seconds:.1f}s) "
-                f"— REJECTED before scoring: still warming up, buffer hasn't spanned a full window yet"
+                f"{self.symbol} direction={self.dominant_direction.upper()} "
+                f"window_age={self.window_age_seconds:.1f}s/{cfg.minimum_window_age_seconds:.1f}s "
+                f"decision=REJECTED reason=\"still warming up\""
             )
 
         components = self.score_breakdown(cfg)
@@ -304,15 +354,15 @@ class EvidenceSummary:
         threshold = cfg.min_score_threshold
         decision = "ACCEPTED" if total >= threshold else "REJECTED"
 
-        lines = [f"{self.symbol} — direction={self.dominant_direction.upper()} samples={self.sample_count} flips={self.direction_flips}"]
-        for c in components:
-            verdict = "PASS" if c.met_target else "FAIL"
-            lines.append(
-                f"  {c.name}: {c.format_value()} (target {c.format_target()}) "
-                f"-> {c.points:.1f}/{c.weight:.0f} pts [{verdict}]"
-            )
-        lines.append(f"  Total score: {total:.1f}/100 (need >= {threshold:.0f})")
-        lines.append(f"  Decision: {decision}")
+        lines = [
+            f"{self.symbol} direction={self.dominant_direction.upper()} samples={self.sample_count} "
+            f"flips={self.direction_flips} score={total:.1f}/100 (need>={threshold:.0f}) decision={decision}"
+        ]
+        component_strs = [
+            f"{c.name} ({c.format_value()} vs {c.format_target()}) {c.points:.1f}/{c.weight:.0f}pts [{'PASS' if c.met_target else 'FAIL'}]"
+            for c in components
+        ]
+        lines.append(f"Components: {component_strs}")
 
         if decision == "REJECTED":
             # Name the biggest shortfalls — components below target, ranked
@@ -324,7 +374,7 @@ class EvidenceSummary:
             )
             if shortfalls:
                 reason = ", ".join(f"{c.name} below target" for c in shortfalls[:2])
-                lines.append(f"  Reason: {reason}")
+                lines.append(f"Reason: {reason}")
         return "\n".join(lines)
 
 
@@ -546,7 +596,28 @@ async def evaluate_tick(
     book_imbalance: Optional[float] = None,
     now_ms: Optional[float] = None,
 ) -> Optional[Tuple[Signal, EvidenceSummary]]:
-    
+    """One tick of the new stage: fold this tick's evidence into the rolling
+    window, then check whether the accumulated + persisted picture clears
+    the bar to trade. Returns (Signal, EvidenceSummary) to execute once
+    persistence is satisfied, otherwise None. Call this every 100-200ms
+    per watchlist symbol; it's cheap (bounded deque append + a handful of
+    sums over a window of ~300-600 samples at that cadence).
+
+    SignalGenerator and EventConfirmationEngine are both called exactly as
+    they already are elsewhere in the codebase — this function doesn't
+    change how either one decides anything, it only remembers and times
+    their outputs.
+
+    The EvidenceSummary returned here is the one that actually cleared
+    the bar — captured before clear() below resets the accumulator for
+    this symbol. Callers needing the breakdown for persistence (e.g.
+    signals_histories) must use this returned summary rather than calling
+    accumulator.summarize(symbol) again afterward: by then clear() has
+    already wiped it, which silently produces an empty/all-zero summary
+    (dominant_direction=None) instead of raising — this was found live
+    when signal_store.record_signal() started rejecting rows with an
+    empty `direction` that violated signals_histories' check constraint.
+    """
     now_ms = now_ms if now_ms is not None else time.time() * 1000.0
 
     confirmation = await confirmation_engine.confirm(signal) if signal is not None else None

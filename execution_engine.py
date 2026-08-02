@@ -105,7 +105,20 @@ class ExecutionConfig:
     # kept liquidating at 50x (~1% adverse move) while ETH-USDT-SWAP was
     # fine at the same leverage. See liquidation_guard.py.
     enable_liquidation_guard: bool = True
-    min_liquidation_distance_pct: float = 0.06
+    # NOTE: this must stay below 1/requested_leverage (2% at 50x) or the
+    # top-preference leverage becomes mathematically unreachable — the
+    # best-case distance at leverage L (mmr=0) is exactly 1/L, so a
+    # threshold >= that caps out every candidate at that leverage
+    # regardless of how good the symbol is. This was previously 0.06 (6%),
+    # which is impossible to clear at any leverage above ~16x, so
+    # requested_leverage (50) never passed and every trade silently fell
+    # back to fallback_leverage (10x) — confirmed against real fills:
+    # ETH-USDT-SWAP's actual liquidation distance at 50x is ~1.5-1.6% of
+    # entry (matches the estimate_liquidation_price() formula closely), so
+    # 0.012 lets a genuinely low-mmr symbol like ETH clear 50x while still
+    # rejecting candidates whose mmr eats further into the leverage's
+    # cushion than that.
+    min_liquidation_distance_pct: float = 0.012
     # Tried in order (requested_leverage first) against
     # min_liquidation_distance_pct; the first one that keeps liquidation
     # far enough away is used. Only relevant while enable_liquidation_guard
