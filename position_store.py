@@ -42,6 +42,8 @@ class PositionHistoryStore:
             "size_contracts": position.size_contracts,
             "entry_price": position.entry_price,
             "take_profit_price": position.take_profit_price,
+            "stop_loss_price": position.stop_loss_price,
+            "liq_price": position.liq_price,
             "opening_fee": position.opening_fee,
             "opened_at": _iso(position.opened_at),
             "status": "open",

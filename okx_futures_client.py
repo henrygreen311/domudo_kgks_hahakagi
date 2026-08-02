@@ -298,6 +298,32 @@ class OKXFuturesClient:
             "min_volume": row.get("minSz"),
         }
 
+    async def get_candles(self, symbol: str, bar: str = "5m", limit: int = 100) -> List[dict]:
+        """Recent OHLCV candles for `symbol` via /api/v5/market/candles
+        (public, no auth). OKX returns newest-first; `limit` maxes out at
+        300 per OKX's docs, which comfortably covers both of this bot's
+        current lookback windows (1h and 15h at 5m bars = 12 and 180
+        candles) in a single call — no pagination/history-candles needed."""
+        data = await self._request(
+            "GET", "/api/v5/market/candles",
+            params={"instId": symbol, "bar": bar, "limit": str(limit)},
+        )
+        candles = []
+        for row in data or []:
+            try:
+                candles.append({
+                    "ts": int(row[0]),
+                    "open": float(row[1]),
+                    "high": float(row[2]),
+                    "low": float(row[3]),
+                    "close": float(row[4]),
+                    "volume": float(row[5]),
+                    "confirm": row[8] if len(row) > 8 else None,
+                })
+            except (IndexError, TypeError, ValueError):
+                continue
+        return candles
+
     # ------------------------------------------------------------------
     # Account / private GET
     # ------------------------------------------------------------------
@@ -544,14 +570,22 @@ class OKXFuturesClient:
         size: Optional[float] = None,
         plan_category: int = 2,
         category: str = "market",
+        stop_loss_trigger_price: Optional[str] = None,
     ) -> dict:
-        """Places a standalone take-profit algo order via
-        /api/v5/trade/order-algo (ordType="conditional"), market-executed
-        on trigger. `side` uses the same BitMart-style close codes as
-        submit_order (2=close short via buy, 3=close long via sell). In
-        hedge mode, `posSide` is sent (identifying which position this
-        closes) and `reduceOnly` is omitted; in net mode it's the reverse
-        — see module docstring."""
+        """Places a take-profit algo order via /api/v5/trade/order-algo.
+        `side` uses the same BitMart-style close codes as submit_order
+        (2=close short via buy, 3=close long via sell). In hedge mode,
+        `posSide` is sent (identifying which position this closes) and
+        `reduceOnly` is omitted; in net mode it's the reverse — see
+        module docstring.
+
+        If `stop_loss_trigger_price` is given, the order is placed as
+        ordType="oco" (one-cancels-other) with both tpTriggerPx and
+        slTriggerPx set on the same algo order — whichever side triggers
+        first cancels the other automatically, so a closed position can
+        never leave the other leg still live on the exchange. Without it,
+        this places a TP-only ordType="conditional" order, same as
+        before."""
         side_map = {2: ("buy", "short"), 3: ("sell", "long")}
         mapped = side_map.get(side)
         if mapped is None:
@@ -562,10 +596,13 @@ class OKXFuturesClient:
             "instId": symbol,
             "tdMode": "isolated",
             "side": okx_side,
-            "ordType": "conditional",
+            "ordType": "oco" if stop_loss_trigger_price is not None else "conditional",
             "tpTriggerPx": trigger_price,
             "tpOrdPx": "-1",  # -1 = execute the TP as a market order once triggered
         }
+        if stop_loss_trigger_price is not None:
+            body["slTriggerPx"] = stop_loss_trigger_price
+            body["slOrdPx"] = "-1"  # -1 = execute the SL as a market order once triggered
         if self.position_mode == "long_short":
             body["posSide"] = pos_side
         else:

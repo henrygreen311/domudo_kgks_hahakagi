@@ -30,21 +30,14 @@ from typing import Dict, List, Optional
 
 from okx_futures_client import OKXAPIError, OKXFuturesClient
 from market_data import Signal
-from liquidation_guard import check_liquidation_distance, select_leverage_with_safe_liquidation
+from liquidation_guard import check_liquidation_distance, select_leverage_with_safe_liquidation, estimate_liquidation_price
+from pretrade_validation import validate_take_profit_reachable, validate_liquidation_history
 
 log = logging.getLogger("okx_futures.execution")
 
-# OKX sCodes that mean the exchange itself will never let this account
-# trade this instrument — a regional/compliance restriction, a delisted
-# or borrow-restricted pair, etc. — as opposed to a transient or
-# bot-caused error (bad params, insufficient margin, rate limit) that
-# might succeed on a later signal. Retrying these wastes API calls and
-# spams identical rejections, so the symbol is blacklisted in-memory for
-# the rest of this run the first time one of these codes is seen.
 PERMANENTLY_UNTRADEABLE_OKX_CODES = {
-    "51155",  # "You can't trade this pair or borrow this crypto due to local compliance restrictions."
+    "51155",
 }
-
 
 @dataclass
 class ExecutionConfig:
@@ -57,75 +50,34 @@ class ExecutionConfig:
     open_type: str = "isolated"
     fill_poll_interval_sec: float = 0.5
     fill_timeout_sec: float = 15.0
-    # Log a price-movement update whenever a position moves another
-    # `alert_move_step_pct` percentage points further from its entry price
-    # (in either direction). E.g. with 0.5, alerts fire at +0.5%, +1.0%,
-    # -0.5%, -1.0%, etc. — never more than once per step, so the log isn't
-    # spammed on every monitor tick.
+
     alert_move_step_pct: float = 0.5
-    # Symbols that are NEVER traded, full stop — checked before every
-    # signal is even considered, regardless of what OKX's API says about
-    # them. Unlike `_blacklisted_symbols` (auto-populated only when OKX
-    # returns one of PERMANENTLY_UNTRADEABLE_OKX_CODES), this list exists
-    # for symbols where the order itself succeeds and OKX never returns an
-    # error at all — the position just gets liquidated near-instantly, so
-    # there's no error code to key off of.
-    #
-    # LINK-USDT-SWAP is seeded here on hard evidence: three MANUALLY
-    # placed long positions ($1, $2, and $8 margin — ruling out bot-side
-    # sizing/leverage bugs entirely) plus two earlier bot-placed shorts all
-    # liquidated within 0-1 second of opening. One of the manual longs
-    # had its liquidation price come back EXACTLY equal to its entry price
-    # (Closed PnL: 0 USDT) — a real leveraged position should always have
-    # some buffer before liquidation, however small; identical entry/liq
-    # price with zero underlying price movement points to OKX's maintenance
-    # margin calculation for this specific contract being broken (most
-    # likely a Demo Trading-specific data/config issue), not anything our
-    # code or position sizing is doing. 5/5 for 5 attempts, both directions,
-    # three very different margin sizes — this is the contract, not us.
+
     permanently_denied_symbols: frozenset = frozenset({"LINK-USDT-SWAP"})
-    # If a position gets liquidated within this many seconds of opening
-    # with less than `instant_liquidation_price_move_pct` adverse price
-    # move, it's flagged as an "instant liquidation" — the same signature
-    # seen on LINK-USDT-SWAP — and the symbol is auto-blacklisted for the
-    # rest of this run (see _finalize_closed_position). This won't survive
-    # a restart; anything caught this way should also be added to
-    # `permanently_denied_symbols` by hand once confirmed.
+
     instant_liquidation_window_sec: float = 10.0
     instant_liquidation_price_move_pct: float = 0.3
 
-    # --- Pre-trade liquidation-distance guard ---
-    # Before ever submitting an order, estimate the liquidation price and
-    # require it to sit at least min_liquidation_distance_pct away from
-    # entry (as a fraction of entry_price). This used to be a fixed tick
-    # count at a single fixed leverage; replaced with a percentage check
-    # tried across candidate leverages (see fallback_leverage below)
-    # because a fixed tick count means very different things across
-    # symbols, and position_history showed exactly that: KAITO-USDT-SWAP
-    # kept liquidating at 50x (~1% adverse move) while ETH-USDT-SWAP was
-    # fine at the same leverage. See liquidation_guard.py.
     enable_liquidation_guard: bool = True
-    # NOTE: this must stay below 1/requested_leverage (2% at 50x) or the
-    # top-preference leverage becomes mathematically unreachable — the
-    # best-case distance at leverage L (mmr=0) is exactly 1/L, so a
-    # threshold >= that caps out every candidate at that leverage
-    # regardless of how good the symbol is. This was previously 0.06 (6%),
-    # which is impossible to clear at any leverage above ~16x, so
-    # requested_leverage (50) never passed and every trade silently fell
-    # back to fallback_leverage (10x) — confirmed against real fills:
-    # ETH-USDT-SWAP's actual liquidation distance at 50x is ~1.5-1.6% of
-    # entry (matches the estimate_liquidation_price() formula closely), so
-    # 0.012 lets a genuinely low-mmr symbol like ETH clear 50x while still
-    # rejecting candidates whose mmr eats further into the leverage's
-    # cushion than that.
+
     min_liquidation_distance_pct: float = 0.012
-    # Tried in order (requested_leverage first) against
-    # min_liquidation_distance_pct; the first one that keeps liquidation
-    # far enough away is used. Only relevant while enable_liquidation_guard
-    # is True — with the guard off, leverage is just
-    # min(exchange_max, requested_leverage) as before.
+
     fallback_leverage: int = 10
 
+    high_leverage_symbols: frozenset = frozenset({"ETH-USDT-SWAP"})
+
+    target_stop_loss_usdt: float = 0.9
+
+    enable_tp_reachability_check: bool = True
+    tp_validation_lookback_hours: float = 1.0
+    min_tp_hits_required: int = 1
+    estimated_fee_by_leverage: dict = field(default_factory=lambda: {50: 0.12, 10: 0.02})
+
+    enable_liquidation_history_check: bool = True
+    liq_validation_lookback_hours: float = 15.0
+    max_liq_hits_allowed: int = 1
+
+    candle_bar: str = "5m"
 
 @dataclass
 class OpenPosition:
@@ -139,11 +91,25 @@ class OpenPosition:
     margin_usdt: float
     opening_fee: float
     take_profit_price: float
+    stop_loss_price: float
     tp_order_id: Optional[str]
     opened_at: float = field(default_factory=time.time)
     last_alert_level: int = 0
     db_id: Optional[int] = None
+    liq_price: Optional[float] = None
 
+def _candle_limit_for_hours(hours: float, bar: str) -> int:
+    """Converts a lookback window in hours into a candle count for OKX's
+    /market/candles `bar` interval. Only "Nm"/"Nh" bar strings are
+    parsed — the only one currently used here is "5m"."""
+    bar = bar.strip().lower()
+    if bar.endswith("h"):
+        minutes = float(bar[:-1]) * 60
+    elif bar.endswith("m"):
+        minutes = float(bar[:-1])
+    else:
+        minutes = 5.0
+    return max(1, int(round(hours * 60 / minutes)))
 
 def _round_to_step(value: float, step_str: str, rounding=ROUND_DOWN) -> float:
     """Round `value` down (or up) to the nearest multiple of `step_str`
@@ -154,12 +120,10 @@ def _round_to_step(value: float, step_str: str, rounding=ROUND_DOWN) -> float:
     quant = (Decimal(str(value)) / step).to_integral_value(rounding=rounding) * step
     return float(quant)
 
-
 def _decimals_from_step(step_str: str) -> int:
     """'0.0000001' -> 7, '0.01' -> 2, '1' -> 0."""
     exponent = Decimal(str(step_str)).as_tuple().exponent
     return max(-exponent, 0) if isinstance(exponent, int) else 0
-
 
 def _format_price(value: float, step_str: str) -> str:
     """Format a price as a plain fixed-point decimal string for the OKX
@@ -177,7 +141,6 @@ def _format_price(value: float, step_str: str) -> str:
     bug entirely."""
     decimals = _decimals_from_step(step_str)
     return f"{value:.{decimals}f}"
-
 
 class ExecutionEngineBase(ABC):
     """Common interface so a live-trading engine can be swapped in later
@@ -199,13 +162,9 @@ class ExecutionEngineBase(ABC):
     async def monitor_positions(self) -> None:
         ...
 
-
 class DemoFuturesExecutionEngine(ExecutionEngineBase):
     """Executes signals as real orders against OKX Demo Trading."""
 
-    # A position isn't checked for closure until it's been open at least
-    # this long, and even then a "not found" reading is re-confirmed after
-    # this short delay before being trusted — see monitor_positions().
     _MIN_AGE_BEFORE_CLOSE_CHECK_SEC = 5.0
     _CLOSE_CONFIRM_DELAY_SEC = 2.0
 
@@ -225,7 +184,7 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         self._open_positions: Dict[str, OpenPosition] = {}
         self._total_opened = 0
         self._lock = asyncio.Lock()
-        # symbol -> the OKXAPIError that got it blacklisted, for logging/introspection.
+
         self._blacklisted_symbols: Dict[str, OKXAPIError] = {}
 
     async def open_count(self) -> int:
@@ -272,16 +231,10 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         async with self._lock:
             return symbol in self._open_positions
 
-    # ------------------------------------------------------------------
-    # Opening a trade
-    # ------------------------------------------------------------------
-
     async def try_open_trade(self, signal: Signal, signal_snapshot: Optional[dict] = None) -> bool:
         cfg = self.config
         symbol = signal.symbol
 
-        # Reserve a slot atomically so two concurrent signals can't both
-        # open a position once we're at the concurrency cap.
         async with self._lock:
             if symbol in self._blacklisted_symbols:
                 return False
@@ -291,7 +244,7 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
                 return False
             if len(self._open_positions) >= cfg.max_open_positions:
                 return False
-            self._open_positions[symbol] = None  # placeholder reservation
+            self._open_positions[symbol] = None
 
         try:
             opened = await self._open_position(signal)
@@ -357,44 +310,31 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
             log.error(f"[execution] {symbol} has invalid contract_size — skipping")
             return None
 
+        target_leverage = cfg.requested_leverage if symbol in cfg.high_leverage_symbols else cfg.fallback_leverage
+        target_leverage = min(target_leverage, max_leverage_symbol)
+
+        if target_leverage < cfg.min_leverage_required:
+            log.info(
+                f"[execution] {symbol} {direction.upper()} — hardcoded leverage {target_leverage:.0f}x "
+                f"< required {cfg.min_leverage_required}x — signal discarded"
+            )
+            return None
+
+        notional_at_lev = cfg.margin_per_trade_usdt * target_leverage
+        try:
+            mmr = await self._client.get_position_tier_mmr(symbol, cfg.open_type, notional_at_lev)
+        except OKXAPIError as exc:
+            log.warning(
+                f"[execution] {symbol} {direction.upper()} — could not fetch maintenance margin "
+                f"rate at {target_leverage:.0f}x ({exc}); discarding rather than trading blind"
+            )
+            return None
+
         if cfg.enable_liquidation_guard:
-            # Try requested_leverage first, fall back to fallback_leverage
-            # — highest (most capital-efficient) leverage that's actually
-            # safe for THIS symbol, not a single fixed leverage applied
-            # everywhere. Each candidate gets its own mmr lookup since
-            # notional (and therefore the maintenance-margin tier) differs
-            # by leverage even at the same margin_per_trade_usdt.
-            candidate_leverages = []
-            for lev in (cfg.requested_leverage, cfg.fallback_leverage):
-                lev = min(lev, max_leverage_symbol)
-                if lev >= cfg.min_leverage_required and lev not in candidate_leverages:
-                    candidate_leverages.append(lev)
-            candidate_leverages.sort(reverse=True)
-
-            candidates_with_mmr = []
-            for lev in candidate_leverages:
-                notional_at_lev = cfg.margin_per_trade_usdt * lev
-                try:
-                    mmr = await self._client.get_position_tier_mmr(symbol, cfg.open_type, notional_at_lev)
-                except OKXAPIError as exc:
-                    log.warning(
-                        f"[execution] {symbol} — could not fetch maintenance margin rate at {lev}x "
-                        f"for the liquidation guard ({exc}); skipping this leverage option"
-                    )
-                    continue
-                candidates_with_mmr.append((lev, mmr))
-
-            if not candidates_with_mmr:
-                log.warning(
-                    f"[execution] {symbol} {direction.upper()} — could not fetch maintenance margin "
-                    f"rate for any candidate leverage; discarding rather than trading blind"
-                )
-                return None
-
             liq_check = select_leverage_with_safe_liquidation(
                 entry_price=signal.entry_price,
                 direction=direction,
-                candidates=candidates_with_mmr,
+                candidates=[(target_leverage, mmr)],
                 min_distance_pct=cfg.min_liquidation_distance_pct,
             )
             if not liq_check.approved:
@@ -402,15 +342,82 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
                 return None
 
             leverage = liq_check.leverage
+            estimated_liq_price = liq_check.liquidation_price
             log.info(
                 f"[execution] {symbol} {direction.upper()} liquidation guard passed at {leverage:.0f}x — "
                 f"est. liq={liq_check.liquidation_price:.8f} "
                 f"({liq_check.distance_pct:.2%} from entry {signal.entry_price})"
             )
         else:
-            leverage = min(max_leverage_symbol, cfg.requested_leverage)
+            leverage = target_leverage
+            estimated_liq_price = estimate_liquidation_price(signal.entry_price, leverage, mmr, direction)
 
         notional_usdt = cfg.margin_per_trade_usdt * leverage
+
+        if cfg.enable_tp_reachability_check:
+            estimated_fee = cfg.estimated_fee_by_leverage.get(
+                int(leverage), max(cfg.estimated_fee_by_leverage.values())
+            )
+            try:
+                tp_candles = await self._client.get_candles(
+                    symbol,
+                    bar=cfg.candle_bar,
+                    limit=_candle_limit_for_hours(cfg.tp_validation_lookback_hours, cfg.candle_bar),
+                )
+            except OKXAPIError as exc:
+                log.warning(
+                    f"[execution] {symbol} {direction.upper()} — could not fetch candles for the TP "
+                    f"reachability check ({exc}); discarding rather than trading without this filter"
+                )
+                return None
+
+            tp_result = validate_take_profit_reachable(
+                entry_price=signal.entry_price,
+                direction=direction,
+                target_net_profit_usdt=cfg.target_net_profit_usdt,
+                estimated_fee_usdt=estimated_fee,
+                notional_usdt=notional_usdt,
+                candles=tp_candles,
+                min_hits=cfg.min_tp_hits_required,
+            )
+            if not tp_result.approved:
+                log.info(f"[execution] {symbol} {direction.upper()} — {tp_result.reason}")
+                return None
+            log.info(
+                f"[execution] {symbol} {direction.upper()} TP reachability passed — planned TP "
+                f"{tp_result.planned_tp_price:.8f} reached {tp_result.hits}x in the last "
+                f"{cfg.tp_validation_lookback_hours:.0f}h"
+            )
+
+        if cfg.enable_liquidation_history_check:
+            try:
+                liq_candles = await self._client.get_candles(
+                    symbol,
+                    bar=cfg.candle_bar,
+                    limit=_candle_limit_for_hours(cfg.liq_validation_lookback_hours, cfg.candle_bar),
+                )
+            except OKXAPIError as exc:
+                log.warning(
+                    f"[execution] {symbol} {direction.upper()} — could not fetch candles for the "
+                    f"liquidation-history check ({exc}); discarding rather than trading without this filter"
+                )
+                return None
+
+            liq_history_result = validate_liquidation_history(
+                liquidation_price=estimated_liq_price,
+                direction=direction,
+                candles=liq_candles,
+                max_hits=cfg.max_liq_hits_allowed,
+            )
+            if not liq_history_result.approved:
+                log.info(f"[execution] {symbol} {direction.upper()} — {liq_history_result.reason}")
+                return None
+            log.info(
+                f"[execution] {symbol} {direction.upper()} liquidation-history check passed — "
+                f"est. liq {estimated_liq_price:.8f} touched {liq_history_result.hits}x in the last "
+                f"{cfg.liq_validation_lookback_hours:.0f}h"
+            )
+
         qty_base = notional_usdt / signal.entry_price
         size_contracts = _round_to_step(qty_base / contract_size, vol_precision, rounding=ROUND_DOWN)
 
@@ -476,25 +483,28 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
             price_precision=price_precision,
         )
 
-        tp_order_id = await self._place_take_profit(
+        stop_loss_price = self._compute_stop_loss_price(
+            direction=direction,
+            entry_price=deal_avg_price,
+            size_contracts=deal_size,
+            contract_size=contract_size,
+            opening_fee=opening_fee,
+            price_precision=price_precision,
+        )
+
+        tp_order_id = await self._place_tp_sl(
             symbol=symbol,
             direction=direction,
             take_profit_price=take_profit_price,
+            stop_loss_price=stop_loss_price,
             size_contracts=deal_size,
             price_precision=price_precision,
         )
 
         if tp_order_id is None:
-            # TP placement failed even after retries. Leaving a leveraged
-            # position open with zero protection is how PEPE sat naked for
-            # over 2 hours and rode a liquidation down to -0.66 USDT
-            # instead of failing fast — so fail safe here: flatten the
-            # position we just opened immediately rather than hoping the
-            # next monitor cycle notices anything is wrong (it wouldn't;
-            # nothing about a TP-less position looks abnormal to
-            # monitor_positions until it's already liquidated).
+
             log.error(
-                f"[execution] {symbol} — TP could not be placed after retries; "
+                f"[execution] {symbol} — TP/SL could not be placed after retries; "
                 f"flattening the just-opened position immediately instead of "
                 f"leaving it unprotected"
             )
@@ -513,7 +523,7 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
 
         log.info(
             f"[execution] {symbol} filled entry={deal_avg_price} size={deal_size} "
-            f"opening_fee={opening_fee:.6f} take_profit={take_profit_price}"
+            f"opening_fee={opening_fee:.6f} take_profit={take_profit_price} stop_loss={stop_loss_price}"
         )
 
         position = OpenPosition(
@@ -527,15 +537,16 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
             margin_usdt=cfg.margin_per_trade_usdt,
             opening_fee=opening_fee,
             take_profit_price=take_profit_price,
+            stop_loss_price=stop_loss_price,
             tp_order_id=tp_order_id,
+            liq_price=estimated_liq_price,
         )
 
         if self._position_store is not None:
             position.db_id = await self._position_store.record_open(position)
 
         if self._movement_tracker is not None:
-            # Observer only — MovementTracker never influences this
-            # return value or anything else in the open path.
+
             await self._movement_tracker.start_tracking(position)
 
         return position
@@ -632,23 +643,59 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
             raw_tp = entry_price * (1 - price_move_frac)
             return _round_to_step(raw_tp, price_precision, rounding=ROUND_DOWN)
 
-    async def _place_take_profit(
+    def _compute_stop_loss_price(
+        self,
+        direction: str,
+        entry_price: float,
+        size_contracts: float,
+        contract_size: float,
+        opening_fee: float,
+        price_precision: str,
+    ) -> float:
+        """Mirrors _compute_take_profit_price above, but for the loss side:
+        derived from the real filled price/size and real opening fee
+        (doubled to estimate the matching closing fee), targeting a net
+        realized LOSS of exactly `target_stop_loss_usdt`. Fees are
+        subtracted from the target here rather than added — the fees
+        themselves already contribute to the loss, so less adverse price
+        movement is needed to reach the same net loss than the raw target
+        alone would suggest. Rounded away from entry (not toward it) in
+        both directions, same conservative-rounding approach as the TP
+        price: a stop-loss placed slightly too close to entry by rounding
+        could trigger prematurely on ordinary noise."""
+        cfg = self.config
+        estimated_total_fees = opening_fee * 2.0
+        notional = size_contracts * contract_size * entry_price
+        required_gross_loss = max(cfg.target_stop_loss_usdt - estimated_total_fees, 0.0)
+        price_move_frac = required_gross_loss / notional if notional > 0 else 0.0
+
+        if direction == "long":
+            raw_sl = entry_price * (1 - price_move_frac)
+            return _round_to_step(raw_sl, price_precision, rounding=ROUND_DOWN)
+        else:
+            raw_sl = entry_price * (1 + price_move_frac)
+            return _round_to_step(raw_sl, price_precision, rounding=ROUND_UP)
+
+    async def _place_tp_sl(
         self,
         symbol: str,
         direction: str,
         take_profit_price: float,
+        stop_loss_price: float,
         size_contracts: float,
         price_precision: str,
         attempts: int = 3,
         retry_delay_sec: float = 1.0,
     ) -> Optional[str]:
-        # Hedge-mode close sides: 3 closes a long, 2 closes a short.
+        """Places TP and SL together as a single OCO (one-cancels-other)
+        algo order — whichever triggers first automatically cancels the
+        other, so the position can never end up with both legs still live
+        after a close."""
+
         close_side = 3 if direction == "long" else 2
-        # Plain fixed-point string, never scientific notation — see
-        # _format_price(). Using str(take_profit_price) here was the bug
-        # that broke TP placement for PEPE (str(2.931e-06) == '2.931e-06',
-        # which OKX rejects as a malformed tpTriggerPx).
-        price_str = _format_price(take_profit_price, price_precision)
+
+        tp_price_str = _format_price(take_profit_price, price_precision)
+        sl_price_str = _format_price(stop_loss_price, price_precision)
         last_exc: Optional[OKXAPIError] = None
         for attempt in range(1, attempts + 1):
             try:
@@ -656,27 +703,24 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
                     symbol=symbol,
                     order_type="take_profit",
                     side=close_side,
-                    trigger_price=price_str,
-                    executive_price=price_str,
+                    trigger_price=tp_price_str,
+                    executive_price=tp_price_str,
                     price_type=1,
                     size=size_contracts,
                     plan_category=2,
                     category="market",
+                    stop_loss_trigger_price=sl_price_str,
                 )
                 return str(result.get("order_id")) if result else None
             except OKXAPIError as exc:
                 last_exc = exc
                 log.warning(
-                    f"[execution] TP placement attempt {attempt}/{attempts} failed for {symbol}: {exc}"
+                    f"[execution] TP/SL placement attempt {attempt}/{attempts} failed for {symbol}: {exc}"
                 )
                 if attempt < attempts:
                     await asyncio.sleep(retry_delay_sec)
-        log.error(f"[execution] failed to place take-profit for {symbol} after {attempts} attempts: {last_exc}")
+        log.error(f"[execution] failed to place TP/SL for {symbol} after {attempts} attempts: {last_exc}")
         return None
-
-    # ------------------------------------------------------------------
-    # Monitoring open positions
-    # ------------------------------------------------------------------
 
     async def monitor_positions(self) -> None:
         """Checks each tracked position against the exchange. A position with
@@ -721,8 +765,7 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
             active = next((p for p in positions if float(p.get("current_amount", 0)) > 0), None)
 
             if active is None:
-                # First reading says gone — don't trust it alone. Wait a
-                # beat and check again before treating this as a real close.
+
                 await asyncio.sleep(self._CLOSE_CONFIRM_DELAY_SEC)
                 try:
                     positions_confirm = await self._client.get_position(symbol=symbol)
@@ -753,10 +796,7 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         closed_at = time.time()
 
         if net_pnl is None and realized_pnl is not None and closing_fee is not None:
-            # OKX's own realizedPnl wasn't available (fills-scan fallback
-            # path) — fall back to a local approximation. Note this can't
-            # account for a liquidation penalty the way OKX's own field
-            # does, so it's a strictly worse number than the real thing.
+
             net_pnl = realized_pnl - closed.opening_fee - closing_fee
             log.warning(
                 f"[execution] {symbol} — OKX's own net_pnl wasn't available; using a local "
@@ -847,23 +887,12 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         if history_row is not None and history_row.get("exit_price") not in (None, ""):
             close_type = str(history_row.get("close_type") or "")
             if close_type in ("3", "4", "5", "6"):
-                # 3/4 = liquidation, 5/6 = ADL — exchange-driven closes,
-                # same bucket the rest of the codebase already uses.
+
                 close_reason = "liquidated"
             else:
                 resolved_order_id = await self._resolve_tp_execution_order_id(symbol, closed)
                 close_reason = "take_profit" if resolved_order_id else "liquidated"
 
-            # `total_fee` from positions-history is CUMULATIVE for the whole
-            # position (opening fee + closing fee + any funding fee) — see
-            # get_closed_position()'s docstring. We already have the real
-            # opening fee from the fill at open time (`closed.opening_fee`),
-            # so the true closing-side fee is whatever's left after backing
-            # that out. Storing `total_fee` itself as closing_fee (the
-            # previous bug) double-counted the opening fee and made
-            # net_pnl — computed downstream as
-            # realized_pnl - opening_fee - closing_fee — read far too
-            # negative.
             total_fee = float(history_row["total_fee"])
             closing_fee = total_fee - closed.opening_fee
             if closing_fee < 0:
@@ -898,7 +927,7 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         resolved_order_id = await self._resolve_tp_execution_order_id(symbol, closed)
 
         opened_at_ms = closed.opened_at * 1000.0
-        # Closing a long is a sell; closing a short is a buy.
+
         closing_side = "sell" if closed.direction == "long" else "buy"
 
         closing_trades: List[dict] = []
@@ -913,7 +942,7 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
                 trades = []
 
             if resolved_order_id:
-                closing_trades = trades  # already filtered server-side by order_id
+                closing_trades = trades
             else:
                 closing_trades = [
                     t for t in trades
@@ -985,14 +1014,14 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         else:
             move_pct = (pos.entry_price - mark_price) / pos.entry_price * 100.0
 
-        level = int(move_pct / step)  # truncates toward zero -> one bucket per `step`
+        level = int(move_pct / step)
         if level == pos.last_alert_level:
             return
 
         async with self._lock:
             current = self._open_positions.get(symbol)
             if current is None:
-                return  # closed out from under us between the check above and here
+                return
             current.last_alert_level = level
 
         outlook = "favorable" if move_pct >= 0 else "adverse"
