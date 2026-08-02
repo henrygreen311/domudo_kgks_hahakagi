@@ -13,7 +13,7 @@ from typing import Deque, Dict, List, Optional, Tuple
 
 import websockets
 
-from observation_engine import classify_trend, compute_buy_sell_ratio, compute_net_aggressive_delta_ok, compute_volume_expansion_ok
+from observation_engine import compute_trend_strength, compute_buy_pressure_strength, compute_volume_expansion_strength
 
 log = logging.getLogger(__name__)
 
@@ -125,26 +125,24 @@ class CrossExchangeConfig:
 
     # How long local per-symbol tick/trade history is retained. Needs to
     # comfortably cover the longest lookback any of the four signals below
-    # uses (volume_baseline_window_sec, 30 min) — 35 min gives headroom.
+    # uses (window_sec, 30 min) — 35 min gives headroom.
     tick_retention_sec: float = 2100.0
     trade_retention_sec: float = 2100.0
     liquidation_window_size: int = 30  # kept for the (currently unused-in-decisions) liquidations feed
 
-    # --- The same four required signals as observation_engine.py, checked
-    # per-exchange against the OKX-side candidate's direction. Defaults
-    # intentionally match ObservationConfig's — these two should be tuned
-    # together if either changes. ---
+    # --- The same three strength-based signals as observation_engine.py,
+    # checked per-exchange against the OKX-side candidate's direction.
+    # Defaults intentionally match ObservationConfig's — these two should
+    # be tuned together if either changes. ---
     trend_bucket_sec: float = 300.0  # 5-minute synthetic candles, bucketed from raw ticks (see _build_candles_from_ticks)
-    trend_bucket_count: int = 6  # ~30 minutes
-    trend_move_threshold_pct: float = 0.003
+    bucket_count: int = 6  # ~30 minutes
+    min_trend_strength_pct: float = 70.0
+    min_net_move_pct: float = 0.003
 
-    ratio_window_sec: float = 300.0
-    min_buy_sell_ratio: float = 0.70
+    window_sec: float = 1800.0  # 30 minutes of executed trades, sliced into bucket_count buckets
+    min_buy_pressure_strength_pct: float = 70.0
 
-    delta_bucket_count: int = 3
-
-    volume_recent_window_sec: float = 300.0
-    volume_baseline_window_sec: float = 1800.0
+    min_volume_expansion_strength_pct: float = 60.0
     volume_expansion_multiplier: float = 1.5
 
 
@@ -219,11 +217,13 @@ class ExchangeOpinion:
     symbol: str
     direction: str  # this exchange's own trend reading: "long" / "short" / "neutral" (sideways or no data)
     trend: str
+    trend_strength_pct: float
     trend_ok: bool
-    buy_sell_ratio: float
-    ratio_ok: bool
-    net_aggressive_delta_ok: bool
-    volume_expansion_ok: bool
+    buy_pressure_strength_pct: float
+    buy_pressure_ratio: float
+    buy_pressure_ok: bool
+    volume_strength_pct: float
+    volume_ok: bool
     conditions_met: bool
     error: Optional[str] = None
 
@@ -236,7 +236,7 @@ class CrossExchangeResult:
     total_exchanges: int
     online_exchanges: int
     consensus_pct: float
-    average_buy_sell_ratio: float
+    average_buy_pressure_ratio: float
     reason: Optional[str]
     exchange_results: Dict[str, ExchangeOpinion]
 
@@ -248,18 +248,20 @@ class CrossExchangeResult:
             "total_exchanges": self.total_exchanges,
             "online_exchanges": self.online_exchanges,
             "consensus_pct": self.consensus_pct,
-            "average_buy_sell_ratio": self.average_buy_sell_ratio,
+            "average_buy_pressure_ratio": self.average_buy_pressure_ratio,
             "reason": self.reason,
             "exchange_results": {
                 name: {
                     "symbol": o.symbol,
                     "direction": o.direction,
                     "trend": o.trend,
+                    "trend_strength_pct": o.trend_strength_pct,
                     "trend_ok": o.trend_ok,
-                    "buy_sell_ratio": o.buy_sell_ratio,
-                    "ratio_ok": o.ratio_ok,
-                    "net_aggressive_delta_ok": o.net_aggressive_delta_ok,
-                    "volume_expansion_ok": o.volume_expansion_ok,
+                    "buy_pressure_strength_pct": o.buy_pressure_strength_pct,
+                    "buy_pressure_ratio": o.buy_pressure_ratio,
+                    "buy_pressure_ok": o.buy_pressure_ok,
+                    "volume_strength_pct": o.volume_strength_pct,
+                    "volume_ok": o.volume_ok,
                     "conditions_met": o.conditions_met,
                     "error": o.error,
                 }
@@ -270,8 +272,10 @@ class CrossExchangeResult:
 
 def _offline_opinion(exchange: str, symbol: str, error: str) -> ExchangeOpinion:
     return ExchangeOpinion(
-        exchange=exchange, symbol=symbol, direction="neutral", trend="sideways", trend_ok=False,
-        buy_sell_ratio=0.0, ratio_ok=False, net_aggressive_delta_ok=False, volume_expansion_ok=False,
+        exchange=exchange, symbol=symbol, direction="neutral", trend="sideways",
+        trend_strength_pct=0.0, trend_ok=False,
+        buy_pressure_strength_pct=0.0, buy_pressure_ratio=0.0, buy_pressure_ok=False,
+        volume_strength_pct=0.0, volume_ok=False,
         conditions_met=False, error=error,
     )
 
@@ -281,10 +285,10 @@ def _build_candles_from_ticks(ticks: List["Tick"], bucket_sec: float, num_bucket
     raw tick history. These external connectors stream ticks/trades over
     their own websocket feeds rather than exposing a REST OHLCV endpoint
     the way okx_futures_client.get_candles() does for the OKX/local side,
-    so the same trend check (classify_trend) is fed synthetic candles
+    so the same trend check (compute_trend_strength) is fed synthetic candles
     built from whatever ticks fall in each `bucket_sec`-wide slice of the
     last `bucket_sec * num_buckets` seconds instead of real exchange
-    candles. Only open/close are populated (classify_trend doesn't use
+    candles. Only open/close are populated (compute_trend_strength doesn't use
     high/low)."""
     if not ticks:
         return []
@@ -323,25 +327,26 @@ def _analyze(
     book_verified = health.channel("book").verified  # kept: still gates whether book-derived fields would be trustworthy if added later
     trades_verified = health.channel("trades").verified
 
-    candles = _build_candles_from_ticks(ticks, cfg.trend_bucket_sec, cfg.trend_bucket_count)
-    trend = classify_trend(candles, cfg.trend_move_threshold_pct)
-    trend_ok = trend == candidate_direction
+    candles = _build_candles_from_ticks(ticks, cfg.trend_bucket_sec, cfg.bucket_count)
+    trend_result = compute_trend_strength(candles)
+    trend = trend_result["direction"]
+    trend_ok = (
+        trend == candidate_direction
+        and trend_result["strength_pct"] >= cfg.min_trend_strength_pct
+        and abs(trend_result["net_move_pct"]) >= cfg.min_net_move_pct
+    )
 
     now = time.time()
     all_trades = [t for t in state.trades if t.price and t.size] if trades_verified else []
-    ratio_trades = _trade_prints_to_dicts([t for t in all_trades if t.ts >= now - cfg.ratio_window_sec])
-    recent_trades = _trade_prints_to_dicts([t for t in all_trades if t.ts >= now - cfg.volume_recent_window_sec])
-    baseline_trades = _trade_prints_to_dicts([t for t in all_trades if t.ts >= now - cfg.volume_baseline_window_sec])
+    window_trades = _trade_prints_to_dicts([t for t in all_trades if t.ts >= now - cfg.window_sec])
 
-    dominant_side, ratio = compute_buy_sell_ratio(ratio_trades)
-    ratio_ok = dominant_side == candidate_direction and ratio >= cfg.min_buy_sell_ratio
-    delta_ok = compute_net_aggressive_delta_ok(ratio_trades, candidate_direction, cfg.delta_bucket_count)
-    volume_ok = compute_volume_expansion_ok(
-        recent_trades, baseline_trades, candidate_direction,
-        cfg.volume_recent_window_sec * 1000.0, cfg.volume_baseline_window_sec * 1000.0, cfg.volume_expansion_multiplier,
-    )
+    pressure = compute_buy_pressure_strength(window_trades, candidate_direction, cfg.bucket_count)
+    buy_pressure_ok = pressure["strength_pct"] >= cfg.min_buy_pressure_strength_pct
 
-    conditions_met = trend_ok and ratio_ok and delta_ok and volume_ok
+    volume = compute_volume_expansion_strength(window_trades, candidate_direction, cfg.bucket_count, cfg.volume_expansion_multiplier)
+    volume_ok = volume["strength_pct"] >= cfg.min_volume_expansion_strength_pct
+
+    conditions_met = trend_ok and buy_pressure_ok and volume_ok
     direction = trend if trend != "sideways" else "neutral"
 
     return ExchangeOpinion(
@@ -349,11 +354,13 @@ def _analyze(
         symbol=symbol,
         direction=direction,
         trend=trend,
+        trend_strength_pct=trend_result["strength_pct"],
         trend_ok=trend_ok,
-        buy_sell_ratio=round(ratio, 4),
-        ratio_ok=ratio_ok,
-        net_aggressive_delta_ok=delta_ok,
-        volume_expansion_ok=volume_ok,
+        buy_pressure_strength_pct=pressure["strength_pct"],
+        buy_pressure_ratio=pressure["current_ratio"],
+        buy_pressure_ok=buy_pressure_ok,
+        volume_strength_pct=volume["strength_pct"],
+        volume_ok=volume_ok,
         conditions_met=conditions_met,
         error=None,
     )
@@ -1297,8 +1304,8 @@ class BingXConnector(_ExchangeConnector):
         return []
 
 
-def _avg_buy_sell_ratio(exchange_results: Dict[str, ExchangeOpinion], direction: Optional[str]) -> float:
-    vals = [o.buy_sell_ratio for o in exchange_results.values() if o.error is None and o.direction == direction]
+def _avg_buy_pressure_ratio(exchange_results: Dict[str, ExchangeOpinion], direction: Optional[str]) -> float:
+    vals = [o.buy_pressure_ratio for o in exchange_results.values() if o.error is None and o.direction == direction]
     return round(sum(vals) / len(vals), 4) if vals else 0.0
 
 
@@ -1311,7 +1318,7 @@ def _build_consensus(
         return CrossExchangeResult(
             decision="rejected", final_direction=None, agreeing_exchanges=0,
             total_exchanges=total, online_exchanges=online_exchanges,
-            consensus_pct=0.0, average_buy_sell_ratio=0.0,
+            consensus_pct=0.0, average_buy_pressure_ratio=0.0,
             reason=(
                 f"Insufficient exchanges online ({online_exchanges}/{total}, need >= "
                 f"{cfg.min_online_exchanges} reporting to evaluate the {cfg.min_agreeing}-of-{total} rule)."
@@ -1329,7 +1336,7 @@ def _build_consensus(
         return CrossExchangeResult(
             decision="rejected", final_direction=None,
             agreeing_exchanges=agreeing, total_exchanges=total, online_exchanges=online_exchanges,
-            consensus_pct=consensus_pct, average_buy_sell_ratio=_avg_buy_sell_ratio(exchange_results, candidate_direction),
+            consensus_pct=consensus_pct, average_buy_pressure_ratio=_avg_buy_pressure_ratio(exchange_results, candidate_direction),
             reason=f"Insufficient cross-exchange confirmation (minimum required: {cfg.min_agreeing} of {total}).",
             exchange_results=exchange_results,
         )
@@ -1337,38 +1344,43 @@ def _build_consensus(
     return CrossExchangeResult(
         decision="accepted", final_direction=candidate_direction,
         agreeing_exchanges=agreeing, total_exchanges=total, online_exchanges=online_exchanges,
-        consensus_pct=consensus_pct, average_buy_sell_ratio=_avg_buy_sell_ratio(exchange_results, candidate_direction),
+        consensus_pct=consensus_pct, average_buy_pressure_ratio=_avg_buy_pressure_ratio(exchange_results, candidate_direction),
         reason=None, exchange_results=exchange_results,
     )
 
 
-def _log_result(okx_symbol: str, candidate_direction: str, result: CrossExchangeResult) -> None:
+def _log_result(okx_symbol: str, candidate_direction: str, result: CrossExchangeResult, verbose: bool) -> None:
+    """One compact summary line always; the full per-exchange breakdown
+    only when `verbose` (reserved for an ACCEPTED decision or a degraded
+    exchange count — see the quiet-logging policy in validate())."""
+    summary = (
+        f"[cross_exchange] {okx_symbol} {candidate_direction.upper()} "
+        f"agreement={result.agreeing_exchanges}/{result.total_exchanges} "
+        f"consensus={result.consensus_pct:.0f}% decision={result.decision.upper()}"
+        + (f" — {result.reason}" if result.reason else "")
+    )
+    log.info(summary)
+
+    if not verbose:
+        return
+
     per_exchange = []
     for name, o in result.exchange_results.items():
         if o.error is not None:
-            per_exchange.append(f"{name.upper()}= {o.error.upper()}")
+            per_exchange.append(f"{name.upper()}={o.error.upper()}")
         else:
             per_exchange.append(
-                f"{name.upper()}= {o.direction.upper()} trend={o.trend}({'OK' if o.trend_ok else 'no'}) "
-                f"ratio={o.buy_sell_ratio:.2f}({'OK' if o.ratio_ok else 'no'}) "
-                f"delta={'OK' if o.net_aggressive_delta_ok else 'no'} volume={'OK' if o.volume_expansion_ok else 'no'}"
+                f"{name.upper()}={o.direction.upper()} trend={o.trend_strength_pct:.0f}%({'OK' if o.trend_ok else 'no'}) "
+                f"buy_pressure={o.buy_pressure_strength_pct:.0f}%({'OK' if o.buy_pressure_ok else 'no'}) "
+                f"volume={o.volume_strength_pct:.0f}%({'OK' if o.volume_ok else 'no'})"
             )
-
-    summary = (
-        f"agreement={result.agreeing_exchanges}/{result.total_exchanges} "
-        f"consensus={result.consensus_pct:.2f}% "
-        + f"decision={result.decision.upper()}"
-        + (f" reason=\"{result.reason}\"" if result.reason else "")
-    )
-
-    log.info(f"[cross_exchange] {okx_symbol} candidate={candidate_direction.upper()}")
-    log.info(f"[cross_exchange] {', '.join(per_exchange)}")
-    log.info(f"[cross_exchange] {summary}")
+    log.info(f"[cross_exchange] detail: {', '.join(per_exchange)}")
 
 
 class CrossExchangeValidator:
     def __init__(self, config: Optional[CrossExchangeConfig] = None) -> None:
         self.config = config or CrossExchangeConfig()
+        self._last_decision: Dict[str, str] = {}  # okx_symbol -> last decision logged, so unchanged rejections stay quiet
         self._connectors: Dict[str, _ExchangeConnector] = {
             "okx": OKXConnector(self.config),
             "coinbase": CoinbaseConnector(self.config),
@@ -1443,7 +1455,18 @@ class CrossExchangeValidator:
 
         online_exchanges = sum(1 for o in exchange_results.values() if o.error is None)
         result = _build_consensus(exchange_results, online_exchanges, candidate_direction, cfg)
-        _log_result(okx_symbol, candidate_direction, result)
+
+        # Quiet by default: a candidate sitting at "rejected" tick after
+        # tick is expected and not worth a log line every few seconds.
+        # Only speak up when something actually changed — the decision
+        # flipped, it just got accepted (about to trade), or the exchange
+        # count is degraded (something's wrong and worth seeing).
+        degraded = online_exchanges < cfg.min_online_exchanges
+        decision_changed = self._last_decision.get(okx_symbol) != result.decision
+        if result.decision == "accepted" or decision_changed or degraded:
+            _log_result(okx_symbol, candidate_direction, result, verbose=(result.decision == "accepted" or degraded))
+        self._last_decision[okx_symbol] = result.decision
+
         return result
 
     async def run_self_test(self, symbol: Optional[str] = None, timeout: Optional[float] = None) -> str:
