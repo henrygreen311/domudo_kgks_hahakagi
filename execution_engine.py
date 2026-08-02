@@ -886,12 +886,11 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
 
         if history_row is not None and history_row.get("exit_price") not in (None, ""):
             close_type = str(history_row.get("close_type") or "")
+            exit_price = float(history_row["exit_price"])
             if close_type in ("3", "4", "5", "6"):
-
                 close_reason = "liquidated"
             else:
-                resolved_order_id = await self._resolve_tp_execution_order_id(symbol, closed)
-                close_reason = "take_profit" if resolved_order_id else "liquidated"
+                close_reason = self._infer_close_reason_from_exit_price(closed, exit_price)
 
             total_fee = float(history_row["total_fee"])
             closing_fee = total_fee - closed.opening_fee
@@ -904,7 +903,7 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
                 closing_fee = 0.0
 
             return (
-                float(history_row["exit_price"]),
+                exit_price,
                 history_row["realized_pnl"],
                 closing_fee,
                 close_reason,
@@ -919,13 +918,13 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
 
     async def _get_close_details_from_fills(self, symbol: str, closed: OpenPosition):
         """Fallback used only when positions-history hasn't produced a row
-        for this close yet. Recovers exit_price/closing_fee/close_reason
-        from raw fills, same as the original implementation — but cannot
-        recover a real realized_pnl or net_pnl this way (see
-        _get_close_details); net_pnl comes back None so the caller falls
-        back to a local approximation."""
-        resolved_order_id = await self._resolve_tp_execution_order_id(symbol, closed)
-
+        for this close yet. Recovers exit_price/closing_fee from raw
+        fills, same as the original implementation — but cannot recover a
+        real realized_pnl or net_pnl this way (see _get_close_details);
+        net_pnl comes back None so the caller falls back to a local
+        approximation. close_reason is inferred from the exit price, same
+        as the positions-history path (see
+        _infer_close_reason_from_exit_price)."""
         opened_at_ms = closed.opened_at * 1000.0
 
         closing_side = "sell" if closed.direction == "long" else "buy"
@@ -933,21 +932,15 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         closing_trades: List[dict] = []
         for attempt in range(1, 6):
             try:
-                if resolved_order_id:
-                    trades = await self._client.get_trades(symbol=symbol, order_id=resolved_order_id)
-                else:
-                    trades = await self._client.get_trades(symbol=symbol)
+                trades = await self._client.get_trades(symbol=symbol)
             except OKXAPIError as exc:
                 log.warning(f"[execution] could not fetch closing trades for {symbol}: {exc}")
                 trades = []
 
-            if resolved_order_id:
-                closing_trades = trades
-            else:
-                closing_trades = [
-                    t for t in trades
-                    if float(t.get("create_time", 0) or 0) >= opened_at_ms and t.get("side") == closing_side
-                ]
+            closing_trades = [
+                t for t in trades
+                if float(t.get("create_time", 0) or 0) >= opened_at_ms and t.get("side") == closing_side
+            ]
             if closing_trades:
                 break
             if attempt < 5:
@@ -964,25 +957,68 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         realized_pnl = sum(float(t.get("realised_profit", 0) or 0) for t in closing_trades)
         closing_fee = sum(float(t.get("paid_fees", 0) or 0) for t in closing_trades)
 
-        close_reason = "take_profit" if resolved_order_id else "liquidated"
+        close_reason = self._infer_close_reason_from_exit_price(closed, exit_price)
         return exit_price, realized_pnl, closing_fee, close_reason, None
 
+    def _infer_close_reason_from_exit_price(self, closed: OpenPosition, exit_price: float) -> str:
+        """Distinguishes a take-profit fill from a stop-loss fill by
+        comparing the real exit price against the position's own
+        take_profit_price/stop_loss_price — the values that were actually
+        set on the exchange at open time (see _place_tp_sl) — rather than
+        asking OKX which algo order triggered.
+
+        This replaces the previous approach (querying
+        /api/v5/trade/orders-algo-history for closed.tp_order_id and
+        treating "found and effective" as take_profit, "not found" as
+        liquidated), which broke in two ways once TP and SL started being
+        submitted together as a single OCO order:
+
+        1. The lookup was querying with ordType="conditional" while the
+           order was actually placed with ordType="oco" — OKX filters
+           this endpoint by ordType server-side, so it returned
+           code=51603 "Order does not exist" for every single close, even
+           genuine take-profit fills (confirmed in production: real
+           trades closed exactly at take_profit_price were logged as
+           reason="liquidated" because the lookup could never find them).
+        2. Even with the right ordType, TP and SL now share one algoId on
+           an OCO order — "effective" only says the order triggered, not
+           which leg did, so there was no way to ever report
+           close_reason="stop_loss" at all; a real stop-loss fill would
+           have been mislabeled take_profit once the ordType above was
+           fixed.
+
+        Whichever of take_profit_price/stop_loss_price the real exit
+        price landed closer to is treated as what fired. This only runs
+        for closes OKX itself didn't already flag as a real liquidation
+        (close_type 3-6, checked by the caller first and always
+        authoritative) — a coincidental exit near the SL price during an
+        actual liquidation cascade is still reported as "liquidated"."""
+        if exit_price is None or exit_price <= 0:
+            return "unknown"
+        tp = closed.take_profit_price
+        sl = closed.stop_loss_price
+        if tp and sl:
+            return "take_profit" if abs(exit_price - tp) <= abs(exit_price - sl) else "stop_loss"
+        if tp:
+            return "take_profit"
+        if sl:
+            return "stop_loss"
+        return "unknown"
+
     async def _resolve_tp_execution_order_id(self, symbol: str, closed: OpenPosition) -> Optional[str]:
-        """`closed.tp_order_id` is the algoId of the TP algo order placed at
-        open time. Checks whether it has triggered ("effective") and, if
-        so, returns the ordId of the order it spawned so fills can be
-        pulled precisely. Verify `get_algo_order_status`'s field names
-        against a live demo response — OKX's exact linkage field for a
-        triggered conditional order's child ordId should be confirmed
-        before relying on this in production; the fallback path above
-        (scan closing-side fills since open) still produces correct P&L
-        even if this returns None."""
+        """`closed.tp_order_id` is the algoId of the TP/SL OCO algo order
+        placed at open time. Checks whether it has triggered ("effective")
+        and, if so, returns the ordId of the order it spawned. No longer
+        used to determine close_reason (see
+        _infer_close_reason_from_exit_price and get_algo_order_status's
+        docstring for why) — kept only in case something needs to know
+        whether this specific algo order is still live/pending."""
         if not closed.tp_order_id:
             return None
         try:
             status = await self._client.get_algo_order_status(symbol, closed.tp_order_id)
         except OKXAPIError as exc:
-            log.warning(f"[execution] could not fetch TP algo order status for {symbol}: {exc}")
+            log.warning(f"[execution] could not fetch TP/SL algo order status for {symbol}: {exc}")
             return None
         if not status:
             return None

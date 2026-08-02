@@ -725,14 +725,25 @@ class OKXFuturesClient:
     async def get_algo_order_status(
         self, symbol: str, algo_id: str, attempts: int = 3, retry_delay_sec: float = 1.0
     ) -> Optional[dict]:
-        """Looks up a TP/SL conditional algo order's status via
-        /api/v5/trade/orders-algo-history. NOTE: the exact field OKX uses
-        to report the ordId(s) a triggered conditional order spawned has
-        not been verified here against a live response — this reads a
-        best-guess `ordIdList`/`ordId` field defensively and returns
-        `ord_id: None` if neither is present, in which case callers should
-        fall back to a time/side-based fills scan instead of trusting this
-        linkage blindly.
+        """Looks up a TP/SL algo order's status via
+        /api/v5/trade/orders-algo-history. Queries with ordType="oco"
+        since execution_engine.py always places TP+SL together as a
+        single one-cancels-other algo order (see
+        DemoFuturesExecutionEngine._place_tp_sl) — querying with the
+        wrong ordType (this used to say "conditional", left over from
+        before SL support was added) makes this endpoint report
+        code=51603 "Order does not exist" for an order that verifiably
+        exists, every single time, since OKX filters this lookup by
+        ordType server-side.
+
+        NOTE: even with the right ordType, a successful "effective"
+        result here only tells you the algo order triggered — NOT which
+        leg (TP or SL) did, since both share the same algoId on an OCO
+        order. execution_engine.py no longer uses this method to
+        determine close_reason for that reason (see
+        _infer_close_reason_from_exit_price) — this is kept for anything
+        that only needs to know whether the order is still live/pending
+        vs. triggered/canceled.
 
         Retries on code=51603 ("Order does not exist"): this endpoint's
         index can lag a couple of seconds behind an algo order that was
@@ -749,7 +760,7 @@ class OKXFuturesClient:
                 data = await self._request(
                     "GET",
                     "/api/v5/trade/orders-algo-history",
-                    params={"instType": INST_TYPE, "ordType": "conditional", "algoId": str(algo_id), "instId": symbol},
+                    params={"instType": INST_TYPE, "ordType": "oco", "algoId": str(algo_id), "instId": symbol},
                     auth=True,
                 )
                 rows = data or []
