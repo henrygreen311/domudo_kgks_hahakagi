@@ -7,6 +7,21 @@ from datetime import datetime
 from typing import Deque, Dict, List, Optional, Tuple
 
 
+# Only these pairs may ever be ranked/watchlisted/traded — anything else the
+# exchange feed surfaces (random altcoins, new listings, etc.) gets filtered
+# out here and again as a hard backstop in
+# ObservationWindowManager.sync_watchlist() (observation_engine.py, which
+# imports this same constant). Mapped from the user's "ETH/USDT" etc. list
+# to the OKX SWAP instId format used everywhere else in this codebase —
+# update this one set, not each caller, if the approved-pairs list changes.
+DEFAULT_SYMBOL_WHITELIST = frozenset({
+    "ETH-USDT-SWAP",
+    "SOL-USDT-SWAP",
+    "DOGE-USDT-SWAP",
+    "KAITO-USDT-SWAP",
+})
+
+
 class MarketDataStore:
     def __init__(self) -> None:
         self._data: Dict[str, Dict[str, float]] = {}
@@ -174,16 +189,27 @@ DEFAULT_RANKING_WEIGHTS = {
 
 
 class SymbolRanker:
-    def __init__(self, top_n: int = 15, stale_after_sec: float = 30.0, weights: Optional[Dict[str, float]] = None) -> None:
+    def __init__(
+        self,
+        top_n: int = 15,
+        stale_after_sec: float = 30.0,
+        weights: Optional[Dict[str, float]] = None,
+        symbol_whitelist: Optional[frozenset] = None,
+    ) -> None:
         self._stats: Dict[str, Dict[str, float]] = {}
         self._lock = asyncio.Lock()
         self.top_n = top_n
         self.stale_after_sec = stale_after_sec
         self.weights = weights or DEFAULT_RANKING_WEIGHTS
+        # None disables filtering; pass frozenset() explicitly (not None) if
+        # you ever want "rank nothing" rather than "rank everything".
+        self.symbol_whitelist = DEFAULT_SYMBOL_WHITELIST if symbol_whitelist is None else symbol_whitelist
 
     async def update_from_ticker(self, payload: dict) -> None:
         symbol = payload.get("symbol")
         if not symbol:
+            return
+        if self.symbol_whitelist and symbol not in self.symbol_whitelist:
             return
         try:
             last_price = float(payload.get("last_price"))

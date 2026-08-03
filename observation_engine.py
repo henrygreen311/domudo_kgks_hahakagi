@@ -58,7 +58,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Dict, List, Optional
 
-from market_data import MarketDataStore, TradeStore
+from market_data import MarketDataStore, TradeStore, DEFAULT_SYMBOL_WHITELIST
 
 log = logging.getLogger("okx_futures.observation")
 
@@ -236,6 +236,11 @@ def compute_volume_expansion_strength(trades: List[dict], direction: str, bucket
 # ---------------------------------------------------------------------------
 
 
+# DEFAULT_SYMBOL_WHITELIST (only these pairs may ever be watchlisted/
+# observed/traded) now lives in market_data.py as the single source of
+# truth, since SymbolRanker there needs the same set — imported above.
+
+
 @dataclass
 class ObservationConfig:
     max_observation_minutes: float = 20.0
@@ -254,6 +259,11 @@ class ObservationConfig:
 
     min_volume_expansion_strength_pct: float = 60.0
     volume_expansion_multiplier: float = 1.5  # target growth (back-half vs front-half of the window) for a max volume score
+
+    # Only symbols in this set are ever accepted into the watchlist — see
+    # sync_watchlist() below. An empty/None set disables filtering (every
+    # symbol the feed offers gets watchlisted), so leave this populated.
+    symbol_whitelist: Optional[frozenset] = field(default_factory=lambda: DEFAULT_SYMBOL_WHITELIST)
 
 
 @dataclass
@@ -324,8 +334,23 @@ class ObservationWindowManager:
     async def sync_watchlist(self, watchlist_symbols) -> None:
         """Starts observing any symbol newly present in the watchlist and
         drops local state for any symbol that fell off it — a symbol that
-        leaves the watchlist is no longer a candidate, full stop."""
+        leaves the watchlist is no longer a candidate, full stop.
+
+        Whatever the caller passes in is first filtered down to
+        `config.symbol_whitelist` — this is the hard backstop that keeps
+        the bot from ever watching (and therefore ever trading) a pair
+        outside the user's approved list, regardless of what the upstream
+        ranking/feed logic surfaces."""
         watchlist_symbols = set(watchlist_symbols)
+        whitelist = self.config.symbol_whitelist
+        if whitelist:
+            rejected = watchlist_symbols - whitelist
+            watchlist_symbols &= whitelist
+            if rejected:
+                log.debug(
+                    f"[observation] ignoring {len(rejected)} non-whitelisted symbol(s) from the feed: "
+                    f"{sorted(rejected)}"
+                )
         async with self._lock:
             for symbol in watchlist_symbols:
                 if symbol not in self._candidates:

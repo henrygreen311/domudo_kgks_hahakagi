@@ -282,6 +282,31 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         symbol = signal.symbol
         direction = signal.direction
 
+        # Authoritative guard, backed by the exchange itself rather than
+        # only in-memory bookkeeping: never open a second position on a
+        # pair that already has one live on OKX, even if our own
+        # _open_positions dict thinks the pair is free (e.g. after a fill
+        # check timed out and we lost track of an order that actually
+        # went on to fill — see _wait_for_fill's caller below). Waits for
+        # the existing exposure to close before this pair is touched
+        # again, exactly as it should.
+        try:
+            existing_positions = await self._client.get_position(symbol)
+        except OKXAPIError as exc:
+            self._log_throttled(
+                f"{symbol}:position_check_fail", logging.WARNING,
+                f"[execution] {symbol} {direction.upper()} — could not verify existing exchange "
+                f"position ({exc}); discarding rather than risking a duplicate"
+            )
+            return None
+        if any(float(p.get("current_amount") or 0) > 0 for p in existing_positions):
+            self._log_throttled(
+                f"{symbol}:already_open_on_exchange", logging.INFO,
+                f"[execution] {symbol} {direction.upper()} — a position is already open on this "
+                f"pair on the exchange; waiting for it to close before opening another"
+            )
+            return None
+
         try:
             contract = await self._client.get_contract_details(symbol)
         except OKXAPIError as exc:
@@ -434,8 +459,17 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
 
         filled = await self._wait_for_fill(symbol, order_id)
         if filled is None:
-            log.error(f"[execution] {symbol} order {order_id} did not fill within timeout")
-            return None
+            log.error(
+                f"[execution] {symbol} order {order_id} did not fill within timeout — cancelling it "
+                f"so it can't sit live on the exchange and fill later without the bot tracking it"
+            )
+            filled = await self._cancel_and_verify(symbol, order_id)
+            if filled is None:
+                return None
+            log.warning(
+                f"[execution] {symbol} order {order_id} had actually filled (fully or partially) by "
+                f"the time the cancel was attempted — proceeding to protect the real position with TP/SL"
+            )
 
         deal_avg_price = float(filled.get("deal_avg_price", 0))
         deal_size = float(filled.get("deal_size", 0))
@@ -523,6 +557,41 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
             await self._movement_tracker.start_tracking(position)
 
         return position
+
+    async def _cancel_and_verify(self, symbol: str, order_id: str) -> Optional[dict]:
+        """Called only after _wait_for_fill gives up. Cancels the
+        still-outstanding order so it can't rest on the exchange and fill
+        later while the bot has already moved on — that gap is exactly
+        what let multiple real orders stack up on the same pair before.
+
+        OKX rejects cancelling an order that has already filled, so a
+        failed cancel is re-checked against the order's actual state
+        rather than assumed to mean "still safe to ignore": if it turns
+        out the order filled (fully or partially) in the moment between
+        our last poll and the cancel attempt, that fill detail is
+        returned so the caller can protect the real position with TP/SL
+        instead of leaving it unprotected. Returns None only once it's
+        confirmed there is no fill to protect."""
+        try:
+            await self._client.cancel_order(symbol, order_id)
+        except OKXAPIError as exc:
+            log.warning(f"[execution] {symbol} order {order_id} cancel request failed ({exc}); re-checking its state")
+
+        try:
+            detail = await self._client.get_order(symbol, order_id)
+        except OKXAPIError as exc:
+            log.error(
+                f"[execution] {symbol} order {order_id} — could not confirm final state after cancel "
+                f"({exc}); treating as unfilled, but verify manually on the exchange"
+            )
+            return None
+
+        if str(detail.get("state")) == "4":
+            return detail
+        deal_size = float(detail.get("deal_size") or 0)
+        if deal_size > 0:
+            return detail
+        return None
 
     async def _wait_for_fill(self, symbol: str, order_id: str) -> Optional[dict]:
         cfg = self.config
