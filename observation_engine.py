@@ -252,7 +252,7 @@ class ObservationConfig:
     volume_expansion_multiplier: float = 1.5  # target growth (back-half vs front-half of the window) for a max volume score
 
     require_cross_exchange: bool = True
-    min_agreeing_exchanges: int = 5
+    min_agreeing_exchanges: int = 4  # display-only (Signal.reasons) -- actual gating threshold lives in CrossExchangeConfig.min_agreeing
     total_exchanges: int = 7
 
 

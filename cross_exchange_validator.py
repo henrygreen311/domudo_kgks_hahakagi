@@ -112,11 +112,26 @@ def _extract_ts(raw) -> float:
 @dataclass
 class CrossExchangeConfig:
     total_exchanges: int = 7
-    min_agreeing: int = 5
-    min_online_exchanges: int = 5
+    # Lowered from 5 to 4: across a full 6-hour live run, the number of
+    # exchanges reporting usable data at any given check never once
+    # reached 5 (topped out at 4/7 every single time), so 5-of-7 was
+    # structurally unreachable regardless of connector health or signal
+    # quality. 4-of-7 still requires a real majority to agree while
+    # actually being achievable with this exchange set.
+    min_agreeing: int = 4
+    min_online_exchanges: int = 4
 
     snapshot_wait_timeout_sec: float = 6.0
-    max_snapshot_age_sec: float = 8.0
+    # How old a symbol's last tick can be before it's treated as stale.
+    # 8s was tuned assuming near-continuous ticks like a major pair on a
+    # primary exchange gets; for the lower-liquidity altcoin perpetuals
+    # this bot actually watches (SLX, ZAMA, PROS, THETA, etc.), several
+    # of the secondary exchanges here naturally go 10-15s between prints
+    # on a given symbol even on a perfectly healthy connection — 8s was
+    # flagging that as "no fresh data" constantly. 20s gives real gaps in
+    # thin trading room to breathe while still catching a genuinely dead
+    # feed reasonably quickly.
+    max_snapshot_age_sec: float = 20.0
     subscription_idle_ttl_sec: float = 300.0
     reconnect_backoff_sec: float = 3.0
     reconnect_backoff_max_sec: float = 30.0
@@ -569,31 +584,51 @@ class _ExchangeConnector:
             backoff = min(backoff * 2, self.config.reconnect_backoff_max_sec)
 
     async def _subscribe_consumer(self, ws) -> None:
+        """Payload-construction errors (a local bug — e.g. a malformed
+        symbol) are caught per-channel and logged so one bad channel
+        doesn't block the others. ws.send() failures are NOT caught here
+        — those mean the socket itself is dead, and must propagate up
+        through asyncio.gather() to _run_forever's except block so it
+        actually reconnects (see _run_forever's comment on _recv_loop —
+        this coroutine needs to honor that same contract, which it
+        previously didn't: it was swallowing send failures, so a dead
+        connection could sit there forever being silently retried
+        instead of ever triggering a reconnect).
+
+        A symbol is only added to `_subscribed` once every channel for it
+        has actually gone out successfully. If nothing succeeds, it's
+        left off — so ensure_subscribed() (called every observation tick
+        for every candidate) will naturally queue it again instead of
+        permanently blacklisting it after one bad send."""
         while True:
             symbol = await self._pending_subscribe.get()
             async with self._lock:
                 if symbol in self._subscribed:
                     continue
-                self._subscribed.add(symbol)
             ok, failed = [], []
             for channel_key, builder in self._channel_builders().items():
                 if channel_key == "liquidations" and self.LIQUIDATIONS_GLOBAL:
                     async with self._lock:
                         if "liquidations" in self._global_subscribed:
                             continue
-                        self._global_subscribed.add("liquidations")
                 try:
                     payload = builder(symbol)
-                    await ws.send(json.dumps(payload))
-                    self.channel_health(channel_key).subscribed = True
-                    ok.append(channel_key)
                 except Exception as e:
                     self.channel_health(channel_key).last_error = f"subscribe failed: {e}"
                     failed.append(f"{channel_key}: {type(e).__name__}")
+                    continue
+                await ws.send(json.dumps(payload))  # intentionally NOT caught -- see docstring
+                self.channel_health(channel_key).subscribed = True
+                ok.append(channel_key)
+                if channel_key == "liquidations" and self.LIQUIDATIONS_GLOBAL:
+                    async with self._lock:
+                        self._global_subscribed.add("liquidations")
             if ok:
+                async with self._lock:
+                    self._subscribed.add(symbol)
                 log.info(f"[cross_exchange:{self.name}] {symbol} subscribed ({', '.join(ok)})")
             if failed:
-                log.warning(f"[cross_exchange:{self.name}] {symbol} subscribe FAILED ({'; '.join(failed)})")
+                log.warning(f"[cross_exchange:{self.name}] {symbol} subscribe FAILED ({'; '.join(failed)}) — will retry")
 
     async def _recv_loop(self, ws) -> None:
         async for raw in ws:
