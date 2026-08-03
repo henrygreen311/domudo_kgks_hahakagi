@@ -1,5 +1,6 @@
 """
-Observation Window signal system.
+Observation Window signal system — Trend Continuation & Reversal
+Prediction Engine.
 
 This replaces the entire legacy evidence/scoring pipeline as the trading
 bot's sole trade-decision logic:
@@ -13,43 +14,57 @@ bot's sole trade-decision logic:
     were persisted to)
 
 None of the above are imported here or anywhere in the new pipeline. See
-tracker.py's run_trading_loop for how this module is wired in; those four
-files are no longer referenced anywhere in the project and can be deleted.
+tracker.py's run_trading_loop for how this module is wired in.
+
+It also replaces this module's OWN first design: a static-threshold
+checker (trend >= 70%, pressure >= 70%, volume >= 60%, all-or-nothing,
+discard the instant any one dropped). That version entered a lot of fake
+breakouts and then missed the reversal that followed, because a single
+soft dip in volume was enough to throw the candidate away right before
+the real move. This version never does that — a weakening trend moves
+into a MONITORING state instead of being discarded, and is only resolved
+once the market actually shows its hand.
 
 Mechanics: a symbol entering the watchlist becomes a candidate immediately
-and is observed for up to `max_observation_minutes` (20 by default). Every
-tick, three required signals are re-evaluated, all measured as a STRENGTH
-over the same lookback (`bucket_count` slices — 6 x 5-minute candles/
-buckets = 30 minutes by default) rather than a rigid one-shot pass/fail:
+and is observed for up to `max_observation_minutes` (20 by default,
+unchanged). Every tick:
 
-  1. Trend strength: candles are weighted by how big their move was (a
-     +3% candle counts far more than a +0.1% candle), not just counted as
-     bullish/bearish. strength_pct = the winning side's share of total
-     weighted movement.
-  2. Buy/sell pressure strength: the window is split into `bucket_count`
-     chronological slices and the dominant side's share is tracked slice
-     by slice — this rewards buying/selling pressure that is *building*
-     (e.g. 58/61/66/71/76/82) over pressure that is merely present but
-     flat (e.g. 71/70/71/70/71/70).
-  3. Volume expansion strength: same slicing, applied to directional
-     volume — rewards steady, accelerating participation over a single
-     one-off spike.
+  1. Determine the current dominant direction from the last
+     `bucket_count` CLOSED 5-minute candles (`compute_trend_strength`,
+     unchanged) — this is the reference direction everything below reacts
+     to. No trade opens off this alone.
 
-...The trade opens the instant all three hold simultaneously —
-observation does not wait out the full window once conditions are met.
-If the window elapses first, the candidate is discarded.
+  2. Health check — is that direction still gaining strength? Checked via
+     the same `compute_buy_pressure_strength` / `compute_volume_expansion_strength`
+     used before, but now specifically for whether the dominant side's
+     pressure is *accelerating* and its volume is *expanding* (not just
+     above a static bar), plus whether the currently-forming 5m candle
+     itself supports that direction. All three healthy -> open the trade
+     immediately, same as the old engine's instant-open behavior.
 
-Cross-exchange confirmation (cross_exchange_validator.py) has been
-removed from this decision path. It's still available as a standalone
-module (it reuses the pure functions below), but ObservationWindowManager
-no longer takes or calls one — a candidate's local trend/buy-pressure/
-volume strength passing is now sufficient on its own to open a trade.
+  3. If not healthy, check for exhaustion: the dominant side's pressure
+     AND volume both flat-or-falling, while the OPPOSITE side's pressure
+     AND volume are both building. Only this specific combination moves
+     the candidate into MONITORING — a merely soft/ambiguous tick (e.g.
+     volume alone easing off) changes nothing and is re-checked next tick.
+     This is the fix for the old discard-on-first-dip behavior.
 
-Net-aggressive-delta persistence (the old "every slice must agree with
-direction or the whole thing fails" check) has been removed. Its intent
-— reward flow that keeps pushing the same way — is now covered by the
-buy/sell pressure *strength* score above, which measures that directly
-instead of as a binary all-or-nothing gate.
+  4. While MONITORING, every tick re-checks two, and only two, outcomes
+     for the ORIGINAL (exhausted) direction:
+       a. TREND_RECOVERED — the exhausted side's pressure/volume are
+          building again and the current candle supports it once more.
+          Opens in the ORIGINAL direction.
+       b. REVERSAL_CONFIRMED — the opposite side's pressure/volume are
+          building AND the last two CLOSED candles show a genuine
+          structure break (close beyond the prior candle's low/high by at
+          least `reversal_velocity_pct`, not just a wick through it).
+          Opens in the OPPOSITE direction.
+     Neither outcome -> stays in MONITORING, still not discarded, up to
+     the overall `max_observation_minutes` ceiling.
+
+Cross-exchange confirmation (cross_exchange_validator.py) is not part of
+this decision path — it's still available as a standalone module reusing
+the pure functions below, but ObservationWindowManager doesn't call one.
 """
 
 import asyncio
@@ -232,6 +247,76 @@ def compute_volume_expansion_strength(trades: List[dict], direction: str, bucket
 
 
 # ---------------------------------------------------------------------------
+# Forming-candle / reversal-structure helpers
+# ---------------------------------------------------------------------------
+
+
+def _split_forming_and_closed(candles: List[dict]):
+    """OKX's /market/candles response carries a `confirm` flag ("0" =
+    still forming/live, "1" = closed) which okx_futures_client.get_candles
+    passes straight through. Splits `candles` (any order) into
+    (forming_candle_or_None, closed_candles_newest_first) so the trend and
+    reversal-structure checks only ever see confirmed bars while the
+    health/recovery checks can still read the live one. A missing/unknown
+    confirm value is treated as closed (conservative: never mistakes a
+    stale/malformed row for a live one)."""
+    forming = None
+    closed: List[dict] = []
+    ordered = sorted(candles, key=lambda c: c.get("ts", 0), reverse=True)
+    for c in ordered:
+        if forming is None and str(c.get("confirm")) == "0":
+            forming = c
+        else:
+            closed.append(c)
+    return forming, closed
+
+
+def _candle_supports_direction(candle: Optional[dict], direction: str) -> bool:
+    """True if `candle`'s own open->close move agrees with `direction`
+    (long wants a bullish/green candle, short wants bearish/red). Used for
+    the still-forming 5m candle when one's available, and as a
+    same-shaped fallback on the latest closed candle otherwise (e.g. a
+    fetcher/test double that doesn't report a confirm flag) — a missing
+    candle never counts as support, which only makes it harder to open or
+    recover a trade, never easier."""
+    if not candle:
+        return False
+    o, c = candle.get("open"), candle.get("close")
+    if not o or c is None:
+        return False
+    if direction == "long":
+        return c > o
+    if direction == "short":
+        return c < o
+    return False
+
+
+def _reversal_confirmed(closed_candles: List[dict], exhausted_direction: str, velocity_pct: float) -> bool:
+    """Confirms a genuine structure break using the last two CLOSED 5m
+    candles (`closed_candles`, newest-first): for an exhausted LONG, the
+    most recently closed candle must close below the prior candle's low
+    by at least `velocity_pct` — not merely wick through it intraday; for
+    an exhausted SHORT, it must close above the prior candle's high by
+    the same margin. Pressure/volume alone (see the reversal-building
+    check in ObservationWindowManager.evaluate) only earn a candidate the
+    right to be checked against this — this is what actually opens the
+    reversal trade."""
+    if len(closed_candles) < 2:
+        return False
+    last_closed, prior_closed = closed_candles[0], closed_candles[1]
+    if exhausted_direction == "long":
+        level = prior_closed.get("low")
+        if not level:
+            return False
+        return last_closed["close"] <= level * (1 - velocity_pct)
+    else:
+        level = prior_closed.get("high")
+        if not level:
+            return False
+        return last_closed["close"] >= level * (1 + velocity_pct)
+
+
+# ---------------------------------------------------------------------------
 # Observation state
 # ---------------------------------------------------------------------------
 
@@ -260,6 +345,18 @@ class ObservationConfig:
     min_volume_expansion_strength_pct: float = 60.0
     volume_expansion_multiplier: float = 1.5  # target growth (back-half vs front-half of the window) for a max volume score
 
+    # Reversal-confirmation velocity filter (see _reversal_confirmed):
+    # requires the close to move at least this far beyond the prior
+    # candle's low/high, not just touch or wick through it, before a
+    # MONITORING candidate's reversal is treated as real.
+    reversal_velocity_pct: float = 0.0015  # 0.15%
+
+    # How many extra candles to fetch beyond bucket_count so there's
+    # still bucket_count CLOSED candles for the trend calc even when the
+    # newest row is a still-forming candle, plus enough closed candles
+    # left over for the last-two-closed reversal-structure check.
+    candle_fetch_buffer: int = 2
+
     # Only symbols in this set are ever accepted into the watchlist — see
     # sync_watchlist() below. An empty/None set disables filtering (every
     # symbol the feed offers gets watchlisted), so leave this populated.
@@ -269,15 +366,28 @@ class ObservationConfig:
 @dataclass
 class CandidateObservation:
     symbol: str
-    direction: str = "long"
-    status: str = "OBSERVING"  # OBSERVING / ACCEPTED / EXPIRED
+    direction: str = ""  # "" until Step 1 establishes a dominant direction; then "long"/"short"
+    status: str = "OBSERVING"  # OBSERVING / ACCEPTED / EXPIRED -- ObservationWindowManager's own bookkeeping
     started_at: float = field(default_factory=time.time)
     last_checked_at: float = 0.0
+
+    # State-machine phase, distinct from `status` above -- this is the
+    # finer-grained read of *why* (OBSERVING / MONITORING / TREND_RECOVERED
+    # / REVERSAL_CONFIRMED), logged on every transition.
+    state: str = "OBSERVING"
+    monitoring: bool = False
+    exhausted_side: str = ""  # "long"/"short" -- the direction currently being monitored for recovery vs reversal
+    exhaustion_count: int = 0  # ticks spent in MONITORING since the current exhaustion began
 
     trend: str = "sideways"
     trend_strength_pct: float = 0.0
     trend_ok: bool = False
 
+    # Dominant-side (i.e. candidate.direction's side) pressure/volume as of
+    # the last tick -- "buy_" naming kept for backward compatibility with
+    # callers (tracker.py's Signal.reasons) built before short candidates
+    # existed; these reflect whichever side is currently dominant, not
+    # literally "buy" for a short candidate.
     buy_pressure_strength_pct: float = 0.0
     buy_pressure_ratio: float = 0.0
     buy_pressure_ok: bool = False
@@ -291,22 +401,17 @@ class CandidateObservation:
     def elapsed_sec(self) -> float:
         return time.time() - self.started_at
 
-    @property
-    def local_conditions_met(self) -> bool:
-        return self.trend_ok and self.buy_pressure_ok and self.volume_ok
-
-    @property
-    def all_conditions_met(self) -> bool:
-        return self.local_conditions_met
-
     def status_line(self) -> str:
-        return (
-            f"{self.symbol} status={self.status} direction={self.direction.upper()} "
+        base = (
+            f"{self.symbol} status={self.status} state={self.state} direction={self.direction.upper() or '-'} "
             f"elapsed={self.elapsed_sec:.0f}s "
-            f"trend={self.trend}:{self.trend_strength_pct:.0f}%({'OK' if self.trend_ok else 'no'}) "
-            f"buy_pressure={self.buy_pressure_strength_pct:.0f}%({'OK' if self.buy_pressure_ok else 'no'}) "
-            f"volume={self.volume_strength_pct:.0f}%({'OK' if self.volume_ok else 'no'})"
+            f"trend={self.trend}:{self.trend_strength_pct:.0f}% "
+            f"pressure={self.buy_pressure_strength_pct:.0f}% "
+            f"volume={self.volume_strength_pct:.0f}%"
         )
+        if self.monitoring:
+            base += f" monitoring_since_ticks={self.exhaustion_count} exhausted_side={self.exhausted_side.upper()}"
+        return base
 
 
 class ObservationWindowManager:
@@ -370,8 +475,11 @@ class ObservationWindowManager:
     async def evaluate(self, symbol: str) -> Optional[CandidateObservation]:
         """Runs one observation tick for `symbol`. Returns the candidate
         once (and only once — it's removed from tracking immediately
-        after) it reaches ACCEPTED; returns None while still observing,
-        on this tick's failure, or once it expires."""
+        after) it reaches ACCEPTED, whether via a healthy continuing
+        trend, a recovered trend, or a confirmed reversal. Returns None
+        on every other tick, including a weakening trend moved into
+        MONITORING — that candidate is NOT discarded, only expiry
+        (max_observation_minutes) or a real acceptance ever removes it."""
         cfg = self.config
         async with self._lock:
             candidate = self._candidates.get(symbol)
@@ -382,7 +490,7 @@ class ObservationWindowManager:
             candidate.status = "EXPIRED"
             log.info(
                 f"[observation] {symbol} EXPIRED after {candidate.elapsed_sec / 60.0:.1f}m "
-                f"without meeting all conditions — discarding"
+                f"(last state={candidate.state}) — discarding"
             )
             async with self._lock:
                 self._candidates.pop(symbol, None)
@@ -392,55 +500,159 @@ class ObservationWindowManager:
         if not market:
             return None
         price = market["last_price"]
-
-        try:
-            candles = await self._candle_fetcher(symbol, cfg.trend_candle_bar, cfg.bucket_count)
-        except Exception as exc:
-            log.warning(f"[observation] {symbol} — could not fetch candles for the trend check: {exc}")
-            candles = []
-        trend_result = compute_trend_strength(candles)
-        trend = trend_result["direction"]
-        candidate.trend = trend
-        candidate.trend_strength_pct = trend_result["strength_pct"]
         candidate.last_checked_at = time.time()
         candidate.entry_price = price
 
+        # --- Step 1: dominant direction from the last `bucket_count`
+        # CLOSED 5m candles. Fetches a few extra so there's still
+        # bucket_count closed candles even when the newest row is the
+        # currently-forming one, plus enough closed candles left over for
+        # the reversal-structure check later. ---
+        try:
+            raw_candles = await self._candle_fetcher(
+                symbol, cfg.trend_candle_bar, cfg.bucket_count + cfg.candle_fetch_buffer
+            )
+        except Exception as exc:
+            log.warning(f"[observation] {symbol} — could not fetch candles for the trend check: {exc}")
+            raw_candles = []
+        forming_candle, closed_candles = _split_forming_and_closed(raw_candles)
+        # Fallback support-check candle when the fetcher doesn't report a
+        # confirm flag at all: the latest closed candle stands in for the
+        # forming one rather than support defaulting to False every tick.
+        support_candle = forming_candle or (closed_candles[0] if closed_candles else None)
+
+        trend_result = compute_trend_strength(closed_candles[: cfg.bucket_count])
+        candidate.trend = trend_result["direction"]
+        candidate.trend_strength_pct = trend_result["strength_pct"]
         trend_ok = (
-            trend != "sideways"
+            trend_result["direction"] != "sideways"
             and trend_result["strength_pct"] >= cfg.min_trend_strength_pct
             and abs(trend_result["net_move_pct"]) >= cfg.min_net_move_pct
         )
         candidate.trend_ok = trend_ok
 
-        if trend == "sideways":
-            candidate.buy_pressure_ok = False
-            candidate.volume_ok = False
-            return None
+        if not candidate.direction:
+            # Direction hasn't been established yet -- Step 1 isn't a
+            # trade decision on its own, just the reference point
+            # everything below reacts to.
+            if not trend_ok:
+                return None
+            candidate.direction = trend_result["direction"]
+            candidate.state = "OBSERVING"
+            log.info(
+                f"[observation] {symbol} STATE=OBSERVING direction established="
+                f"{candidate.direction.upper()} trend_strength={trend_result['strength_pct']:.0f}%"
+            )
 
-        direction = trend
-        candidate.direction = direction
-
-        if not trend_ok:
-            candidate.buy_pressure_ok = False
-            candidate.volume_ok = False
-            return None
+        direction = candidate.direction
+        opposite = "short" if direction == "long" else "long"
 
         window_trades = await self._trade_store.get_window(symbol, cfg.window_ms)
+        dom_pressure = compute_buy_pressure_strength(window_trades, direction, cfg.bucket_count)
+        dom_volume = compute_volume_expansion_strength(window_trades, direction, cfg.bucket_count, cfg.volume_expansion_multiplier)
+        opp_pressure = compute_buy_pressure_strength(window_trades, opposite, cfg.bucket_count)
+        opp_volume = compute_volume_expansion_strength(window_trades, opposite, cfg.bucket_count, cfg.volume_expansion_multiplier)
 
-        pressure = compute_buy_pressure_strength(window_trades, direction, cfg.bucket_count)
-        candidate.buy_pressure_strength_pct = pressure["strength_pct"]
-        candidate.buy_pressure_ratio = pressure["current_ratio"]
-        candidate.buy_pressure_ok = pressure["strength_pct"] >= cfg.min_buy_pressure_strength_pct
+        candidate.buy_pressure_strength_pct = dom_pressure["strength_pct"]
+        candidate.buy_pressure_ratio = dom_pressure["current_ratio"]
+        candidate.volume_strength_pct = dom_volume["strength_pct"]
 
-        volume = compute_volume_expansion_strength(window_trades, direction, cfg.bucket_count, cfg.volume_expansion_multiplier)
-        candidate.volume_strength_pct = volume["strength_pct"]
-        candidate.volume_ok = volume["strength_pct"] >= cfg.min_volume_expansion_strength_pct
+        dominant_healthy = (
+            dom_pressure["accelerating"]
+            and dom_pressure["strength_pct"] >= cfg.min_buy_pressure_strength_pct
+            and dom_volume["expanding"]
+            and dom_volume["strength_pct"] >= cfg.min_volume_expansion_strength_pct
+            and _candle_supports_direction(support_candle, direction)
+        )
+        candidate.buy_pressure_ok = dom_pressure["accelerating"] and dom_pressure["strength_pct"] >= cfg.min_buy_pressure_strength_pct
+        candidate.volume_ok = dom_volume["expanding"] and dom_volume["strength_pct"] >= cfg.min_volume_expansion_strength_pct
 
-        if not candidate.local_conditions_met:
+        # --- Step 2 (not yet monitoring): is the established trend still
+        # gaining strength? ---
+        if not candidate.monitoring:
+            if dominant_healthy:
+                candidate.state = "ACCEPTED"
+                candidate.status = "ACCEPTED"
+                async with self._lock:
+                    self._candidates.pop(symbol, None)
+                log.info(f"[observation] {symbol} STATE=ACCEPTED (trend healthy) — {candidate.status_line()}")
+                return candidate
+
+            # --- Step 3: exhaustion check. Only THIS specific combination
+            # (dominant side flat-or-falling on BOTH pressure and volume,
+            # opposite side building on BOTH) moves the candidate into
+            # MONITORING — anything softer/ambiguous changes nothing and
+            # is simply re-checked next tick, still OBSERVING. ---
+            exhaustion = (
+                not dom_pressure["accelerating"]
+                and dom_pressure["strength_pct"] < cfg.min_buy_pressure_strength_pct
+                and not dom_volume["expanding"]
+                and dom_volume["strength_pct"] < cfg.min_volume_expansion_strength_pct
+                and opp_pressure["accelerating"]
+                and opp_volume["expanding"]
+            )
+            if exhaustion:
+                candidate.monitoring = True
+                candidate.exhausted_side = direction
+                candidate.exhaustion_count = 1
+                candidate.state = "MONITORING"
+                log.info(
+                    f"[observation] {symbol} STATE=MONITORING exhausted_side={direction.upper()} — "
+                    f"reason: {direction} pressure/volume falling "
+                    f"(pressure={dom_pressure['strength_pct']:.0f}% volume={dom_volume['strength_pct']:.0f}%), "
+                    f"{opposite} pressure/volume building "
+                    f"(pressure={opp_pressure['strength_pct']:.0f}% volume={opp_volume['strength_pct']:.0f}%)"
+                )
             return None
 
-        candidate.status = "ACCEPTED"
-        async with self._lock:
-            self._candidates.pop(symbol, None)
-        log.info(f"[observation] {symbol} ACCEPTED — {candidate.status_line()}")
-        return candidate
+        # --- Step 4: MONITORING. Only two outcomes are ever checked for
+        # the ORIGINAL (exhausted) direction; anything else leaves the
+        # candidate in MONITORING, not discarded, up to
+        # max_observation_minutes. ---
+        candidate.exhaustion_count += 1
+        exhausted = candidate.exhausted_side
+
+        recovered = (
+            dom_pressure["accelerating"]
+            and dom_pressure["strength_pct"] >= cfg.min_buy_pressure_strength_pct
+            and dom_volume["expanding"]
+            and dom_volume["strength_pct"] >= cfg.min_volume_expansion_strength_pct
+            and _candle_supports_direction(support_candle, exhausted)
+        )
+        if recovered:
+            candidate.monitoring = False
+            candidate.exhausted_side = ""
+            candidate.state = "TREND_RECOVERED"
+            candidate.status = "ACCEPTED"
+            log.info(
+                f"[observation] {symbol} STATE=TREND_RECOVERED — {exhausted} pressure/volume building again, "
+                f"current candle supports it — opening {exhausted.upper()}"
+            )
+            async with self._lock:
+                self._candidates.pop(symbol, None)
+            return candidate
+
+        reversal_building = (
+            opp_pressure["accelerating"]
+            and opp_volume["expanding"]
+            and not dom_pressure["accelerating"]
+            and not dom_volume["expanding"]
+        )
+        if reversal_building and _reversal_confirmed(closed_candles, exhausted, cfg.reversal_velocity_pct):
+            new_direction = opposite
+            candidate.direction = new_direction
+            candidate.monitoring = False
+            candidate.exhausted_side = ""
+            candidate.state = "REVERSAL_CONFIRMED"
+            candidate.status = "ACCEPTED"
+            log.info(
+                f"[observation] {symbol} STATE=REVERSAL_CONFIRMED — price closed beyond the prior candle's "
+                f"{'low' if exhausted == 'long' else 'high'} by >= {cfg.reversal_velocity_pct:.2%}, "
+                f"velocity filter passed — opening {new_direction.upper()}"
+            )
+            async with self._lock:
+                self._candidates.pop(symbol, None)
+            return candidate
+
+        # Neither outcome yet -- stays in MONITORING.
+        return None
