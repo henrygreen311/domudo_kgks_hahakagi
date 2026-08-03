@@ -35,11 +35,15 @@ buckets = 30 minutes by default) rather than a rigid one-shot pass/fail:
      volume — rewards steady, accelerating participation over a single
      one-off spike.
 
-...plus cross-exchange confirmation of the same three signals (see
-cross_exchange_validator.py, which reuses the pure functions below). The
-trade opens the instant all of this holds simultaneously — observation
-does not wait out the full window once conditions are met. If the window
-elapses first, the candidate is discarded.
+...The trade opens the instant all three hold simultaneously —
+observation does not wait out the full window once conditions are met.
+If the window elapses first, the candidate is discarded.
+
+Cross-exchange confirmation (cross_exchange_validator.py) has been
+removed from this decision path. It's still available as a standalone
+module (it reuses the pure functions below), but ObservationWindowManager
+no longer takes or calls one — a candidate's local trend/buy-pressure/
+volume strength passing is now sufficient on its own to open a trade.
 
 Net-aggressive-delta persistence (the old "every slice must agree with
 direction or the whole thing fails" check) has been removed. Its intent
@@ -251,10 +255,6 @@ class ObservationConfig:
     min_volume_expansion_strength_pct: float = 60.0
     volume_expansion_multiplier: float = 1.5  # target growth (back-half vs front-half of the window) for a max volume score
 
-    require_cross_exchange: bool = True
-    min_agreeing_exchanges: int = 4  # display-only (Signal.reasons) -- actual gating threshold lives in CrossExchangeConfig.min_agreeing
-    total_exchanges: int = 7
-
 
 @dataclass
 class CandidateObservation:
@@ -275,10 +275,6 @@ class CandidateObservation:
     volume_strength_pct: float = 0.0
     volume_ok: bool = False
 
-    cross_exchange_ok: bool = False
-    cross_exchange_agreeing: int = 0
-    cross_exchange_reason: str = ""
-
     entry_price: float = 0.0
 
     @property
@@ -291,7 +287,7 @@ class CandidateObservation:
 
     @property
     def all_conditions_met(self) -> bool:
-        return self.local_conditions_met and self.cross_exchange_ok
+        return self.local_conditions_met
 
     def status_line(self) -> str:
         return (
@@ -299,8 +295,7 @@ class CandidateObservation:
             f"elapsed={self.elapsed_sec:.0f}s "
             f"trend={self.trend}:{self.trend_strength_pct:.0f}%({'OK' if self.trend_ok else 'no'}) "
             f"buy_pressure={self.buy_pressure_strength_pct:.0f}%({'OK' if self.buy_pressure_ok else 'no'}) "
-            f"volume={self.volume_strength_pct:.0f}%({'OK' if self.volume_ok else 'no'}) "
-            f"cross_exchange={self.cross_exchange_agreeing}({'OK' if self.cross_exchange_ok else 'no'})"
+            f"volume={self.volume_strength_pct:.0f}%({'OK' if self.volume_ok else 'no'})"
         )
 
 
@@ -317,13 +312,11 @@ class ObservationWindowManager:
         trade_store: TradeStore,
         market_data: MarketDataStore,
         candle_fetcher: CandleFetcher,
-        cross_exchange_validator=None,
         config: Optional[ObservationConfig] = None,
     ) -> None:
         self._trade_store = trade_store
         self._market_data = market_data
         self._candle_fetcher = candle_fetcher
-        self._cross_exchange_validator = cross_exchange_validator
         self.config = config or ObservationConfig()
         self._candidates: Dict[str, CandidateObservation] = {}
         self._lock = asyncio.Lock()
@@ -397,7 +390,6 @@ class ObservationWindowManager:
         if trend == "sideways":
             candidate.buy_pressure_ok = False
             candidate.volume_ok = False
-            candidate.cross_exchange_ok = False
             return None
 
         direction = trend
@@ -406,7 +398,6 @@ class ObservationWindowManager:
         if not trend_ok:
             candidate.buy_pressure_ok = False
             candidate.volume_ok = False
-            candidate.cross_exchange_ok = False
             return None
 
         window_trades = await self._trade_store.get_window(symbol, cfg.window_ms)
@@ -421,18 +412,7 @@ class ObservationWindowManager:
         candidate.volume_ok = volume["strength_pct"] >= cfg.min_volume_expansion_strength_pct
 
         if not candidate.local_conditions_met:
-            candidate.cross_exchange_ok = False
             return None
-
-        if cfg.require_cross_exchange and self._cross_exchange_validator is not None:
-            cx_result = await self._cross_exchange_validator.validate(symbol, direction)
-            candidate.cross_exchange_agreeing = cx_result.agreeing_exchanges
-            candidate.cross_exchange_reason = cx_result.reason or ""
-            candidate.cross_exchange_ok = cx_result.decision == "accepted"
-            if not candidate.cross_exchange_ok:
-                return None
-        else:
-            candidate.cross_exchange_ok = True
 
         candidate.status = "ACCEPTED"
         async with self._lock:
