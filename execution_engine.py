@@ -31,7 +31,7 @@ from typing import Dict, List, Optional
 from okx_futures_client import OKXAPIError, OKXFuturesClient
 from market_data import Signal
 from liquidation_guard import check_liquidation_distance, select_leverage_with_safe_liquidation, estimate_liquidation_price
-from pretrade_validation import validate_take_profit_reachable, validate_liquidation_history
+from pretrade_validation import validate_liquidation_history
 
 log = logging.getLogger("okx_futures.execution")
 
@@ -68,14 +68,11 @@ class ExecutionConfig:
 
     target_stop_loss_usdt: float = 0.9
 
-    enable_tp_reachability_check: bool = True
-    tp_validation_lookback_hours: float = 1.0
-    min_tp_hits_required: int = 1
-    estimated_fee_by_leverage: dict = field(default_factory=lambda: {50: 0.12, 10: 0.02})
-
     enable_liquidation_history_check: bool = True
-    liq_validation_lookback_hours: float = 15.0
+    liq_validation_lookback_hours: float = 5.0
     max_liq_hits_allowed: int = 1
+
+    log_throttle_sec: float = 30.0
 
     candle_bar: str = "5m"
 
@@ -185,9 +182,30 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
 
         self._blacklisted_symbols: Dict[str, OKXAPIError] = {}
 
+        # Repeated per-tick discard/pass logs (liquidation guard, liquidation
+        # history, min order size, etc.) are throttled to at most once per
+        # `config.log_throttle_sec` per (symbol, message-kind) key — the same
+        # symbol can otherwise log the same line dozens of times a minute
+        # while a candidate keeps failing the same check tick after tick.
+        self._last_log_ts: Dict[str, float] = {}
+
     async def open_count(self) -> int:
         async with self._lock:
             return len(self._open_positions)
+
+    def _log_throttled(self, key: str, level: int, msg: str) -> None:
+        """Logs `msg` at `level` only if at least `config.log_throttle_sec`
+        has passed since the last log under this same `key` — collapses
+        the same recurring per-tick line (e.g. one symbol failing the same
+        check over and over) down to one line per throttle window instead
+        of one per tick. Not locked: worst case under concurrent calls for
+        the same key is an extra line or two slipping through, which is
+        fine for a rate-limiting log helper."""
+        now = time.time()
+        last = self._last_log_ts.get(key, 0.0)
+        if now - last >= self.config.log_throttle_sec:
+            self._last_log_ts[key] = now
+            log.log(level, msg)
 
     async def is_blacklisted(self, symbol: str) -> bool:
         """True once the exchange has told us `symbol` can never be
@@ -272,7 +290,8 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
 
         max_leverage_symbol = int(float(contract.get("max_leverage", 0)))
         if max_leverage_symbol < cfg.min_leverage_required:
-            log.info(
+            self._log_throttled(
+                f"{symbol}:max_lev_too_low", logging.INFO,
                 f"[execution] {symbol} max leverage {max_leverage_symbol}x < required "
                 f"{cfg.min_leverage_required}x — signal discarded"
             )
@@ -290,7 +309,8 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         target_leverage = min(target_leverage, max_leverage_symbol)
 
         if target_leverage < cfg.min_leverage_required:
-            log.info(
+            self._log_throttled(
+                f"{symbol}:hardcoded_lev_too_low", logging.INFO,
                 f"[execution] {symbol} {direction.upper()} — hardcoded leverage {target_leverage:.0f}x "
                 f"< required {cfg.min_leverage_required}x — signal discarded"
             )
@@ -300,7 +320,8 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         try:
             mmr = await self._client.get_position_tier_mmr(symbol, cfg.open_type, notional_at_lev)
         except OKXAPIError as exc:
-            log.warning(
+            self._log_throttled(
+                f"{symbol}:mmr_fetch_fail", logging.WARNING,
                 f"[execution] {symbol} {direction.upper()} — could not fetch maintenance margin "
                 f"rate at {target_leverage:.0f}x ({exc}); discarding rather than trading blind"
             )
@@ -314,12 +335,16 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
                 min_distance_pct=cfg.min_liquidation_distance_pct,
             )
             if not liq_check.approved:
-                log.info(f"[execution] {symbol} {direction.upper()} — {liq_check.reason}")
+                self._log_throttled(
+                    f"{symbol}:liq_guard_reject", logging.INFO,
+                    f"[execution] {symbol} {direction.upper()} — {liq_check.reason}"
+                )
                 return None
 
             leverage = liq_check.leverage
             estimated_liq_price = liq_check.liquidation_price
-            log.info(
+            self._log_throttled(
+                f"{symbol}:liq_guard_pass", logging.INFO,
                 f"[execution] {symbol} {direction.upper()} liquidation guard passed at {leverage:.0f}x — "
                 f"est. liq={liq_check.liquidation_price:.8f} "
                 f"({liq_check.distance_pct:.2%} from entry {signal.entry_price})"
@@ -330,41 +355,6 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
 
         notional_usdt = cfg.margin_per_trade_usdt * leverage
 
-        if cfg.enable_tp_reachability_check:
-            estimated_fee = cfg.estimated_fee_by_leverage.get(
-                int(leverage), max(cfg.estimated_fee_by_leverage.values())
-            )
-            try:
-                tp_candles = await self._client.get_candles(
-                    symbol,
-                    bar=cfg.candle_bar,
-                    limit=_candle_limit_for_hours(cfg.tp_validation_lookback_hours, cfg.candle_bar),
-                )
-            except OKXAPIError as exc:
-                log.warning(
-                    f"[execution] {symbol} {direction.upper()} — could not fetch candles for the TP "
-                    f"reachability check ({exc}); discarding rather than trading without this filter"
-                )
-                return None
-
-            tp_result = validate_take_profit_reachable(
-                entry_price=signal.entry_price,
-                direction=direction,
-                target_net_profit_usdt=cfg.target_net_profit_usdt,
-                estimated_fee_usdt=estimated_fee,
-                notional_usdt=notional_usdt,
-                candles=tp_candles,
-                min_hits=cfg.min_tp_hits_required,
-            )
-            if not tp_result.approved:
-                log.info(f"[execution] {symbol} {direction.upper()} — {tp_result.reason}")
-                return None
-            log.info(
-                f"[execution] {symbol} {direction.upper()} TP reachability passed — planned TP "
-                f"{tp_result.planned_tp_price:.8f} reached {tp_result.hits}x in the last "
-                f"{cfg.tp_validation_lookback_hours:.0f}h"
-            )
-
         if cfg.enable_liquidation_history_check:
             try:
                 liq_candles = await self._client.get_candles(
@@ -373,7 +363,8 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
                     limit=_candle_limit_for_hours(cfg.liq_validation_lookback_hours, cfg.candle_bar),
                 )
             except OKXAPIError as exc:
-                log.warning(
+                self._log_throttled(
+                    f"{symbol}:liq_candle_fetch_fail", logging.WARNING,
                     f"[execution] {symbol} {direction.upper()} — could not fetch candles for the "
                     f"liquidation-history check ({exc}); discarding rather than trading without this filter"
                 )
@@ -384,11 +375,16 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
                 direction=direction,
                 candles=liq_candles,
                 max_hits=cfg.max_liq_hits_allowed,
+                lookback_hours=cfg.liq_validation_lookback_hours,
             )
             if not liq_history_result.approved:
-                log.info(f"[execution] {symbol} {direction.upper()} — {liq_history_result.reason}")
+                self._log_throttled(
+                    f"{symbol}:liq_history_reject", logging.INFO,
+                    f"[execution] {symbol} {direction.upper()} — {liq_history_result.reason}"
+                )
                 return None
-            log.info(
+            self._log_throttled(
+                f"{symbol}:liq_history_pass", logging.INFO,
                 f"[execution] {symbol} {direction.upper()} liquidation-history check passed — "
                 f"est. liq {estimated_liq_price:.8f} touched {liq_history_result.hits}x in the last "
                 f"{cfg.liq_validation_lookback_hours:.0f}h"
@@ -398,7 +394,8 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         size_contracts = _round_to_step(qty_base / contract_size, vol_precision, rounding=ROUND_DOWN)
 
         if size_contracts < min_volume:
-            log.info(
+            self._log_throttled(
+                f"{symbol}:min_order_size", logging.INFO,
                 f"[execution] {symbol} minimum order size ({min_volume} contracts) exceeds what "
                 f"${cfg.margin_per_trade_usdt} margin at {leverage}x can buy — signal discarded"
             )
