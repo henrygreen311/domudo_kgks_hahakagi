@@ -401,6 +401,16 @@ class CandidateObservation:
     def elapsed_sec(self) -> float:
         return time.time() - self.started_at
 
+    @property
+    def direction_letter(self) -> str:
+        """Single-letter direction ('L'/'S') for compact per-candidate
+        logging, e.g. tracker.py's periodic watch-summary line. Returns
+        '?' before Step 1 establishes a direction (`direction` starts as
+        "" and stays that way for any candidate whose 30-min trend hasn't
+        cleared yet) rather than making every caller guard against
+        indexing into an empty string themselves."""
+        return self.direction[0].upper() if self.direction else "?"
+
     def status_line(self) -> str:
         base = (
             f"{self.symbol} status={self.status} state={self.state} direction={self.direction.upper() or '-'} "
