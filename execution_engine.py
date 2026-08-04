@@ -32,6 +32,7 @@ from okx_futures_client import OKXAPIError, OKXFuturesClient
 from market_data import Signal
 from liquidation_guard import check_liquidation_distance, select_leverage_with_safe_liquidation, estimate_liquidation_price
 from pretrade_validation import validate_liquidation_history
+from tp_tracker import TPTracker, TPTrackerConfig
 
 log = logging.getLogger("okx_futures.execution")
 
@@ -68,6 +69,15 @@ class ExecutionConfig:
 
     target_stop_loss_usdt: float = 0.9
 
+    # --- Trailing profit floor (see tp_tracker.py) ---
+    # Once a position's peak unrealized profit reaches
+    # trailing_tp_activation_usdt, the stop-loss is walked up to lock in
+    # (peak - trailing_tp_lag_usdt) instead of sitting at the original
+    # loss-side stop. Capped at target_net_profit_usdt, which is where
+    # the original take-profit order already fires on its own.
+    trailing_tp_activation_usdt: float = 0.20
+    trailing_tp_lag_usdt: float = 0.10
+
     enable_liquidation_history_check: bool = True
     liq_validation_lookback_hours: float = 5.0
     max_liq_hits_allowed: int = 1
@@ -90,6 +100,7 @@ class OpenPosition:
     take_profit_price: float
     stop_loss_price: float
     tp_order_id: Optional[str]
+    price_precision: str
     opened_at: float = field(default_factory=time.time)
     last_alert_level: int = 0
     db_id: Optional[int] = None
@@ -179,6 +190,14 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         self._open_positions: Dict[str, OpenPosition] = {}
         self._total_opened = 0
         self._lock = asyncio.Lock()
+
+        self._tp_tracker = TPTracker(
+            TPTrackerConfig(
+                activation_profit_usdt=self.config.trailing_tp_activation_usdt,
+                trail_lag_usdt=self.config.trailing_tp_lag_usdt,
+                final_take_profit_usdt=self.config.target_net_profit_usdt,
+            )
+        )
 
         self._blacklisted_symbols: Dict[str, OKXAPIError] = {}
 
@@ -546,8 +565,11 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
             take_profit_price=take_profit_price,
             stop_loss_price=stop_loss_price,
             tp_order_id=tp_order_id,
+            price_precision=price_precision,
             liq_price=estimated_liq_price,
         )
+
+        await self._tp_tracker.start_tracking(symbol)
 
         if self._position_store is not None:
             position.db_id = await self._position_store.record_open(position)
@@ -663,6 +685,7 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         contract_size: float,
         opening_fee: float,
         price_precision: str,
+        target_net_profit_usdt: Optional[float] = None,
     ) -> float:
         """Take profit is derived entirely from real, exchange-reported
         numbers: the actual filled entry price/size and the actual opening
@@ -671,11 +694,18 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         — no added cushion. A prior version added a slippage buffer here
         (0.20% extra required price move), which pushed the TP price out
         to ~0.30-0.39 USDT of required profit against a $0.07 target,
-        defeating the scalp — removed per explicit instruction."""
+        defeating the scalp — removed per explicit instruction.
+
+        `target_net_profit_usdt` defaults to `config.target_net_profit_usdt`
+        (the original behavior, unchanged) but can be overridden with a
+        smaller value — used by _ratchet_stop_loss to price a tighter
+        profit-lock floor with this exact same fee-aware math, instead of
+        duplicating it."""
         cfg = self.config
+        target = target_net_profit_usdt if target_net_profit_usdt is not None else cfg.target_net_profit_usdt
         estimated_total_fees = opening_fee * 2.0
         notional = size_contracts * contract_size * entry_price
-        required_gross_profit = cfg.target_net_profit_usdt + estimated_total_fees
+        required_gross_profit = target + estimated_total_fees
         price_move_frac = required_gross_profit / notional if notional > 0 else 0.0
 
         if direction == "long":
@@ -764,12 +794,103 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         log.error(f"[execution] failed to place TP/SL for {symbol} after {attempts} attempts: {last_exc}")
         return None
 
+    async def _maybe_ratchet_stop_loss(self, symbol: str, pos: OpenPosition, active: dict) -> None:
+        """Asks the TP tracker (tp_tracker.py) whether the profit-lock
+        floor has moved up since the last check and, if so, replaces the
+        resting stop-loss leg on the exchange with one at the new
+        (tighter) floor. The take-profit leg (pos.take_profit_price) is
+        never touched here — it stays at the original final target the
+        whole time; see tp_tracker.py's module docstring for why this is
+        functionally a trailing STOP despite "TP" in the module name."""
+        try:
+            unrealized_pnl = float(active.get("unrealized_pnl") or 0.0)
+        except (TypeError, ValueError):
+            return
+
+        decision = await self._tp_tracker.update(symbol, unrealized_pnl)
+        if not decision.ratchet:
+            return
+
+        await self._ratchet_stop_loss(symbol, pos, decision.floor_usdt)
+
+    async def _ratchet_stop_loss(self, symbol: str, pos: OpenPosition, new_floor_usdt: float) -> None:
+        new_sl_price = self._compute_take_profit_price(
+            direction=pos.direction,
+            entry_price=pos.entry_price,
+            size_contracts=pos.size_contracts,
+            contract_size=pos.contract_size,
+            opening_fee=pos.opening_fee,
+            price_precision=pos.price_precision,
+            target_net_profit_usdt=new_floor_usdt,
+        )
+        if new_sl_price == pos.stop_loss_price:
+            # Rounds to the same price as what's already resting -- nothing to do.
+            return
+
+        old_algo_id = pos.tp_order_id
+        try:
+            await self._client.cancel_algo_order(symbol, old_algo_id)
+        except OKXAPIError as exc:
+            # Most likely the previous order already triggered (price hit
+            # the prior floor right as this ratchet was about to run) or
+            # was already cancelled some other way. Either way, leave it
+            # alone here rather than treat it as a hard failure — the
+            # normal close-detection in monitor_positions will sort out
+            # what actually happened on its own next tick.
+            log.warning(
+                f"[execution] {symbol} — could not cancel the existing TP/SL order while "
+                f"ratcheting the profit floor to {new_floor_usdt:.4f} USDT ({exc}); leaving "
+                f"the current order in place"
+            )
+            return
+
+        new_algo_id = await self._place_tp_sl(
+            symbol=symbol,
+            direction=pos.direction,
+            take_profit_price=pos.take_profit_price,  # unchanged -- see module docstring in tp_tracker.py
+            stop_loss_price=new_sl_price,
+            size_contracts=pos.size_contracts,
+            price_precision=pos.price_precision,
+        )
+
+        if new_algo_id is None:
+            log.error(
+                f"[execution] {symbol} — profit-floor ratchet cancelled the old TP/SL order but "
+                f"could not place the replacement after retries; flattening the position immediately "
+                f"instead of leaving it unprotected"
+            )
+            close_side = 3 if pos.direction == "long" else 2
+            try:
+                await self._client.submit_order(
+                    symbol=symbol, side=close_side, size=pos.size_contracts, order_type="market"
+                )
+                log.warning(f"[execution] {symbol} — fail-safe close submitted after a failed ratchet")
+            except OKXAPIError as exc:
+                log.error(
+                    f"[execution] {symbol} — fail-safe close ALSO failed after a failed ratchet "
+                    f"({exc}); this position is genuinely unprotected and needs manual attention"
+                )
+            return
+
+        pos.tp_order_id = new_algo_id
+        pos.stop_loss_price = new_sl_price
+        log.info(
+            f"[execution] {symbol} {pos.direction.upper()} profit floor ratcheted — stop-loss moved to "
+            f"{new_sl_price} (locks in ~{new_floor_usdt:.4f} USDT net), take-profit unchanged at "
+            f"{pos.take_profit_price}"
+        )
+
     async def monitor_positions(self) -> None:
         """Checks each tracked position against the exchange. A position with
-        zero remaining size has been closed by its take-profit order or by
-        exchange liquidation — either way, we free the slot. No stop loss and
-        no timeout logic exist here by design: OKX's own liquidation
-        engine is the only thing that can end a losing position.
+        zero remaining size has been closed by its take-profit order, its
+        stop-loss order, or by exchange liquidation — either way, we free
+        the slot. There is no bot-side close/timeout decision here: OKX's
+        own algo orders and liquidation engine are the only things that
+        can end a position. The one exception is the profit-floor ratchet
+        (see _maybe_ratchet_stop_loss / tp_tracker.py) — that only ever
+        moves the resting stop-loss trigger up as profit builds, it never
+        force-closes a position directly except as a fail-safe if a
+        ratchet's replacement order can't be placed.
 
         While a position stays open, it's also checked for a significant
         price move (see `_check_price_alert`) so a trade running against —
@@ -832,8 +953,11 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
                 continue
 
             await self._check_price_alert(symbol, pos, active)
+            await self._maybe_ratchet_stop_loss(symbol, pos, active)
 
     async def _finalize_closed_position(self, symbol: str, closed: OpenPosition) -> None:
+        await self._tp_tracker.stop_tracking(symbol)
+
         exit_price, realized_pnl, closing_fee, close_reason, net_pnl = await self._get_close_details(symbol, closed)
         closed_at = time.time()
 

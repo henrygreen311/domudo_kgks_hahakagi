@@ -36,8 +36,10 @@ few minutes is reading stale context, not a 20-minute one). Every tick:
      accelerating and its volume is expanding (same scored functions as
      before, just fed a much shorter trade-tape window — `window_ms`,
      4 minutes by default instead of 30), AND the live (currently-forming)
-     candle itself agrees with the direction. All three true -> open
-     immediately.
+     candle itself agrees with the direction, AND price is on the correct
+     side of the session VWAP (long wants price above VWAP — buyers
+     paying up, not chasing a spike; short wants price below it). All
+     four true -> open immediately.
 
   3. Anything less than that -> stay OBSERVING, re-checked fresh next
      tick, until `max_observation_minutes` elapses and the candidate is
@@ -222,6 +224,44 @@ def compute_volume_expansion_strength(trades: List[dict], direction: str, bucket
 
 
 # ---------------------------------------------------------------------------
+# VWAP filter — added to guard against entering an already-extended move.
+# Trend + pressure + volume can all agree while price is nonetheless
+# stretched well past where the actual volume in the window traded; VWAP
+# catches that case specifically. Deliberately the ONLY new signal added
+# here — order book depth was considered too (top-5 levels can vanish
+# between being read and an order landing, so it's noisier) and left out
+# until VWAP alone has proven itself in practice.
+# ---------------------------------------------------------------------------
+
+
+def compute_vwap(trades: List[dict]) -> Optional[float]:
+    """Volume-weighted average price across `trades`: sum(price*qty) /
+    sum(qty). Fed the same `window_ms` trade-tape window already used for
+    the pressure/volume checks (4 minutes by default), so this costs no
+    extra fetch. Returns None if there's no volume to weight against,
+    which the caller treats as "can't confirm" rather than a pass."""
+    total_qty = sum(t["qty"] for t in trades)
+    if total_qty <= 0:
+        return None
+    return sum(t["price"] * t["qty"] for t in trades) / total_qty
+
+
+def _vwap_supports_direction(price: float, vwap: Optional[float], direction: str) -> bool:
+    """True if `price` is on the side of `vwap` that direction wants:
+    long wants price trading above VWAP (buyers paying up into strength,
+    not chasing an extended move below where volume actually traded),
+    short wants price below it. A missing VWAP (no volume in the window)
+    never counts as support."""
+    if vwap is None:
+        return False
+    if direction == "long":
+        return price > vwap
+    if direction == "short":
+        return price < vwap
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Forming-candle helper
 # ---------------------------------------------------------------------------
 
@@ -300,6 +340,11 @@ class ObservationConfig:
     min_volume_expansion_strength_pct: float = 55.0
     volume_expansion_multiplier: float = 1.4
 
+    # Require price to be on the correct side of the session VWAP (see
+    # compute_vwap). Kept as a toggle since it's new and unproven —
+    # set False to instantly fall back to the pre-VWAP behavior.
+    require_vwap_confirmation: bool = True
+
     # How many extra candles to fetch beyond bucket_count so there's still
     # bucket_count CLOSED candles even when the newest row is a
     # still-forming candle.
@@ -330,6 +375,9 @@ class CandidateObservation:
     volume_strength_pct: float = 0.0
     volume_ok: bool = False
 
+    vwap: Optional[float] = None
+    vwap_ok: bool = False
+
     entry_price: float = 0.0
 
     @property
@@ -343,12 +391,14 @@ class CandidateObservation:
         return self.direction[0].upper() if self.direction else "?"
 
     def status_line(self) -> str:
+        vwap_text = f"{self.vwap:.6g}" if self.vwap is not None else "-"
         base = (
             f"{self.symbol} status={self.status} direction={self.direction.upper() or '-'} "
             f"elapsed={self.elapsed_sec:.0f}s "
             f"trend={self.trend}:{self.trend_strength_pct:.0f}% "
             f"pressure={self.buy_pressure_strength_pct:.0f}% "
-            f"volume={self.volume_strength_pct:.0f}%"
+            f"volume={self.volume_strength_pct:.0f}% "
+            f"vwap={vwap_text}"
         )
         if not self.data_ready:
             base += " (warming up)"
@@ -494,9 +544,19 @@ class ObservationWindowManager:
         )
         candidate.volume_ok = volume["expanding"] and volume["strength_pct"] >= cfg.min_volume_expansion_strength_pct
 
+        # VWAP, computed from the same window_trades already fetched
+        # above for pressure/volume -- no extra fetch needed.
+        candidate.vwap = compute_vwap(window_trades)
+        candidate.vwap_ok = (
+            _vwap_supports_direction(candidate.entry_price, candidate.vwap, direction)
+            if cfg.require_vwap_confirmation
+            else True
+        )
+
         healthy = (
             candidate.buy_pressure_ok
             and candidate.volume_ok
+            and candidate.vwap_ok
             and _candle_supports_direction(support_candle, direction)
         )
         if healthy:
