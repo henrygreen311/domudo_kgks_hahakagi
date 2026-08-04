@@ -101,6 +101,7 @@ class OpenPosition:
     stop_loss_price: float
     tp_order_id: Optional[str]
     price_precision: str
+    stop_loss_is_profit_lock: bool = False  # True once tp_tracker.py's ratchet has moved stop_loss_price above entry (long) / below entry (short) -- see _ratchet_stop_loss and _infer_close_reason_from_exit_price
     opened_at: float = field(default_factory=time.time)
     last_alert_level: int = 0
     db_id: Optional[int] = None
@@ -874,6 +875,7 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
 
         pos.tp_order_id = new_algo_id
         pos.stop_loss_price = new_sl_price
+        pos.stop_loss_is_profit_lock = True  # from this point on, this position's SL leg sits in profit territory, not loss territory -- see _infer_close_reason_from_exit_price
         log.info(
             f"[execution] {symbol} {pos.direction.upper()} profit floor ratcheted — stop-loss moved to "
             f"{new_sl_price} (locks in ~{new_floor_usdt:.4f} USDT net), take-profit unchanged at "
@@ -1158,17 +1160,31 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         for closes OKX itself didn't already flag as a real liquidation
         (close_type 3-6, checked by the caller first and always
         authoritative) — a coincidental exit near the SL price during an
-        actual liquidation cascade is still reported as "liquidated"."""
+        actual liquidation cascade is still reported as "liquidated".
+
+        IMPORTANT: once tp_tracker.py's ratchet has moved stop_loss_price
+        into profit territory (closed.stop_loss_is_profit_lock — see
+        _ratchet_stop_loss), a fill closer to that price is no longer a
+        real stop-loss and must not be reported as one — it's a real,
+        positive-net-pnl exit, and "stop_loss" would misrepresent a
+        winning trade as a loss in position_history/trade_snapshots.
+        Reported as "trailing_stop" instead in that case. (If either
+        table has a CHECK constraint restricting close_reason to a fixed
+        set of values, "trailing_stop" needs to be added to it before
+        this will write successfully — same caveat position_store.py
+        already notes for net_pnl.)"""
         if exit_price is None or exit_price <= 0:
             return "unknown"
         tp = closed.take_profit_price
         sl = closed.stop_loss_price
         if tp and sl:
-            return "take_profit" if abs(exit_price - tp) <= abs(exit_price - sl) else "stop_loss"
+            if abs(exit_price - tp) <= abs(exit_price - sl):
+                return "take_profit"
+            return "trailing_stop" if closed.stop_loss_is_profit_lock else "stop_loss"
         if tp:
             return "take_profit"
         if sl:
-            return "stop_loss"
+            return "trailing_stop" if closed.stop_loss_is_profit_lock else "stop_loss"
         return "unknown"
 
     async def _resolve_tp_execution_order_id(self, symbol: str, closed: OpenPosition) -> Optional[str]:
