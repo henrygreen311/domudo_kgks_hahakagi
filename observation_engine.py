@@ -340,6 +340,24 @@ class ObservationConfig:
     min_trend_strength_pct: float = 70.0
     min_net_move_pct: float = 0.003  # still require some real overall move, not just a lopsided-but-flat window
 
+    # Pressure/volume strength (dom_pressure/dom_volume/opp_pressure/
+    # opp_volume in evaluate()) are computed from `window_trades` --
+    # live trade prints TradeStore has personally received since THIS
+    # symbol was subscribed, not a stored history. Right after startup
+    # (or right after a symbol newly enters the watchlist) that window
+    # can be seconds old, not `window_ms` (30 min) old -- a handful of
+    # trades can then produce a misleadingly clean 90-100% "strength"
+    # reading purely from small-sample noise. These two floors gate
+    # every pressure/volume-based transition (health/exhaustion/
+    # recovery/reversal) until there's enough real data to trust:
+    # min_data_warmup_sec is deliberately well under
+    # max_observation_minutes*60 (20 min) -- it only has to be enough
+    # accumulated time for the buckets to mean something, not the full
+    # nominal window, or no candidate could ever be accepted before
+    # expiring.
+    min_data_warmup_sec: float = 300.0  # 5 minutes
+    min_data_trade_count: int = 20
+
     min_buy_pressure_strength_pct: float = 70.0
 
     min_volume_expansion_strength_pct: float = 60.0
@@ -378,6 +396,7 @@ class CandidateObservation:
     monitoring: bool = False
     exhausted_side: str = ""  # "long"/"short" -- the direction currently being monitored for recovery vs reversal
     exhaustion_count: int = 0  # ticks spent in MONITORING since the current exhaustion began
+    data_ready: bool = False  # False until enough real trade-tape data has accumulated to trust pressure/volume
 
     trend: str = "sideways"
     trend_strength_pct: float = 0.0
@@ -419,6 +438,8 @@ class CandidateObservation:
             f"pressure={self.buy_pressure_strength_pct:.0f}% "
             f"volume={self.volume_strength_pct:.0f}%"
         )
+        if not self.data_ready:
+            base += " (warming up)"
         if self.monitoring:
             base += f" monitoring_since_ticks={self.exhaustion_count} exhausted_side={self.exhausted_side.upper()}"
         return base
@@ -558,6 +579,24 @@ class ObservationWindowManager:
         opposite = "short" if direction == "long" else "long"
 
         window_trades = await self._trade_store.get_window(symbol, cfg.window_ms)
+        was_ready = candidate.data_ready
+        candidate.data_ready = (
+            candidate.elapsed_sec >= cfg.min_data_warmup_sec
+            and len(window_trades) >= cfg.min_data_trade_count
+        )
+        if candidate.data_ready and not was_ready:
+            log.info(
+                f"[observation] {symbol} data warm-up complete after {candidate.elapsed_sec:.0f}s "
+                f"({len(window_trades)} trades in window) — pressure/volume checks now active"
+            )
+        if not candidate.data_ready:
+            # Not enough real trade-tape history yet to trust a pressure/
+            # volume reading off it -- stay exactly where we are (still
+            # OBSERVING, or still MONITORING if already there) rather
+            # than let a handful of post-subscribe trades masquerade as
+            # a 30-minute strength score and trigger an early open.
+            return None
+
         dom_pressure = compute_buy_pressure_strength(window_trades, direction, cfg.bucket_count)
         dom_volume = compute_volume_expansion_strength(window_trades, direction, cfg.bucket_count, cfg.volume_expansion_multiplier)
         opp_pressure = compute_buy_pressure_strength(window_trades, opposite, cfg.bucket_count)
