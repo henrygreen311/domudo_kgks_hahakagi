@@ -15,6 +15,9 @@ from typing import Deque, Dict, List, Optional, Tuple
 # to the OKX SWAP instId format used everywhere else in this codebase —
 # update this one set, not each caller, if the approved-pairs list changes.
 DEFAULT_SYMBOL_WHITELIST = frozenset({
+    "ETH-USDT-SWAP",
+    "SOL-USDT-SWAP",
+    "DOGE-USDT-SWAP",
     "KAITO-USDT-SWAP",
 })
 
@@ -81,6 +84,46 @@ class MarketDataStore:
     async def symbol_count(self) -> int:
         async with self._lock:
             return len(self._data)
+
+
+class PositionUpdateStore:
+    """Live per-symbol position snapshots pushed by OKX's private
+    'positions' websocket channel — a real-time push feed rather than the
+    REST get_position() poll used elsewhere in this bot.
+
+    Its main purpose is to be the authoritative, lowest-latency source
+    for unrealized_pnl feeding the trailing profit-floor ratchet (see
+    tp_tracker.py / execution_engine.py's _maybe_ratchet_stop_loss) —
+    unlike a locally-computed price-move-times-notional estimate, `upl`
+    here is OKX's own server-side calculation from mark price (which
+    factors in index/funding basis, not just last-trade price), and it
+    arrives the instant OKX recalculates it rather than on a polling
+    cadence.
+
+    Same field shape as OKXFuturesClient.get_position()'s per-row dict
+    (current_amount/mark_price/unrealized_pnl/liquidation_price/
+    avg_price/raw) so any code already handling that REST shape can
+    handle this one identically."""
+
+    def __init__(self) -> None:
+        self._data: Dict[str, dict] = {}
+        self._lock = asyncio.Lock()
+
+    async def apply_update(self, payload: dict) -> None:
+        symbol = payload.get("symbol")
+        if not symbol:
+            return
+        async with self._lock:
+            self._data[symbol] = payload
+
+    async def get(self, symbol: str) -> Optional[dict]:
+        async with self._lock:
+            entry = self._data.get(symbol)
+            return dict(entry) if entry is not None else None
+
+    async def remove(self, symbol: str) -> None:
+        async with self._lock:
+            self._data.pop(symbol, None)
 
 
 class OrderBookStore:
