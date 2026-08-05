@@ -63,20 +63,21 @@ execution_engine.py's own fee-aware price math — only the peak-tracking
 threshold itself is gross. At this position size the difference is a few
 cents, not worth the complexity of reconciling both conventions exactly.
 
-IMPORTANT — call `observe()` from a fast, high-frequency price feed, not
-a slow polling loop. The peak this tracker floors against can only ever
-be as good as what it's shown: fed only from execution_engine.py's
-5-second exchange poll, it structurally misses any spike that builds and
-reverts inside that 5-second gap, which on a fast-scalp bot happens
-often enough to matter -- the floor then ratchets against a stale, lower
-peak than the trade actually reached, and exits for meaingfully less
-than it should. `observe()` is designed be cheap and side-effect-light
-specifically so it's safe to call every tick of a fast price stream
-(e.g. MovementTracker's ~150ms loop) as the primary feed, with a slower
-poll (e.g. execution_engine's own 5-second position check) still safe to
-call alongside it as a fallback -- observe() is a pure running-max, so
-redundant calls from multiple sources are harmless and the more frequent
-source simply dominates.
+IMPORTANT — call `observe()` from a fast, high-frequency feed, not a slow
+polling loop. The peak this tracker floors against can only ever be as
+good as what it's shown: fed only from a 5-second exchange poll, it
+structurally misses any spike that builds and reverts inside that
+5-second gap, which on a fast-scalp bot happens often enough to matter --
+the floor then ratchets against a stale, lower peak than the trade
+actually reached, and exits for meaingfully less than it should.
+`observe()` is designed to be cheap and side-effect-light specifically so
+it's safe to call from multiple sources at once -- it's a pure running-
+max, so redundant calls are harmless and the more frequent/accurate
+source simply dominates. As currently wired (see tracker.py's main()),
+that's OKX's own positions-channel websocket push (primary -- arrives
+the instant OKX recalculates its own server-side unrealized_pnl) plus a
+5-second REST poll as a fallback -- both genuinely OKX's own number, by
+deliberate choice, rather than any locally-computed price-based estimate.
 """
 
 import asyncio

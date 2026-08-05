@@ -7,17 +7,7 @@ from datetime import datetime
 from typing import Deque, Dict, List, Optional, Tuple
 
 
-# Only these pairs may ever be ranked/watchlisted/traded — anything else the
-# exchange feed surfaces (random altcoins, new listings, etc.) gets filtered
-# out here and again as a hard backstop in
-# ObservationWindowManager.sync_watchlist() (observation_engine.py, which
-# imports this same constant). Mapped from the user's "ETH/USDT" etc. list
-# to the OKX SWAP instId format used everywhere else in this codebase —
-# update this one set, not each caller, if the approved-pairs list changes.
 DEFAULT_SYMBOL_WHITELIST = frozenset({
-    "ETH-USDT-SWAP",
-    "SOL-USDT-SWAP",
-    "DOGE-USDT-SWAP",
     "KAITO-USDT-SWAP",
 })
 

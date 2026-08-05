@@ -194,12 +194,15 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         self._lock = asyncio.Lock()
 
         # Accepts an externally-constructed tracker so tracker.py's main()
-        # can share ONE instance between this engine and MovementTracker
-        # -- MovementTracker's ~150ms loop is the primary feed for peak
-        # detection (see tp_tracker.py / MovementTracker.run_forever for
-        # why that matters), this engine's own 5-second poll below is a
-        # slower fallback. Falls back to building its own if none is
-        # given, so this class still works standalone.
+        # can share ONE instance across every peak-observing source.
+        # Deliberately fed ONLY by OKX's own server-computed
+        # unrealized_pnl (upl) -- run_private's positions-channel push
+        # (primary, arrives the instant OKX recalculates) and this
+        # engine's own 5-second REST poll below (fallback). NOT fed by
+        # MovementTracker's locally price-derived estimate -- see
+        # tracker.py's main() for why that source was deliberately left
+        # out of this tracker's wiring. Falls back to building its own if
+        # none is given, so this class still works standalone.
         self._tp_tracker = tp_tracker or TPTracker(
             TPTrackerConfig(
                 activation_profit_usdt=self.config.trailing_tp_activation_usdt,
@@ -804,18 +807,22 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         return None
 
     async def _maybe_ratchet_stop_loss(self, symbol: str, pos: OpenPosition, active: dict) -> None:
-        """Feeds the TP tracker (tp_tracker.py) this 5-second poll's
-        unrealized_pnl as a fallback observation (works even if
-        MovementTracker isn't wired up), then checks whether any
-        observation so far — including MovementTracker's much
-        higher-frequency ~150ms feed, which is the primary source and
-        catches brief spikes this 5-second poll would miss entirely — has
-        produced a new floor that's ready to be acted on. If so, replaces
-        the resting stop-loss leg on the exchange with one at that floor.
-        The take-profit leg (pos.take_profit_price) is never touched here
-        — it stays at the original final target the whole time; see
-        tp_tracker.py's module docstring for why this is functionally a
-        trailing STOP despite "TP" in the module name."""
+        """Feeds the TP tracker (tp_tracker.py) this 5-second REST poll's
+        unrealized_pnl (OKX's own `upl`, from get_position()) as a
+        fallback observation, then checks whether any observation so far
+        — including run_private's positions-channel websocket push,
+        which is the primary source since it arrives the instant OKX
+        recalculates rather than on this poll's 5-second cadence — has
+        produced a new floor that's ready to be acted on. Both sources
+        feeding this tracker are genuinely OKX's own server-computed
+        number; MovementTracker's locally price-derived estimate is
+        deliberately NOT wired into this tracker (see tracker.py's
+        main()). If so, replaces the resting stop-loss leg on the
+        exchange with one at that floor. The take-profit leg
+        (pos.take_profit_price) is never touched here — it stays at the
+        original final target the whole time; see tp_tracker.py's module
+        docstring for why this is functionally a trailing STOP despite
+        "TP" in the module name."""
         try:
             unrealized_pnl = float(active.get("unrealized_pnl") or 0.0)
         except (TypeError, ValueError):
