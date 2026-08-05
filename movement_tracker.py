@@ -485,12 +485,20 @@ class MovementTracker:
         market_data,
         snapshot_store: Optional[TradeSnapshotStore] = None,
         config: Optional[MovementTrackerConfig] = None,
+        tp_tracker: Optional[Any] = None,
     ) -> None:
         self._market_data = market_data
         self._store = snapshot_store
         self.config = config or MovementTrackerConfig()
         self._trades: Dict[str, TrackedTrade] = {}
         self._lock = asyncio.Lock()
+        # Duck-typed (only .observe(symbol, pnl_usdt) is ever called) to
+        # avoid a circular import with tp_tracker.py, same reasoning as
+        # `position` being duck-typed in start_tracking below. Optional so
+        # this class works standalone even if the ratchet feature isn't
+        # wired up -- see run_forever's docstring for why feeding it here,
+        # at this loop's ~150ms cadence, matters.
+        self._tp_tracker = tp_tracker
 
     async def start_tracking(self, position: Any) -> None:
         """`position` is an execution_engine.OpenPosition (duck-typed here
@@ -567,7 +575,19 @@ class MovementTracker:
         """Background loop — start this once as its own asyncio task. Ticks
         every `tick_interval_sec`, updates every currently-tracked trade
         from MarketDataStore, and throttles actual DB writes to
-        `db_snapshot_interval_sec` per trade."""
+        `db_snapshot_interval_sec` per trade.
+
+        This is also the PRIMARY feed for the trailing profit-floor
+        ratchet (tp_tracker.py), when one is wired in via the constructor:
+        every trade gets tp_tracker.observe() called at this loop's
+        ~150ms cadence, using the exact same unrealized_pnl_usdt figure
+        already being computed for the trade_snapshots DB row. This
+        matters because execution_engine.py's own position-monitor loop
+        only polls the exchange every 5 seconds — far too coarse to catch
+        a peak that spikes and reverts within that gap, which on a fast
+        scalp happens often enough to matter. Feeding the ratchet from
+        this loop instead means it floors against what the trade actually
+        reached, not against whatever a 5-second poll happened to sample."""
         while True:
             await asyncio.sleep(self.config.tick_interval_sec)
             async with self._lock:
@@ -593,6 +613,12 @@ class MovementTracker:
                     continue
 
                 trade.apply_tick(float(price), now, self.config.timeline_max_points)
+
+                if self._tp_tracker is not None:
+                    try:
+                        await self._tp_tracker.observe(symbol, trade.unrealized_pnl_usdt(trade.current_price))
+                    except Exception:
+                        log.exception(f"[movement-tracker] tp_tracker.observe failed for {symbol}")
 
                 if self._store is not None and now - trade.last_db_snapshot_at >= self.config.db_snapshot_interval_sec:
                     trade.last_db_snapshot_at = now

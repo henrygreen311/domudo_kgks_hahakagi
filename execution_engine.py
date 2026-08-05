@@ -183,6 +183,7 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         config: Optional[ExecutionConfig] = None,
         position_store=None,
         movement_tracker=None,
+        tp_tracker: Optional[TPTracker] = None,
     ) -> None:
         self._client = client
         self.config = config or ExecutionConfig()
@@ -192,7 +193,14 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         self._total_opened = 0
         self._lock = asyncio.Lock()
 
-        self._tp_tracker = TPTracker(
+        # Accepts an externally-constructed tracker so tracker.py's main()
+        # can share ONE instance between this engine and MovementTracker
+        # -- MovementTracker's ~150ms loop is the primary feed for peak
+        # detection (see tp_tracker.py / MovementTracker.run_forever for
+        # why that matters), this engine's own 5-second poll below is a
+        # slower fallback. Falls back to building its own if none is
+        # given, so this class still works standalone.
+        self._tp_tracker = tp_tracker or TPTracker(
             TPTrackerConfig(
                 activation_profit_usdt=self.config.trailing_tp_activation_usdt,
                 trail_lag_usdt=self.config.trailing_tp_lag_usdt,
@@ -796,19 +804,27 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         return None
 
     async def _maybe_ratchet_stop_loss(self, symbol: str, pos: OpenPosition, active: dict) -> None:
-        """Asks the TP tracker (tp_tracker.py) whether the profit-lock
-        floor has moved up since the last check and, if so, replaces the
-        resting stop-loss leg on the exchange with one at the new
-        (tighter) floor. The take-profit leg (pos.take_profit_price) is
-        never touched here — it stays at the original final target the
-        whole time; see tp_tracker.py's module docstring for why this is
-        functionally a trailing STOP despite "TP" in the module name."""
+        """Feeds the TP tracker (tp_tracker.py) this 5-second poll's
+        unrealized_pnl as a fallback observation (works even if
+        MovementTracker isn't wired up), then checks whether any
+        observation so far — including MovementTracker's much
+        higher-frequency ~150ms feed, which is the primary source and
+        catches brief spikes this 5-second poll would miss entirely — has
+        produced a new floor that's ready to be acted on. If so, replaces
+        the resting stop-loss leg on the exchange with one at that floor.
+        The take-profit leg (pos.take_profit_price) is never touched here
+        — it stays at the original final target the whole time; see
+        tp_tracker.py's module docstring for why this is functionally a
+        trailing STOP despite "TP" in the module name."""
         try:
             unrealized_pnl = float(active.get("unrealized_pnl") or 0.0)
         except (TypeError, ValueError):
-            return
+            unrealized_pnl = None
 
-        decision = await self._tp_tracker.update(symbol, unrealized_pnl)
+        if unrealized_pnl is not None:
+            await self._tp_tracker.observe(symbol, unrealized_pnl)
+
+        decision = await self._tp_tracker.peek(symbol)
         if not decision.ratchet:
             return
 
@@ -825,7 +841,12 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
             target_net_profit_usdt=new_floor_usdt,
         )
         if new_sl_price == pos.stop_loss_price:
-            # Rounds to the same price as what's already resting -- nothing to do.
+            # Rounds to the same exchange price as what's already resting
+            # (price-tick precision) -- no exchange action needed, but
+            # still commit so peek() doesn't keep re-suggesting this same
+            # no-op ratchet every cycle until a larger move produces an
+            # actually-different price.
+            await self._tp_tracker.commit(symbol, new_floor_usdt)
             return
 
         old_algo_id = pos.tp_order_id
@@ -876,6 +897,7 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         pos.tp_order_id = new_algo_id
         pos.stop_loss_price = new_sl_price
         pos.stop_loss_is_profit_lock = True  # from this point on, this position's SL leg sits in profit territory, not loss territory -- see _infer_close_reason_from_exit_price
+        await self._tp_tracker.commit(symbol, new_floor_usdt)
         log.info(
             f"[execution] {symbol} {pos.direction.upper()} profit floor ratcheted — stop-loss moved to "
             f"{new_sl_price} (locks in ~{new_floor_usdt:.4f} USDT net), take-profit unchanged at "
