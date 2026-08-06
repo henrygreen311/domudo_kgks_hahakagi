@@ -293,6 +293,11 @@ class MovementAnalyzer:
         total = efficiency_pts + drawdown_pts + underwater_pts + speed_pts + smoothness_pts
         return round(max(0.0, min(100.0, total)), 1)
 
+    # Thresholds (USDT, against trade.max_unrealized_loss_usdt's magnitude)
+    # for classify_entry_quality below.
+    GOOD_ENTRY_MAX_LOSS_USDT = 0.2
+    AVERAGE_ENTRY_MAX_LOSS_USDT = 0.4
+
     @staticmethod
     def classify_entry_quality(
         trade: TrackedTrade,
@@ -300,53 +305,22 @@ class MovementAnalyzer:
         close_reason: str,
         duration_sec: float,
     ) -> str:
-        """Rule-based, heuristic, and deliberately simple to extend. Judges
-        the *journey*, not just the win/loss outcome — see module docstring
-        examples this mirrors: Excellent Entry, Good Entry, Average Entry,
-        Poor Entry, Lucky Win, Late Entry, Early Exit."""
-        if net_pnl is None:
-            return "Unknown"
+        """Flat 3-tier rule based purely on how much unrealized loss the
+        trade weathered at its worst point (trade.max_unrealized_loss_usdt,
+        a >=0 magnitude in USDT — this is the same number shown as
+        "Max Unreal. Loss" on the dashboard). Doesn't look at the outcome,
+        duration, or shape of the move at all — just that one number:
 
-        # An immediate hard move against the position, regardless of how
-        # it eventually closed, is the signature of a bad entry timing.
-        early_window = max(5.0, 0.10 * duration_sec) if duration_sec > 0 else 5.0
-        entered_hard_against = any(
-            pct <= -0.003 and elapsed <= early_window for elapsed, pct in trade.timeline
-        )
-
-        if close_reason == "manual_close" and trade.max_favorable_excursion_pct > 0:
-            left_on_table = trade.max_favorable_excursion_pct - max(0.0, net_pnl / trade.notional_usdt if trade.notional_usdt else 0.0)
-            if left_on_table >= 0.5 * trade.max_favorable_excursion_pct:
-                return "Early Exit"
-
-        won = net_pnl > 0
-
-        if won:
-            if duration_sec > 0 and trade.time_losing_sec >= 0.5 * duration_sec:
-                return "Lucky Win"
-            quick_profit = (
-                trade.time_to_first_profit_sec is not None
-                and trade.time_to_first_profit_sec <= early_window
-            )
-            if trade.max_drawdown_pct <= 0.0015 and quick_profit:
-                return "Excellent Entry"
-            if trade.max_drawdown_pct <= 0.005:
-                return "Good Entry"
+          <= GOOD_ENTRY_MAX_LOSS_USDT (0.2)    -> "Good Entry"
+          <= AVERAGE_ENTRY_MAX_LOSS_USDT (0.4) -> "Average Entry"
+          above that                            -> "Lucky Win"
+        """
+        max_loss = trade.max_unrealized_loss_usdt
+        if max_loss <= MovementAnalyzer.GOOD_ENTRY_MAX_LOSS_USDT:
+            return "Good Entry"
+        if max_loss <= MovementAnalyzer.AVERAGE_ENTRY_MAX_LOSS_USDT:
             return "Average Entry"
-
-        # Loss
-        if entered_hard_against:
-            return "Poor Entry"
-        if (
-            trade.max_favorable_excursion_pct > 0
-            and trade.max_drawdown_pct >= 0.8 * trade.max_favorable_excursion_pct
-            and trade.seconds_until_max_profit <= early_window
-        ):
-            # Reached a decent favorable move early, then gave almost all
-            # of it back — the classic signature of entering right as the
-            # move was already ending.
-            return "Late Entry"
-        return "Poor Entry"
+        return "Lucky Win"
 
 
 # ---------------------------------------------------------------------------
