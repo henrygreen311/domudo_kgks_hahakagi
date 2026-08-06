@@ -785,6 +785,39 @@ class OKXFuturesClient:
             raise last_exc
         return None
 
+    async def get_pending_algo_order(self, symbol: str, algo_id: str) -> Optional[dict]:
+        """Reads back a currently-live (not yet triggered) algo order's
+        own parameters via /api/v5/trade/orders-algo-pending. Deliberately
+        NOT the same endpoint as get_algo_order_status (which queries
+        orders-algo-history, a historical index documented there to lag a
+        couple of seconds behind an order that was just created) — this
+        queries the live pending-order book directly, so a just-placed
+        order's actual accepted slTriggerPx/tpTriggerPx are readable
+        immediately, with no indexing delay. This is the source of truth
+        for confirming what OKX actually has resting right now, used by
+        execution_engine.py's _ratchet_stop_loss verification loop.
+
+        Returns None if the order isn't found pending — e.g. it already
+        triggered in the moment between being placed and this being
+        called, or genuinely doesn't exist. Callers should treat that as
+        "can't verify right now", not as an error."""
+        data = await self._request(
+            "GET",
+            "/api/v5/trade/orders-algo-pending",
+            params={"instType": INST_TYPE, "ordType": "oco", "algoId": str(algo_id), "instId": symbol},
+            auth=True,
+        )
+        rows = data or []
+        row = rows[0] if rows else None
+        if not row:
+            return None
+        return {
+            "sl_trigger_price": row.get("slTriggerPx"),
+            "tp_trigger_price": row.get("tpTriggerPx"),
+            "state": row.get("state"),
+            "raw": row,
+        }
+
     async def cancel_algo_order(self, symbol: str, algo_id: str) -> dict:
         """Cancels a pending TP algo order (e.g. before manually closing a
         position). Not present on the old BitMart client's public surface,

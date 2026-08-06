@@ -28,6 +28,36 @@ class PositionHistoryStore:
     def __init__(self, supabase_client) -> None:
         self._sb = supabase_client
 
+    async def get_open_rows(self) -> list:
+        """Every row still marked status="open" — used at startup
+        (execution_engine.py's reconcile_from_store) to check each one
+        against what OKX actually shows, since a bot restart (crash,
+        redeploy, manual stop) while a trade was live otherwise leaves it
+        stuck open in the DB forever with nothing watching it."""
+        try:
+            result = await asyncio.to_thread(
+                lambda: self._sb.table(TABLE).select("*").eq("status", "open").execute()
+            )
+        except Exception:
+            log.exception("[position-store] failed to fetch open rows for startup reconciliation")
+            return []
+        return getattr(result, "data", None) or []
+
+    async def count_all(self) -> int:
+        """Total row count across the table's whole history (open +
+        closed, all-time) — used to reseed the bot's lifetime trade
+        counter at startup so max_total_trades is genuinely respected
+        across restarts, instead of resetting to 0 every time the
+        process restarts."""
+        try:
+            result = await asyncio.to_thread(
+                lambda: self._sb.table(TABLE).select("id", count="exact").execute()
+            )
+        except Exception:
+            log.exception("[position-store] failed to count rows for startup reconciliation")
+            return 0
+        return getattr(result, "count", None) or 0
+
     async def record_open(self, position) -> Optional[int]:
         """Inserts a row for a freshly opened position and returns its id,
         which is later passed to `record_close`."""
