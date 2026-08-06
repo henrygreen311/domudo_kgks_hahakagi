@@ -1283,6 +1283,8 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         opening_fee = float(row.get("opening_fee") or 0)
         stop_loss_is_profit_lock = self._infer_stop_loss_is_profit_lock(direction, entry_price, stop_loss_price)
 
+        opened_at = self._parse_stored_opened_at(row)
+
         # Duck-typed stand-in for the OpenPosition _get_close_details (and
         # its _infer_close_reason_from_exit_price /
         # _get_close_details_from_fills fallback) actually read from —
@@ -1290,7 +1292,7 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         stand_in = SimpleNamespace(
             symbol=symbol,
             direction=direction,
-            opened_at=self._parse_stored_opened_at(row),
+            opened_at=opened_at,
             opening_fee=opening_fee,
             take_profit_price=take_profit_price,
             stop_loss_price=stop_loss_price,
@@ -1307,13 +1309,15 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
                 f"for any liquidation penalty"
             )
 
+        closed_at = time.time()
+
         await position_store.record_close(
             row_id=row.get("id"),
             exit_price=exit_price,
             realized_pnl=realized_pnl,
             closing_fee=closing_fee,
             close_reason=close_reason,
-            closed_at=time.time(),
+            closed_at=closed_at,
             net_pnl=net_pnl,
         )
 
@@ -1322,6 +1326,43 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
             f"it already closed — backfilled from OKX history (exit={exit_price}, realized_pnl={realized_pnl}, "
             f"net_pnl={net_pnl}, reason={close_reason}) and marked closed"
         )
+
+        # This row closed entirely before this bot process started, so it
+        # was never registered with MovementTracker via start_tracking
+        # (unlike _resume_open_row's still-open case above) — meaning
+        # stop_tracking would otherwise silently no-op (nothing tracked
+        # for this symbol) and trade_snapshots would never get a row for
+        # it. Feed it through a start/stop pair here purely so the final
+        # summary gets written; there's no live price history to replay,
+        # so movement stats (MFE/MAE/timeline) reflect this single
+        # backfilled data point rather than the trade's real path.
+        if self._movement_tracker is not None:
+            try:
+                mt_stand_in = SimpleNamespace(
+                    symbol=symbol,
+                    direction=direction,
+                    entry_price=entry_price,
+                    take_profit_price=take_profit_price,
+                    contract_size=float(row.get("contract_size") or 0),
+                    size_contracts=float(row.get("size_contracts") or 0),
+                    opened_at=opened_at,
+                    db_id=row.get("id"),
+                )
+                await self._movement_tracker.start_tracking(mt_stand_in)
+                await self._movement_tracker.stop_tracking(
+                    symbol,
+                    exit_price=exit_price,
+                    realized_pnl=realized_pnl,
+                    closing_fee=closing_fee,
+                    net_pnl=net_pnl,
+                    close_reason=close_reason,
+                    closed_at=closed_at,
+                )
+            except Exception:
+                log.exception(
+                    f"[startup] {symbol} — failed to backfill trade_snapshots for row {row.get('id')} "
+                    f"(position_history backfill above already succeeded)"
+                )
 
     async def _finalize_closed_position(self, symbol: str, closed: OpenPosition) -> None:
         await self._tp_tracker.stop_tracking(symbol)
