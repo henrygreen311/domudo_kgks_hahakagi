@@ -368,6 +368,30 @@ class TradeSnapshotStore:
     def __init__(self, supabase_client) -> None:
         self._sb = supabase_client
 
+    async def get_row_id_for_trade(self, trade_id: Optional[int]) -> Optional[int]:
+        """Looks up the single existing trade_snapshots row for this
+        trade_id, if one already exists — e.g. a snapshot written by a
+        previous bot process before a restart, for a trade that's now
+        being re-registered via MovementTracker.start_tracking (see
+        execution_engine.py's _resume_open_row / _backfill_closed_row).
+        Without this, start_tracking always begins from
+        last_snapshot_row_id=None, and the later insert-or-update in
+        update_snapshot/write_final_summary would insert a brand new row
+        instead of continuing to update the trade's one true row —
+        exactly the "one row per trade" invariant this table is supposed
+        to hold (see update_snapshot's docstring)."""
+        if trade_id is None:
+            return None
+        try:
+            result = await asyncio.to_thread(
+                lambda: self._sb.table(TABLE).select("id").eq("trade_id", trade_id).limit(1).execute()
+            )
+        except Exception:
+            log.exception(f"[movement-tracker] failed to look up existing snapshot row for trade_id={trade_id}")
+            return None
+        data = getattr(result, "data", None) or []
+        return data[0].get("id") if data else None
+
     async def insert_snapshot(self, trade: TrackedTrade) -> Optional[int]:
         row = {
             "trade_id": trade.trade_id,
@@ -507,6 +531,20 @@ class MovementTracker:
             size_contracts=position.size_contracts,
             opened_at=position.opened_at,
         )
+
+        # Re-registering a trade this process didn't itself open (a
+        # still-open position resumed after a restart, or an
+        # already-closed one being backfilled — see
+        # execution_engine.py's reconcile_from_store) would otherwise
+        # always start from last_snapshot_row_id=None and insert a
+        # duplicate row on the first write. Reuse the existing row for
+        # this trade_id if one's already there.
+        if self._store is not None and trade.trade_id is not None:
+            try:
+                trade.last_snapshot_row_id = await self._store.get_row_id_for_trade(trade.trade_id)
+            except Exception:
+                log.exception(f"[movement-tracker] failed to check for an existing snapshot row for {position.symbol}")
+
         async with self._lock:
             self._trades[position.symbol] = trade
         log.info(f"[movement-tracker] now tracking {position.symbol} ({position.direction}) from entry={position.entry_price}")
