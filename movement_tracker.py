@@ -305,22 +305,30 @@ class MovementAnalyzer:
         close_reason: str,
         duration_sec: float,
     ) -> str:
-        """Flat 3-tier rule based purely on how much unrealized loss the
-        trade weathered at its worst point (trade.max_unrealized_loss_usdt,
-        a >=0 magnitude in USDT — this is the same number shown as
-        "Max Unreal. Loss" on the dashboard). Doesn't look at the outcome,
-        duration, or shape of the move at all — just that one number:
+        """Tiered rule based on how much unrealized loss the trade weathered
+        at its worst point (trade.max_unrealized_loss_usdt, a >=0 magnitude
+        in USDT — this is the same number shown as "Max Unreal. Loss" on
+        the dashboard), refined by outcome once that loss is large:
 
           <= GOOD_ENTRY_MAX_LOSS_USDT (0.2)    -> "Good Entry"
           <= AVERAGE_ENTRY_MAX_LOSS_USDT (0.4) -> "Average Entry"
-          above that                            -> "Lucky Win"
+          above that, and it still closed profitably -> "Lucky Win"
+          above that, and it closed at a loss         -> "Bad Entry"
+
+        The outcome check only kicks in above the Average Entry threshold:
+        a trade that dug a deep hole and recovered to a real profit earned
+        that via luck, not entry quality — but one that dug the same hole
+        and then actually lost (e.g. stop_loss) is a bad entry, not a win
+        of any kind.
         """
         max_loss = trade.max_unrealized_loss_usdt
         if max_loss <= MovementAnalyzer.GOOD_ENTRY_MAX_LOSS_USDT:
             return "Good Entry"
         if max_loss <= MovementAnalyzer.AVERAGE_ENTRY_MAX_LOSS_USDT:
             return "Average Entry"
-        return "Lucky Win"
+        if net_pnl is not None and net_pnl > 0:
+            return "Lucky Win"
+        return "Bad Entry"
 
 
 # ---------------------------------------------------------------------------
