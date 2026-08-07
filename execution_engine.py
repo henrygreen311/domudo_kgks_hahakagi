@@ -77,6 +77,14 @@ class ExecutionConfig:
     # (peak - trailing_tp_lag_usdt) instead of sitting at the original
     # loss-side stop. Capped at target_net_profit_usdt, which is where
     # the original take-profit order already fires on its own.
+    #
+    # Set enable_trailing_tp=False to turn this whole feature off without
+    # touching tp_tracker.py itself: maybe_ratchet_stop_loss_for and
+    # _maybe_ratchet_stop_loss both become no-ops, so every position just
+    # rides its original fixed stop-loss/take-profit from open to close,
+    # exactly as if tp_tracker.py didn't exist. See tracker.py's
+    # TP_TRACKER_ENABLED for the single switch that controls this.
+    enable_trailing_tp: bool = True
     trailing_tp_activation_usdt: float = 0.20
     trailing_tp_lag_usdt: float = 0.10
 
@@ -206,6 +214,24 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         self._total_opened = 0
         self._lock = asyncio.Lock()
 
+        # One lock per symbol with an open position, guarding the entire
+        # peek->cancel->place->commit ratchet sequence in
+        # _ratchet_stop_loss. Without this, the positions-websocket push
+        # (run_private, fires the instant OKX recalculates -- can be
+        # several times a second during a fast move) and the 5-second
+        # monitor_positions() poll fallback could both see
+        # tp_tracker.peek() return ratchet=True for the same symbol at
+        # nearly the same moment and both start ratcheting concurrently.
+        # The second call would read pos.tp_order_id before the first had
+        # finished replacing it, then try to cancel an order that was
+        # already gone -- exactly the "already filled, canceled or does
+        # not exist" (sCode=51400) errors this was built to eliminate,
+        # and in the worst case two interleaved cancel/place calls could
+        # leave pos.tp_order_id and the exchange's actual resting order
+        # out of sync entirely, which is what produced the follow-on
+        # sCode=51280 rejection and fail-safe flatten.
+        self._ratchet_locks: Dict[str, asyncio.Lock] = {}
+
         # Accepts an externally-constructed tracker so tracker.py's main()
         # can share ONE instance across every peak-observing source.
         # Deliberately fed ONLY by OKX's own server-computed
@@ -232,6 +258,13 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         # symbol can otherwise log the same line dozens of times a minute
         # while a candidate keeps failing the same check tick after tick.
         self._last_log_ts: Dict[str, float] = {}
+
+    def _get_ratchet_lock(self, symbol: str) -> asyncio.Lock:
+        lock = self._ratchet_locks.get(symbol)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._ratchet_locks[symbol] = lock
+        return lock
 
     async def open_count(self) -> int:
         async with self._lock:
@@ -835,15 +868,39 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         collapses that gap to effectively zero. monitor_positions()'s own
         5-second call into _maybe_ratchet_stop_loss remains as a fallback
         sweep (harmless and cheap if this already handled it — peek()
-        just returns ratchet=False)."""
+        just returns ratchet=False).
+
+        Skips entirely, with no exchange calls at all, if
+        config.enable_trailing_tp is False — see tracker.py's
+        TP_TRACKER_ENABLED."""
+        if not self.config.enable_trailing_tp:
+            return
         async with self._lock:
             pos = self._open_positions.get(symbol)
         if pos is None:
             return
-        decision = await self._tp_tracker.peek(symbol)
-        if not decision.ratchet:
+
+        lock = self._get_ratchet_lock(symbol)
+        if lock.locked():
+            # Another observation of this same symbol (the 5-second poll
+            # fallback, or a second websocket push arriving before the
+            # first finished) is already mid-ratchet. Skip rather than
+            # queue behind it — see this engine's __init__ for why
+            # queuing here was the actual bug. Whatever new peak this
+            # observation represents was already folded into
+            # tp_tracker's running max via observe() below, so the
+            # in-flight ratchet's own next peek() (or the very next call
+            # here once it's done) will pick it up -- the caller's
+            # observe() call already folded this observation's peak into
+            # tp_tracker's running max before this method was reached,
+            # so nothing about the peak itself is lost by skipping here.
             return
-        await self._ratchet_stop_loss(symbol, pos, decision.floor_usdt)
+
+        async with lock:
+            decision = await self._tp_tracker.peek(symbol)
+            if not decision.ratchet:
+                return
+            await self._ratchet_stop_loss(symbol, pos, decision.floor_usdt)
 
     async def _maybe_ratchet_stop_loss(self, symbol: str, pos: OpenPosition, active: dict) -> None:
         """Feeds the TP tracker (tp_tracker.py) this 5-second REST poll's
@@ -861,7 +918,14 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         (pos.take_profit_price) is never touched here — it stays at the
         original final target the whole time; see tp_tracker.py's module
         docstring for why this is functionally a trailing STOP despite
-        "TP" in the module name."""
+        "TP" in the module name.
+
+        Skips entirely, with no exchange calls at all, if
+        config.enable_trailing_tp is False — see tracker.py's
+        TP_TRACKER_ENABLED."""
+        if not self.config.enable_trailing_tp:
+            return
+
         try:
             unrealized_pnl = float(active.get("unrealized_pnl") or 0.0)
         except (TypeError, ValueError):
@@ -870,11 +934,20 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         if unrealized_pnl is not None:
             await self._tp_tracker.observe(symbol, unrealized_pnl)
 
-        decision = await self._tp_tracker.peek(symbol)
-        if not decision.ratchet:
+        lock = self._get_ratchet_lock(symbol)
+        if lock.locked():
+            # See maybe_ratchet_stop_loss_for's matching check -- the
+            # websocket push handler is almost certainly the one holding
+            # this right now, since it fires far more often. This poll
+            # is only a fallback anyway; skip this cycle rather than
+            # race it.
             return
 
-        await self._ratchet_stop_loss(symbol, pos, decision.floor_usdt)
+        async with lock:
+            decision = await self._tp_tracker.peek(symbol)
+            if not decision.ratchet:
+                return
+            await self._ratchet_stop_loss(symbol, pos, decision.floor_usdt)
 
     def _price_to_net_profit(
         self,
@@ -1173,13 +1246,54 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
 
         log.info(f"[startup] reconciling {len(rows)} open position_history row(s) against OKX (lifetime trades so far: {self._total_opened})...")
 
+        # More than one row marked status="open" for the SAME symbol
+        # means either (a) a genuine bug wrote position_history twice for
+        # one real trade, or (b) two bot processes really did each open
+        # their own real position on the same pair around the same time
+        # (e.g. overlapping runs of this bot, both passing the exchange-
+        # level pre-open check in _open_position because neither one's
+        # order had filled yet when the other one checked). Either way,
+        # OKX itself only ever shows ONE net position per symbol, so this
+        # engine can only actively track one OpenPosition per symbol too
+        # -- silently letting the loop below process both, one after the
+        # other, would just overwrite _open_positions[symbol] with
+        # whichever row came last while leaving BOTH database rows stuck
+        # at status="open" forever (since only _resume_open_row /
+        # _backfill_closed_row change that, and only for the row they
+        # were actually called with). That silent overwrite, with no
+        # trace left behind, is what made two identical-looking "open"
+        # cards show up on the dashboard even though only one was truly
+        # still being managed. Surface it loudly instead.
+        rows_by_symbol: Dict[str, List[dict]] = {}
         for row in rows:
-            symbol = row.get("symbol")
-            row_id = row.get("id")
+            rows_by_symbol.setdefault(row.get("symbol"), []).append(row)
+
+        for symbol, symbol_rows in rows_by_symbol.items():
             if not symbol:
-                log.warning(f"[startup] position_history row {row_id} has no symbol — skipping")
+                for row in symbol_rows:
+                    log.warning(f"[startup] position_history row {row.get('id')} has no symbol — skipping")
                 continue
 
+            if len(symbol_rows) > 1:
+                symbol_rows.sort(key=lambda r: self._parse_stored_opened_at(r), reverse=True)
+                newest, *duplicates = symbol_rows
+                log.error(
+                    f"[startup] {symbol} has {len(symbol_rows)} position_history rows all marked "
+                    f"status=\"open\" at once (ids={[r.get('id') for r in symbol_rows]}) — OKX only "
+                    f"ever shows one real position per symbol, so this is either a duplicate-write "
+                    f"bug or two bot processes both opened a real position on this pair around the "
+                    f"same time. Resuming tracking against the most recently opened row (id="
+                    f"{newest.get('id')}, opened_at={newest.get('opened_at')}) only. The other "
+                    f"row(s) ({[r.get('id') for r in duplicates]}) are being left untouched in the "
+                    f"database rather than guessed-closed with fabricated numbers — please check "
+                    f"Supabase and OKX's own position/order history directly to see whether real "
+                    f"money was actually exposed twice, and reconcile those rows manually."
+                )
+                row = newest
+            else:
+                row = symbol_rows[0]
+
+            row_id = row.get("id")
             try:
                 live_positions = await self._client.get_position(symbol=symbol)
             except OKXAPIError as exc:
@@ -1366,6 +1480,7 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
 
     async def _finalize_closed_position(self, symbol: str, closed: OpenPosition) -> None:
         await self._tp_tracker.stop_tracking(symbol)
+        self._ratchet_locks.pop(symbol, None)
 
         exit_price, realized_pnl, closing_fee, close_reason, net_pnl = await self._get_close_details(symbol, closed)
         closed_at = time.time()
