@@ -295,6 +295,7 @@ class MovementAnalyzer:
 
     # Thresholds (USDT, against trade.max_unrealized_loss_usdt's magnitude)
     # for classify_entry_quality below.
+    EXCELLENT_ENTRY_MAX_LOSS_USDT = 0.09
     GOOD_ENTRY_MAX_LOSS_USDT = 0.2
     AVERAGE_ENTRY_MAX_LOSS_USDT = 0.4
 
@@ -310,8 +311,9 @@ class MovementAnalyzer:
         in USDT — this is the same number shown as "Max Unreal. Loss" on
         the dashboard), refined by outcome once that loss is large:
 
-          <= GOOD_ENTRY_MAX_LOSS_USDT (0.2)    -> "Good Entry"
-          <= AVERAGE_ENTRY_MAX_LOSS_USDT (0.4) -> "Average Entry"
+          <= EXCELLENT_ENTRY_MAX_LOSS_USDT (0.09) -> "Excellent Entry"
+          <= GOOD_ENTRY_MAX_LOSS_USDT (0.2)        -> "Good Entry"
+          <= AVERAGE_ENTRY_MAX_LOSS_USDT (0.4)     -> "Average Entry"
           above that, and it still closed profitably -> "Lucky Win"
           above that, and it closed at a loss         -> "Bad Entry"
 
@@ -322,6 +324,8 @@ class MovementAnalyzer:
         of any kind.
         """
         max_loss = trade.max_unrealized_loss_usdt
+        if max_loss <= MovementAnalyzer.EXCELLENT_ENTRY_MAX_LOSS_USDT:
+            return "Excellent Entry"
         if max_loss <= MovementAnalyzer.GOOD_ENTRY_MAX_LOSS_USDT:
             return "Good Entry"
         if max_loss <= MovementAnalyzer.AVERAGE_ENTRY_MAX_LOSS_USDT:
