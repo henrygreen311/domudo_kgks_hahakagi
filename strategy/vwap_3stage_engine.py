@@ -334,7 +334,11 @@ class Vwap3StageConfig:
     max_observation_minutes: float = 6.0
     trend_candle_bar: str = "1m"
     bucket_count: int = 5
-    window_ms: int = 240_000
+    window_ms: int = 240_000  # recent-trade window for pressure/volume reads (short and reactive, by design)
+    vwap_window_ms: int = 1_800_000  # 30 min -- SEPARATE, longer window the zone-classifying VWAP is computed from.
+    # Must stay meaningfully longer than window_ms: this is what price is compared against to decide if it's
+    # "far" enough for Engine 1/3 to even look. A VWAP built from the same short window as pressure/volume just
+    # tracks current price and can never diverge enough to leave the near-zone -- see vwap_3stage_engine module notes.
     min_data_warmup_sec: float = 45.0
     min_data_trade_count: int = 15
     candle_fetch_buffer: int = 2
@@ -540,7 +544,15 @@ class Vwap3StageEngine(StrategyEngine):
         if not candidate.data_ready:
             return None
 
-        vwap = compute_vwap(window_trades)
+        # VWAP is deliberately computed from a much longer, separate window than the pressure/volume
+        # reads above -- using the same short window here would make VWAP just shadow current price
+        # and Engine 1/3 would never see a "far" zone.
+        try:
+            vwap_trades = await self._trade_store.get_window(symbol, cfg.vwap_window_ms)
+        except Exception as exc:
+            log.warning(f"[vwap3stage] {symbol} — could not fetch VWAP window: {exc}")
+            return None
+        vwap = compute_vwap(vwap_trades)
         candidate.vwap = vwap
         if not vwap:
             return None
