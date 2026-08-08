@@ -571,6 +571,7 @@ class OKXFuturesClient:
         plan_category: int = 2,
         category: str = "market",
         stop_loss_trigger_price: Optional[str] = None,
+        stop_loss_order_price: Optional[str] = None,
     ) -> dict:
         """Places a take-profit algo order via /api/v5/trade/order-algo.
         `side` uses the same BitMart-style close codes as submit_order
@@ -585,7 +586,25 @@ class OKXFuturesClient:
         first cancels the other automatically, so a closed position can
         never leave the other leg still live on the exchange. Without it,
         this places a TP-only ordType="conditional" order, same as
-        before."""
+        before.
+
+        The take-profit leg (tpOrdPx) is always "-1" — a true market
+        order once triggered, uncapped, by design (see
+        execution_engine.py's ExecutionConfig.sl_limit_slippage_pct
+        docstring for why TP and SL are treated differently here).
+
+        `stop_loss_order_price`, if given, sets slOrdPx to that specific
+        price instead of "-1" — turning the SL leg from an uncapped
+        market order into a capped one: once triggered, OKX places a
+        LIMIT order at this price rather than a market order, so the
+        worst possible fill is bounded at this price (better fills, at
+        anything between the trigger and this price, are still possible
+        and don't require this price to be touched exactly). The
+        tradeoff is that a fast enough move can leave that limit order
+        unfilled — see execution_engine.py's monitor_positions for the
+        fail-safe that watches for exactly that and forces a market
+        close if it happens, so a capped SL price never means an
+        uncapped exposure duration."""
         side_map = {2: ("buy", "short"), 3: ("sell", "long")}
         mapped = side_map.get(side)
         if mapped is None:
@@ -598,11 +617,11 @@ class OKXFuturesClient:
             "side": okx_side,
             "ordType": "oco" if stop_loss_trigger_price is not None else "conditional",
             "tpTriggerPx": trigger_price,
-            "tpOrdPx": "-1",  # -1 = execute the TP as a market order once triggered
+            "tpOrdPx": "-1",  # -1 = execute the TP as a market order once triggered -- always uncapped, see docstring above
         }
         if stop_loss_trigger_price is not None:
             body["slTriggerPx"] = stop_loss_trigger_price
-            body["slOrdPx"] = "-1"  # -1 = execute the SL as a market order once triggered
+            body["slOrdPx"] = stop_loss_order_price if stop_loss_order_price is not None else "-1"
         if self.position_mode == "long_short":
             body["posSide"] = pos_side
         else:

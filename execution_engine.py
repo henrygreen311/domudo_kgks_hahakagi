@@ -71,6 +71,31 @@ class ExecutionConfig:
 
     target_stop_loss_usdt: float = 0.9
 
+    # --- Stop-loss slippage cap ---
+    # Take-profit stays a pure, uncapped market order (tpOrdPx="-1")
+    # deliberately -- an uncapped TP can only ever slip into a SMALLER
+    # win (or, occasionally, a bigger one -- market slippage cuts both
+    # ways), never a loss, so there's nothing worth capping there. A
+    # stop-loss is the opposite: its whole job is loss containment, and
+    # an uncapped SL market order can slip into an ARBITRARILY larger
+    # loss during a fast move -- on a small notional with a small
+    # target_stop_loss_usdt, a handful of bad slips a day can wipe out
+    # several good trades' worth of profit.
+    #
+    # sl_limit_slippage_pct caps that: instead of slOrdPx="-1", the SL
+    # leg is placed with an actual limit price this far beyond the
+    # trigger (0.25% by default), so the worst possible fill is bounded
+    # at roughly target_stop_loss_usdt plus this percentage of notional,
+    # not unbounded. The tradeoff: a limit order can go unfilled if price
+    # gaps straight through it, which would otherwise leave the position
+    # exposed with no working protection at all -- monitor_positions
+    # watches for exactly that (mark price has moved past the SL's own
+    # limit price while the position still shows as open) and forces an
+    # uncapped market close the moment it's detected, so a capped SL
+    # price never turns into unbounded exposure TIME, only a bounded
+    # worst-case PRICE before that fail-safe takes over.
+    sl_limit_slippage_pct: float = 0.0025
+
     # --- Trailing profit floor (see tp_tracker.py) ---
     # Once a position's peak unrealized profit reaches
     # trailing_tp_activation_usdt, the stop-loss is walked up to lock in
@@ -123,6 +148,8 @@ class OpenPosition:
     tp_order_id: Optional[str]
     price_precision: str
     stop_loss_is_profit_lock: bool = False  # True once tp_tracker.py's ratchet has moved stop_loss_price above entry (long) / below entry (short) -- see _ratchet_stop_loss and _infer_close_reason_from_exit_price
+    sl_limit_price: Optional[float] = None  # the resting SL leg's actual (capped) order price -- see ExecutionConfig.sl_limit_slippage_pct. None only for a position resumed from a row too old to have this column.
+    sl_breach_failsafe_submitted: bool = False  # True once monitor_positions has already fired the uncapped-market fail-safe close for this position, so it isn't resubmitted every 5s while waiting for the exchange to reflect the close
     opened_at: float = field(default_factory=time.time)
     last_alert_level: int = 0
     db_id: Optional[int] = None
@@ -576,7 +603,7 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
             price_precision=price_precision,
         )
 
-        tp_order_id = await self._place_tp_sl(
+        tp_order_id, sl_limit_price = await self._place_tp_sl(
             symbol=symbol,
             direction=direction,
             take_profit_price=take_profit_price,
@@ -607,7 +634,8 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
 
         log.info(
             f"[execution] {symbol} filled entry={deal_avg_price} size={deal_size} "
-            f"opening_fee={opening_fee:.6f} take_profit={take_profit_price} stop_loss={stop_loss_price}"
+            f"opening_fee={opening_fee:.6f} take_profit={take_profit_price} stop_loss={stop_loss_price} "
+            f"(SL capped at {sl_limit_price})"
         )
 
         position = OpenPosition(
@@ -624,6 +652,7 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
             stop_loss_price=stop_loss_price,
             tp_order_id=tp_order_id,
             price_precision=price_precision,
+            sl_limit_price=sl_limit_price,
             liq_price=estimated_liq_price,
         )
 
@@ -806,6 +835,26 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
             raw_sl = entry_price * (1 + price_move_frac)
             return _round_to_step(raw_sl, price_precision, rounding=ROUND_UP)
 
+    def _compute_sl_limit_price(self, direction: str, stop_loss_price: float, price_precision: str) -> float:
+        """The actual order price placed for the SL leg once it triggers
+        (see ExecutionConfig.sl_limit_slippage_pct) -- a real limit price
+        `sl_limit_slippage_pct` further from entry than the trigger
+        itself, in the SAME (adverse) direction the trigger already is,
+        so the order can still fill anywhere between the trigger and this
+        price but never worse than it. Rounded further away from entry
+        than plain rounding would give (ROUND_DOWN for long, ROUND_UP for
+        short — same conservative direction _compute_stop_loss_price
+        itself uses), so the cap is never accidentally tighter than
+        configured."""
+        cfg = self.config
+        buffer_frac = cfg.sl_limit_slippage_pct
+        if direction == "long":
+            raw_limit = stop_loss_price * (1 - buffer_frac)
+            return _round_to_step(raw_limit, price_precision, rounding=ROUND_DOWN)
+        else:
+            raw_limit = stop_loss_price * (1 + buffer_frac)
+            return _round_to_step(raw_limit, price_precision, rounding=ROUND_UP)
+
     async def _place_tp_sl(
         self,
         symbol: str,
@@ -816,16 +865,26 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         price_precision: str,
         attempts: int = 3,
         retry_delay_sec: float = 1.0,
-    ) -> Optional[str]:
+    ) -> tuple:
         """Places TP and SL together as a single OCO (one-cancels-other)
         algo order — whichever triggers first automatically cancels the
         other, so the position can never end up with both legs still live
-        after a close."""
+        after a close.
+
+        Returns (order_id, sl_limit_price) — order_id is None on failure
+        (retries exhausted), in which case sl_limit_price is also None.
+        sl_limit_price is the real price now resting as the SL leg's own
+        order price (see ExecutionConfig.sl_limit_slippage_pct); callers
+        should store it on OpenPosition.sl_limit_price so
+        monitor_positions' breach fail-safe has something to compare
+        against."""
 
         close_side = 3 if direction == "long" else 2
 
         tp_price_str = _format_price(take_profit_price, price_precision)
         sl_price_str = _format_price(stop_loss_price, price_precision)
+        sl_limit_price = self._compute_sl_limit_price(direction, stop_loss_price, price_precision)
+        sl_limit_price_str = _format_price(sl_limit_price, price_precision)
         last_exc: Optional[OKXAPIError] = None
         for attempt in range(1, attempts + 1):
             try:
@@ -840,8 +899,10 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
                     plan_category=2,
                     category="market",
                     stop_loss_trigger_price=sl_price_str,
+                    stop_loss_order_price=sl_limit_price_str,
                 )
-                return str(result.get("order_id")) if result else None
+                order_id = str(result.get("order_id")) if result else None
+                return (order_id, sl_limit_price if order_id is not None else None)
             except OKXAPIError as exc:
                 last_exc = exc
                 log.warning(
@@ -850,7 +911,7 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
                 if attempt < attempts:
                     await asyncio.sleep(retry_delay_sec)
         log.error(f"[execution] failed to place TP/SL for {symbol} after {attempts} attempts: {last_exc}")
-        return None
+        return (None, None)
 
     async def maybe_ratchet_stop_loss_for(self, symbol: str) -> None:
         """Public, event-driven counterpart to _maybe_ratchet_stop_loss —
@@ -1036,7 +1097,7 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
                 )
                 return
 
-            new_algo_id = await self._place_tp_sl(
+            new_algo_id, new_sl_limit_price = await self._place_tp_sl(
                 symbol=symbol,
                 direction=pos.direction,
                 take_profit_price=pos.take_profit_price,  # unchanged -- see module docstring in tp_tracker.py
@@ -1066,6 +1127,7 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
 
             pos.tp_order_id = new_algo_id
             pos.stop_loss_price = new_sl_price
+            pos.sl_limit_price = new_sl_limit_price
             pos.stop_loss_is_profit_lock = True  # from this point on, this position's SL leg sits in profit territory, not loss territory -- see _infer_close_reason_from_exit_price
 
             # --- Verify what OKX actually has resting, rather than
@@ -1200,6 +1262,7 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
                 continue
 
             await self._check_price_alert(symbol, pos, active)
+            await self._check_sl_breach(symbol, pos, active)
             await self._maybe_ratchet_stop_loss(symbol, pos, active)
 
     async def reconcile_from_store(self, position_store) -> None:
@@ -1353,6 +1416,21 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         stop_loss_is_profit_lock = self._infer_stop_loss_is_profit_lock(direction, entry_price, stop_loss_price)
         liq_price_raw = row.get("liq_price")
 
+        # position_history doesn't persist the SL leg's actual resting
+        # limit price (see ExecutionConfig.sl_limit_slippage_pct), so
+        # it's recomputed the same way _place_tp_sl derives it rather
+        # than left unprotected here -- if this row predates the SL cap
+        # feature and the real resting order on the exchange is still an
+        # uncapped market SL, the only consequence is the breach
+        # fail-safe below can fire a little earlier than strictly
+        # necessary, which is harmless (it only ever forces a prompt,
+        # uncapped market close, same or better than waiting).
+        sl_limit_price = (
+            self._compute_sl_limit_price(direction, stop_loss_price, price_precision)
+            if stop_loss_price
+            else None
+        )
+
         pos = OpenPosition(
             symbol=symbol,
             direction=direction,
@@ -1368,6 +1446,7 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
             tp_order_id=row.get("tp_order_id"),
             price_precision=price_precision,
             stop_loss_is_profit_lock=stop_loss_is_profit_lock,
+            sl_limit_price=sl_limit_price,
             opened_at=self._parse_stored_opened_at(row),
             db_id=row.get("id"),
             liq_price=float(liq_price_raw) if liq_price_raw not in (None, "") else None,
@@ -1729,6 +1808,84 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         if status.get("state") == "effective" and status.get("ord_id"):
             return str(status.get("ord_id"))
         return None
+
+    async def _check_sl_breach(self, symbol: str, pos: OpenPosition, active: dict) -> None:
+        """Fail-safe counterpart to ExecutionConfig.sl_limit_slippage_pct:
+        since the SL leg is placed as a capped LIMIT order (not a true
+        market order) once triggered, it can go unfilled if price gaps
+        straight through it during a fast move — leaving the position
+        open with no working stop at all. This is the check that catches
+        that: if the mark price has moved past pos.sl_limit_price (the
+        real, capped price resting on the exchange) by more than a small
+        confirmation buffer WHILE the position still shows as open, the
+        capped limit clearly isn't going to fill on its own, so this
+        cancels it and submits an uncapped market close instead — the
+        exact protection an uncapped SL would have given, just arriving
+        a poll cycle (monitor_positions runs every
+        config's caller interval) later than an uncapped order would
+        have. A capped SL price only ever bounds the worst-case FILL
+        PRICE; this bounds the worst-case EXPOSURE TIME on top of it, so
+        the combination is never worse than a plain uncapped SL, only
+        sometimes slightly slower to resolve.
+
+        No-ops entirely for a position with no sl_limit_price recorded
+        (an uncapped SL, or one resumed from a database row too old to
+        have this column — see OpenPosition.sl_limit_price), and only
+        ever submits the fail-safe close once per position
+        (sl_breach_failsafe_submitted), so a position already being
+        flattened isn't resubmitted every 5 seconds while OKX catches up
+        to reflect the close."""
+        if pos.sl_limit_price is None or pos.sl_breach_failsafe_submitted:
+            return
+
+        cfg = self.config
+        try:
+            mark_price = float(active.get("mark_price", 0))
+        except (TypeError, ValueError):
+            return
+        if mark_price <= 0:
+            return
+
+        confirm_buffer = pos.sl_limit_price * cfg.sl_limit_slippage_pct
+        if pos.direction == "long":
+            breached = mark_price < pos.sl_limit_price - confirm_buffer
+        else:
+            breached = mark_price > pos.sl_limit_price + confirm_buffer
+        if not breached:
+            return
+
+        log.error(
+            f"[execution] {symbol} {pos.direction.upper()} — mark price {mark_price} has moved past "
+            f"the capped stop-loss limit ({pos.sl_limit_price}) while the position is still open; the "
+            f"limit order didn't fill in time. Cancelling it and submitting an uncapped market close "
+            f"as a fail-safe rather than leaving this position unprotected any longer"
+        )
+
+        async with self._lock:
+            pos.sl_breach_failsafe_submitted = True
+
+        if pos.tp_order_id:
+            try:
+                await self._client.cancel_algo_order(symbol, pos.tp_order_id)
+            except OKXAPIError as exc:
+                log.warning(
+                    f"[execution] {symbol} — could not cancel the stuck TP/SL order {pos.tp_order_id} "
+                    f"before the breach fail-safe close ({exc}); proceeding with the market close anyway"
+                )
+
+        close_side = 3 if pos.direction == "long" else 2
+        try:
+            await self._client.submit_order(
+                symbol=symbol, side=close_side, size=pos.size_contracts, order_type="market"
+            )
+            log.warning(f"[execution] {symbol} — SL-breach fail-safe close submitted")
+        except OKXAPIError as exc:
+            log.error(
+                f"[execution] {symbol} — SL-breach fail-safe close ALSO failed ({exc}); this position "
+                f"is genuinely unprotected and needs manual attention immediately"
+            )
+            async with self._lock:
+                pos.sl_breach_failsafe_submitted = False
 
     async def _check_price_alert(self, symbol: str, pos: OpenPosition, active: dict) -> None:
         """Logs a movement update once the position has moved another
