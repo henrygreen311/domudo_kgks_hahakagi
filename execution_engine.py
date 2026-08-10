@@ -71,6 +71,35 @@ class ExecutionConfig:
 
     target_stop_loss_usdt: float = 0.9
 
+    # --- Funding-rate guard ---
+    # OKX charges/pays funding periodically (typically every 8h) based on
+    # each open position's side: a POSITIVE funding rate means longs pay
+    # shorts, a NEGATIVE rate means shorts pay longs. A trade that holds
+    # through a settlement on the paying side gets that cost deducted
+    # from realized_pnl regardless of how the TP/SL itself resolved --
+    # real cases seen: a short that hit its stop-loss cleanly still had
+    # -0.38 USDT in funding fees on top, and a short that hit take-profit
+    # for +0.56 gross was left with only +0.06 net after -0.446 USDT in
+    # funding. Both were entirely avoidable: funding direction is known
+    # BEFORE opening, from OKX's own public funding-rate endpoint.
+    #
+    # enable_funding_guard=True checks the current funding rate against
+    # the signal's own direction right before opening (alongside the
+    # liquidation guard) and discards the signal if funding is against
+    # it by more than funding_rate_tolerance -- a long is blocked when
+    # funding_rate > tolerance, a short when funding_rate < -tolerance.
+    # Rates flip sign often and are usually tiny, so most trades are
+    # unaffected either way; this only ever blocks the specific case
+    # where the position would start out already paying to hold.
+    #
+    # Fails OPEN (allows the trade through) if the funding-rate fetch
+    # itself errors, since this is a cost-avoidance heuristic, not a
+    # capital-safety mechanism like the liquidation guard -- an
+    # occasional missed check from an API hiccup isn't worth blocking an
+    # otherwise-valid signal over.
+    enable_funding_guard: bool = True
+    funding_rate_tolerance: float = 0.0
+
     # --- Stop-loss slippage cap ---
     # Take-profit stays a pure, uncapped market order (tpOrdPx="-1")
     # deliberately -- an uncapped TP can only ever slip into a SMALLER
@@ -286,6 +315,20 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         # while a candidate keeps failing the same check tick after tick.
         self._last_log_ts: Dict[str, float] = {}
 
+    @staticmethod
+    def _funding_rate_allows(direction: str, funding_rate: float, tolerance: float) -> bool:
+        """True unless `funding_rate` is against `direction` by more than
+        `tolerance`. OKX's sign convention: positive means longs pay
+        shorts (bad for long, fine/good for short); negative means shorts
+        pay longs (bad for short, fine/good for long). tolerance=0.0 (the
+        default) blocks on ANY adverse rate, however small; a small
+        positive tolerance (e.g. 0.0001 = 0.01%) would let through mildly
+        adverse rates too small to matter over a typical hold."""
+        if direction == "long":
+            return funding_rate <= tolerance
+        else:
+            return funding_rate >= -tolerance
+
     def _get_ratchet_lock(self, symbol: str) -> asyncio.Lock:
         lock = self._ratchet_locks.get(symbol)
         if lock is None:
@@ -385,6 +428,30 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         cfg = self.config
         symbol = signal.symbol
         direction = signal.direction
+
+        if cfg.enable_funding_guard:
+            try:
+                funding = await self._client.get_funding_rate(symbol)
+            except OKXAPIError as exc:
+                log.warning(
+                    f"[execution] {symbol} {direction.upper()} — could not fetch funding rate ({exc}); "
+                    f"proceeding without this check rather than blocking a valid signal over it"
+                )
+            else:
+                funding_rate = funding["funding_rate"]
+                if not self._funding_rate_allows(direction, funding_rate, cfg.funding_rate_tolerance):
+                    payer = "longs" if funding_rate > 0 else "shorts"
+                    self._log_throttled(
+                        f"{symbol}:funding_guard_reject", logging.INFO,
+                        f"[execution] {symbol} {direction.upper()} — funding rate {funding_rate:+.4%} "
+                        f"is against this direction ({payer} currently pay) — signal discarded rather "
+                        f"than opening into a known funding cost"
+                    )
+                    return None
+                self._log_throttled(
+                    f"{symbol}:funding_guard_pass", logging.DEBUG,
+                    f"[execution] {symbol} {direction.upper()} funding guard passed — rate {funding_rate:+.4%}"
+                )
 
         # Authoritative guard, backed by the exchange itself rather than
         # only in-memory bookkeeping: never open a second position on a

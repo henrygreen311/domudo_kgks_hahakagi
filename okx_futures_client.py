@@ -298,6 +298,28 @@ class OKXFuturesClient:
             "min_volume": row.get("minSz"),
         }
 
+    async def get_funding_rate(self, symbol: str) -> dict:
+        """Current funding rate for `symbol` via /api/v5/public/funding-rate
+        (public, no auth). Returns {"funding_rate": float, "funding_time_ms":
+        int or None} -- funding_rate is the rate that will actually be
+        charged/paid at funding_time_ms, OKX's own semantics: POSITIVE
+        means longs pay shorts (favorable to be short, costs longs money);
+        NEGATIVE means shorts pay longs (favorable to be long, costs
+        shorts money). See execution_engine.py's ExecutionConfig for how
+        this gates opening a new position."""
+        data = await self._request("GET", "/api/v5/public/funding-rate", params={"instId": symbol})
+        rows = data or []
+        if not rows:
+            raise OKXAPIError(f"No funding rate returned for {symbol}")
+        row = rows[0]
+        try:
+            funding_rate = float(row.get("fundingRate"))
+        except (TypeError, ValueError):
+            raise OKXAPIError(f"Malformed funding rate for {symbol}: {row.get('fundingRate')!r}")
+        funding_time_raw = row.get("fundingTime")
+        funding_time_ms = int(funding_time_raw) if funding_time_raw not in (None, "") else None
+        return {"funding_rate": funding_rate, "funding_time_ms": funding_time_ms}
+
     async def get_candles(self, symbol: str, bar: str = "5m", limit: int = 100) -> List[dict]:
         """Recent OHLCV candles for `symbol` via /api/v5/market/candles
         (public, no auth). OKX returns newest-first; `limit` maxes out at
