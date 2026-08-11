@@ -10,7 +10,7 @@ from typing import Deque, Dict, List, Optional, Tuple
 DEFAULT_SYMBOL_WHITELIST = frozenset({
     "KAITO-USDT-SWAP",
     "ETH-USDT-SWAP",
-    "SOL-USDT-SWAP",
+    "ACT-USDT-SWAP",
 })
 
 
