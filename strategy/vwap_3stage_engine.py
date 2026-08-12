@@ -62,10 +62,10 @@ CandleFetcher = Callable[[str, str, int], Awaitable[List[dict]]]
 
 TREND_CANDLE_BAR = "1m"
 WINDOW_MS = 240_000
-VWAP_WINDOW_MS = 18_000_000
-MIN_ENTRY_TREND_STRENGTH_PCT = 70.0
-MIN_ENTRY_PRESSURE_PCT = 70.0
-MIN_ENTRY_VOLUME_EXPANSION_PCT = 50.0
+VWAP_WINDOW_MS = 1_800_000
+MIN_ENTRY_TREND_STRENGTH_PCT = 60.0
+MIN_ENTRY_PRESSURE_PCT = 60.0
+MIN_ENTRY_VOLUME_EXPANSION_PCT = 30.0
 
 
 def compute_trend_strength(candles: List[dict]) -> Dict:
@@ -261,7 +261,7 @@ class Vwap3StageConfig:
     symbol_whitelist: Optional[frozenset] = field(default_factory=lambda: DEFAULT_SYMBOL_WHITELIST)
 
     vwap_far_threshold_pct: float = 0.005
-    vwap_near_threshold_pct: float = 0.0015
+    vwap_near_threshold_pct: float = 0.0010
 
     swing_lookback: int = 20
     swing_proximity_pct: float = 0.002
@@ -452,6 +452,9 @@ class Vwap3StageEngine(StrategyEngine):
         if zone == "near":
             candidate.engine_used = "engine2_continuation"
             return await self._evaluate_engine2_continuation(candidate, price, trend_result, window_trades, support_candle)
+        if zone == "far_below":
+            candidate.engine_used = "engine3_long_exhaustion"
+            return await self._evaluate_engine3_long(candidate, price, distance_pct, window_trades)
 
         candidate.engine_used = ""
         candidate.direction = ""
@@ -524,6 +527,65 @@ class Vwap3StageEngine(StrategyEngine):
                 f"swing_high={swing_high:.6g}",
                 f"seller_pressure={pressure['strength_pct']:.0f}%",
                 f"sell_volume_expansion={volume['strength_pct']:.0f}%",
+            ],
+        )
+
+    async def _evaluate_engine3_long(
+        self, candidate: CandidateObservation, price: float, distance_pct: float, window_trades: List[dict]
+    ) -> Optional[Signal]:
+        cfg = self.config
+        swing_low = candidate.swing_low
+        if not swing_low:
+            candidate.direction = ""
+            return None
+
+        proximity_pct = abs(price - swing_low) / swing_low
+        if proximity_pct >= cfg.swing_proximity_pct:
+            candidate.direction = ""
+            return None
+
+        direction = "long"
+        pressure = compute_buy_pressure_strength(window_trades, direction, cfg.bucket_count)
+        volume = compute_volume_expansion_strength(
+            window_trades, direction, cfg.bucket_count, cfg.reversal_volume_expansion_multiplier
+        )
+        candidate.buy_pressure_strength_pct = pressure["strength_pct"]
+        candidate.volume_strength_pct = volume["strength_pct"]
+
+        pressure_ok = pressure["strength_pct"] >= cfg.reversal_min_pressure_pct
+        if cfg.reversal_require_pressure_accelerating:
+            pressure_ok = pressure_ok and pressure["accelerating"]
+        volume_ok = volume["expanding"] and volume["strength_pct"] >= cfg.reversal_min_volume_expansion_strength_pct
+
+        if not (pressure_ok and volume_ok):
+            candidate.direction = ""
+            return None
+
+        candidate.direction = direction
+        symbol = candidate.symbol
+        log.info(
+            f"[vwap3stage] ENGINE 3 ACCEPTED: {symbol}\n"
+            f"  Price far below VWAP (distance={distance_pct:+.2%})\n"
+            f"  Swing support reached (price={price:.6g}, swing_low={swing_low:.6g})\n"
+            f"  Buyer pressure {pressure['strength_pct']:.0f}%\n"
+            f"  Buy volume expanding"
+        )
+        async with self._lock:
+            self._candidates.pop(symbol, None)
+        return Signal(
+            symbol=symbol,
+            direction=direction,
+            confidence=1.0,
+            entry_price=price,
+            take_profit=price,
+            stop_loss=price,
+            timestamp=time.time(),
+            reasons=[
+                "engine=3_long_exhaustion",
+                f"vwap_distance={distance_pct:+.2%}",
+                f"swing_low={swing_low:.6g}",
+                f"buyer_pressure={pressure['strength_pct']:.0f}%",
+                f"buy_volume_expansion={volume['strength_pct']:.0f}%",
             ],
         )
 
