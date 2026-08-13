@@ -736,6 +736,20 @@ class Vwap3StageEngine(StrategyEngine):
         market_structure: str,
     ) -> Optional[Signal]:
         cfg = self.config
+
+        # Compute pressure/volume immediately, before any gate below can
+        # short-circuit. Previously this only ran after the swing/proximity/
+        # structure checks passed, so on every cycle one of those gates
+        # rejected first, the status log kept showing a stale 0%/0% instead
+        # of the real current reading.
+        direction = "short"
+        pressure = compute_buy_pressure_strength(window_trades, direction, cfg.bucket_count)
+        volume = compute_volume_expansion_strength(
+            window_trades, direction, cfg.bucket_count, cfg.reversal_volume_expansion_multiplier
+        )
+        candidate.buy_pressure_strength_pct = pressure["strength_pct"]
+        candidate.volume_strength_pct = volume["strength_pct"]
+
         swing_high = candidate.swing_high
         if not swing_high:
             candidate.direction = ""
@@ -752,14 +766,6 @@ class Vwap3StageEngine(StrategyEngine):
             # know" must never silently pass as "no headwind."
             candidate.direction = ""
             return None
-
-        direction = "short"
-        pressure = compute_buy_pressure_strength(window_trades, direction, cfg.bucket_count)
-        volume = compute_volume_expansion_strength(
-            window_trades, direction, cfg.bucket_count, cfg.reversal_volume_expansion_multiplier
-        )
-        candidate.buy_pressure_strength_pct = pressure["strength_pct"]
-        candidate.volume_strength_pct = volume["strength_pct"]
 
         # A bullish (or strongly bullish) 5m structure is a headwind for an
         # exhaustion SHORT: rather than block outright, demand pressure/volume
@@ -831,6 +837,17 @@ class Vwap3StageEngine(StrategyEngine):
         market_structure: str,
     ) -> Optional[Signal]:
         cfg = self.config
+
+        # Compute pressure/volume immediately, before any gate below can
+        # short-circuit -- see Engine 1 for the same fix and reasoning.
+        direction = "long"
+        pressure = compute_buy_pressure_strength(window_trades, direction, cfg.bucket_count)
+        volume = compute_volume_expansion_strength(
+            window_trades, direction, cfg.bucket_count, cfg.reversal_volume_expansion_multiplier
+        )
+        candidate.buy_pressure_strength_pct = pressure["strength_pct"]
+        candidate.volume_strength_pct = volume["strength_pct"]
+
         swing_low = candidate.swing_low
         if not swing_low:
             candidate.direction = ""
@@ -846,14 +863,6 @@ class Vwap3StageEngine(StrategyEngine):
             # never be treated as "no headwind" -- don't trade blind.
             candidate.direction = ""
             return None
-
-        direction = "long"
-        pressure = compute_buy_pressure_strength(window_trades, direction, cfg.bucket_count)
-        volume = compute_volume_expansion_strength(
-            window_trades, direction, cfg.bucket_count, cfg.reversal_volume_expansion_multiplier
-        )
-        candidate.buy_pressure_strength_pct = pressure["strength_pct"]
-        candidate.volume_strength_pct = volume["strength_pct"]
 
         # A bearish (or strongly bearish) 5m structure is a headwind for an
         # exhaustion LONG: rather than block outright, demand pressure/volume
@@ -920,6 +929,26 @@ class Vwap3StageEngine(StrategyEngine):
         market_structure: str,
     ) -> Optional[Signal]:
         cfg = self.config
+        direction = trend_result["direction"]
+
+        # Compute pressure/volume for whichever side the 1m trend currently
+        # favors, before the trend/structure gates below can short-circuit --
+        # same fix as Engine 1/3. A sideways trend has no side to measure (the
+        # helper defaults anything other than "long" to "sell"), so it's left
+        # at 0, which is an honest "no directional signal" rather than stale.
+        if direction in ("long", "short"):
+            pressure = compute_buy_pressure_strength(window_trades, direction, cfg.bucket_count)
+            volume = compute_volume_expansion_strength(
+                window_trades, direction, cfg.bucket_count, cfg.continuation_volume_expansion_multiplier
+            )
+            candidate.buy_pressure_strength_pct = pressure["strength_pct"]
+            candidate.volume_strength_pct = volume["strength_pct"]
+        else:
+            pressure = {"strength_pct": 0.0, "accelerating": False}
+            volume = {"strength_pct": 0.0, "expanding": False}
+            candidate.buy_pressure_strength_pct = 0.0
+            candidate.volume_strength_pct = 0.0
+
         trend_ok = (
             trend_result["direction"] != "sideways"
             and trend_result["strength_pct"] >= cfg.continuation_min_trend_strength_pct
@@ -929,7 +958,6 @@ class Vwap3StageEngine(StrategyEngine):
             candidate.direction = ""
             return None
 
-        direction = trend_result["direction"]
         structure_ok = (
             (direction == "long" and market_structure in ("BULLISH", "BULLISH_STRONG"))
             or (direction == "short" and market_structure in ("BEARISH", "BEARISH_STRONG"))
@@ -937,13 +965,6 @@ class Vwap3StageEngine(StrategyEngine):
         if not structure_ok:
             candidate.direction = ""
             return None
-
-        pressure = compute_buy_pressure_strength(window_trades, direction, cfg.bucket_count)
-        volume = compute_volume_expansion_strength(
-            window_trades, direction, cfg.bucket_count, cfg.continuation_volume_expansion_multiplier
-        )
-        candidate.buy_pressure_strength_pct = pressure["strength_pct"]
-        candidate.volume_strength_pct = volume["strength_pct"]
 
         pressure_ok = pressure["strength_pct"] >= cfg.continuation_min_pressure_pct
         if cfg.continuation_require_pressure_accelerating:
