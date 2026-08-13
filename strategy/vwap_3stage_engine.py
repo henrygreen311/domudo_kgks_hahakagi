@@ -63,9 +63,9 @@ CandleFetcher = Callable[[str, str, int], Awaitable[List[dict]]]
 TREND_CANDLE_BAR = "1m"
 WINDOW_MS = 240_000
 VWAP_WINDOW_MS = 1_800_000
-MIN_ENTRY_TREND_STRENGTH_PCT = 80.0
-MIN_ENTRY_PRESSURE_PCT = 80.0
-MIN_ENTRY_VOLUME_EXPANSION_PCT = 70.0
+MIN_ENTRY_TREND_STRENGTH_PCT = 70.0
+MIN_ENTRY_PRESSURE_PCT = 70.0
+MIN_ENTRY_VOLUME_EXPANSION_PCT = 50.0
 STRUCTURE_CANDLE_BAR = "5m"
 STRUCTURE_LOOKBACK_CANDLES = 20
 STRUCTURE_PIVOT_STRENGTH = 2
@@ -746,6 +746,13 @@ class Vwap3StageEngine(StrategyEngine):
             candidate.direction = ""
             return None
 
+        if market_structure == "UNCLEAR":
+            # Not enough completed 5m candles/swings yet to read structure at
+            # all. That's different from a genuine RANGE read -- "we don't
+            # know" must never silently pass as "no headwind."
+            candidate.direction = ""
+            return None
+
         direction = "short"
         pressure = compute_buy_pressure_strength(window_trades, direction, cfg.bucket_count)
         volume = compute_volume_expansion_strength(
@@ -831,6 +838,12 @@ class Vwap3StageEngine(StrategyEngine):
 
         proximity_pct = abs(price - swing_low) / swing_low
         if proximity_pct >= cfg.swing_proximity_pct:
+            candidate.direction = ""
+            return None
+
+        if market_structure == "UNCLEAR":
+            # Same reasoning as Engine 1: insufficient structure data must
+            # never be treated as "no headwind" -- don't trade blind.
             candidate.direction = ""
             return None
 
