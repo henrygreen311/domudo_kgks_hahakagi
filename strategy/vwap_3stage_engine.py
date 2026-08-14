@@ -60,38 +60,27 @@ log = logging.getLogger("okx_futures.vwap3stage")
 
 CandleFetcher = Callable[[str, str, int], Awaitable[List[dict]]]
 
-TREND_CANDLE_BAR = "1m"
-WINDOW_MS = 240_000
-VWAP_WINDOW_MS = 1_800_000
-MIN_ENTRY_TREND_STRENGTH_PCT = 70.0
-MIN_ENTRY_PRESSURE_PCT = 70.0
-MIN_ENTRY_VOLUME_EXPANSION_PCT = 50.0
-STRUCTURE_CANDLE_BAR = "5m"
-STRUCTURE_LOOKBACK_CANDLES = 20
-STRUCTURE_PIVOT_STRENGTH = 2
-# Reused as BOTH (a) the min-swing-significance filter that keeps small candle
-# wiggles from registering as real swings, and (b) the tolerance band used to
-# decide whether a new swing is meaningfully higher/lower than the prior swing
-# of the same type. One threshold, no second conflicting system.
-STRUCTURE_EQUAL_TOLERANCE_PCT = 0.003
-# Weighted-score cutoff (see _classify_labeled_sequence) for calling a
-# structure BULLISH/BEARISH instead of RANGE. Real number derived from actual
-# swing counts/weights -- not a cosmetic confidence figure.
-STRUCTURE_TREND_SCORE_THRESHOLD = 0.25
-# Minimum count of same-direction swings, with zero opposing swings, required
-# before a structure can be labeled *_STRONG rather than the plain version.
-STRUCTURE_MIN_SWINGS_FOR_STRONG = 3
-# Engine 1/3 "headwind" bars: when the 5m structure opposes an exhaustion
-# trade, pressure/volume must clear a higher bar than the normal reversal
-# minimums before the trade is allowed through. Two tiers (moderate vs strong)
-# mirror the plain vs *_STRONG structure labels.
-STRUCTURE_HEADWIND_MIN_PRESSURE_PCT = 85.0
-STRUCTURE_HEADWIND_MIN_VOLUME_PCT = 70.0
-STRUCTURE_STRONG_HEADWIND_MIN_PRESSURE_PCT = 92.0
-STRUCTURE_STRONG_HEADWIND_MIN_VOLUME_PCT = 78.0
+
+# ---------------------------------------------------------------------------
+# Pure signal functions — reused verbatim from observation_engine.py. Not
+# reimplemented: the micro-trend / pressure / volume-expansion / VWAP /
+# candle-confirmation math itself didn't need to change, only how the
+# results get routed into a decision (see the three engines further down).
+# ---------------------------------------------------------------------------
 
 
 def compute_trend_strength(candles: List[dict]) -> Dict:
+    """Direction + strength from a sequence of {"ts","open","close"}
+    candles (only these three keys are required — high/low aren't used),
+    ordered oldest to newest internally regardless of input order.
+
+    Each candle's move is weighted by its own size, so a +3% candle pulls
+    much harder than a +0.1% candle instead of every candle counting as
+    one equal "vote". strength_pct is the dominant side's share of the
+    total weighted movement across all candles.
+
+    Returns {"direction": "long"/"short"/"sideways", "strength_pct": 0-100,
+    "net_move_pct": open-to-close move across the whole window}."""
     if not candles or len(candles) < 2:
         return {"direction": "sideways", "strength_pct": 0.0, "net_move_pct": 0.0}
 
@@ -127,6 +116,8 @@ def compute_trend_strength(candles: List[dict]) -> Dict:
 
 
 def _bucketize_trades(trades: List[dict], bucket_count: int) -> List[List[dict]]:
+    """Splits trades into `bucket_count` equal chronological slices
+    spanning the trades' own oldest-to-newest timestamp range."""
     if not trades or bucket_count < 1:
         return [[] for _ in range(max(bucket_count, 1))]
     ordered = sorted(trades, key=lambda t: t["timestamp"])
@@ -144,6 +135,10 @@ def _bucketize_trades(trades: List[dict], bucket_count: int) -> List[List[dict]]
 
 
 def _slice_slope_score(values: List[float], full_range: float) -> float:
+    """0-100 score for how strongly `values` trend upward across their
+    index, via a simple least-squares slope normalized against the
+    largest slope that would be plausible for values living in
+    `full_range`. 50 = flat, 100 = accelerating hard, 0 = reversing hard."""
     n = len(values)
     if n < 2:
         return 50.0
@@ -160,6 +155,14 @@ def _slice_slope_score(values: List[float], full_range: float) -> float:
 
 
 def compute_buy_pressure_strength(trades: List[dict], direction: str, bucket_count: int) -> Dict:
+    """Splits the window into `bucket_count` chronological slices and
+    scores whether executed buy/sell pressure in `direction`'s favor is
+    BUILDING across those slices, not just present on net. Combines two
+    things equally: (a) the current (most recent slice) dominance level,
+    and (b) whether that dominance has been accelerating slice to slice.
+
+    Returns {"strength_pct": 0-100, "current_ratio": 0-1, "accelerating":
+    bool}."""
     side = "buy" if direction == "long" else "sell"
     other = "sell" if direction == "long" else "buy"
     buckets = _bucketize_trades(trades, bucket_count)
@@ -183,6 +186,14 @@ def compute_buy_pressure_strength(trades: List[dict], direction: str, bucket_cou
 
 
 def compute_volume_expansion_strength(trades: List[dict], direction: str, bucket_count: int, target_multiplier: float) -> Dict:
+    """Splits the window into `bucket_count` chronological slices and
+    scores whether directional participation is expanding CONSISTENTLY
+    across those slices rather than via a single spike. Combines equally:
+    (a) how many consecutive slices increased vs the one before, and
+    (b) overall growth of the back half vs the front half, capped at
+    `target_multiplier`x.
+
+    Returns {"strength_pct": 0-100, "expanding": bool}."""
     side = "buy" if direction == "long" else "sell"
     buckets = _bucketize_trades(trades, bucket_count)
     volumes = [sum(t["qty"] for t in bucket if t["side"] == side) for bucket in buckets]
@@ -208,6 +219,8 @@ def compute_volume_expansion_strength(trades: List[dict], direction: str, bucket
 
 
 def compute_vwap(trades: List[dict]) -> Optional[float]:
+    """Volume-weighted average price across `trades`: sum(price*qty) /
+    sum(qty). Returns None if there's no volume to weight against."""
     total_qty = sum(t["qty"] for t in trades)
     if total_qty <= 0:
         return None
@@ -215,6 +228,11 @@ def compute_vwap(trades: List[dict]) -> Optional[float]:
 
 
 def _vwap_supports_direction(price: float, vwap: Optional[float], direction: str) -> bool:
+    """True if `price` is on the side of `vwap` that direction wants.
+    Kept from observation_engine.py for parity / potential reuse by a
+    future engine, but the three zone engines below make their own,
+    finer-grained use of VWAP distance instead of this simple
+    above/below test."""
     if vwap is None:
         return False
     if direction == "long":
@@ -225,6 +243,13 @@ def _vwap_supports_direction(price: float, vwap: Optional[float], direction: str
 
 
 def _split_forming_and_closed(candles: List[dict]):
+    """OKX's /market/candles response carries a `confirm` flag ("0" =
+    still forming/live, "1" = closed). Splits `candles` (any order) into
+    (forming_candle_or_None, closed_candles_newest_first) so the trend
+    check only ever sees confirmed bars while the live-candle-agreement
+    check can still read the current one. A missing/unknown confirm value
+    is treated as closed (conservative: never mistakes a stale/malformed
+    row for a live one)."""
     forming = None
     closed: List[dict] = []
     ordered = sorted(candles, key=lambda c: c.get("ts", 0), reverse=True)
@@ -237,6 +262,10 @@ def _split_forming_and_closed(candles: List[dict]):
 
 
 def _candle_supports_direction(candle: Optional[dict], direction: str) -> bool:
+    """True if `candle`'s own open->close move agrees with `direction`
+    (long wants a bullish/green candle, short wants bearish/red). A
+    missing candle never counts as support, which only makes it harder to
+    open, never easier."""
     if not candle:
         return False
     o, c = candle.get("open"), candle.get("close")
@@ -249,7 +278,18 @@ def _candle_supports_direction(candle: Optional[dict], direction: str) -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# New: swing level detection + VWAP zone classification.
+# ---------------------------------------------------------------------------
+
+
 def get_swing_levels(closed_candles: List[dict], lookback: int) -> Dict[str, Optional[float]]:
+    """Swing high/low from the most recent `lookback` CLOSED candles
+    (any input order; sorted internally newest-first before slicing).
+    Swing high is resistance (Engine 1's reference level), swing low is
+    support (Engine 3's). Returns {"swing_high": ..., "swing_low": ...},
+    with None for either side if there aren't enough candles with a
+    usable high/low to compute it from."""
     if not closed_candles:
         return {"swing_high": None, "swing_low": None}
     ordered = sorted(closed_candles, key=lambda c: c.get("ts", 0), reverse=True)[:lookback]
@@ -261,211 +301,19 @@ def get_swing_levels(closed_candles: List[dict], lookback: int) -> Dict[str, Opt
     }
 
 
-def _find_fractal_pivots(ordered: List[dict], pivot_strength: int) -> List[Dict]:
-    """Raw swing highs/lows: a candle whose high (low) is the max (min) within
-    a symmetric window of `pivot_strength` candles on either side. Chronological
-    (oldest -> newest) since `ordered` is and we scan i ascending."""
-    raw: List[Dict] = []
-    n = len(ordered)
-    for i in range(pivot_strength, n - pivot_strength):
-        window = ordered[i - pivot_strength: i + pivot_strength + 1]
-        high_i, low_i = ordered[i].get("high"), ordered[i].get("low")
-        if high_i is None or low_i is None:
-            continue
-        window_highs = [c["high"] for c in window if c.get("high") is not None]
-        window_lows = [c["low"] for c in window if c.get("low") is not None]
-        if window_highs and high_i == max(window_highs):
-            raw.append({"ts": ordered[i].get("ts", 0), "type": "H", "price": high_i})
-        if window_lows and low_i == min(window_lows):
-            raw.append({"ts": ordered[i].get("ts", 0), "type": "L", "price": low_i})
-    return raw
-
-
-def _enforce_alternating_pivots(pivots: List[Dict]) -> List[Dict]:
-    """A choppy run of candles can produce two swing highs in a row with no
-    swing low between them (or vice versa). Collapse those into a single
-    pivot, keeping whichever is more extreme, so the sequence always
-    alternates H, L, H, L, ..."""
-    alt: List[Dict] = []
-    for p in pivots:
-        if alt and alt[-1]["type"] == p["type"]:
-            if p["type"] == "H" and p["price"] >= alt[-1]["price"]:
-                alt[-1] = p
-            elif p["type"] == "L" and p["price"] <= alt[-1]["price"]:
-                alt[-1] = p
-            # else: less extreme duplicate, drop it
-        else:
-            alt.append(p)
-    return alt
-
-
-def _filter_insignificant_swings(pivots: List[Dict], min_swing_pct: float) -> List[Dict]:
-    """Drop swing points whose move relative to a neighbor is smaller than
-    min_swing_pct, so a tiny candle wiggle can't flip the read (requirement:
-    reuse the existing deviation threshold rather than a second system)."""
-    if min_swing_pct <= 0 or len(pivots) < 3:
-        return list(pivots)
-    seq = list(pivots)
-    changed = True
-    while changed and len(seq) >= 3:
-        changed = False
-        i = 1
-        while i < len(seq) - 1:
-            prev_p, cur_p, next_p = seq[i - 1], seq[i], seq[i + 1]
-            leg1 = abs(cur_p["price"] - prev_p["price"]) / prev_p["price"] if prev_p["price"] else 0.0
-            leg2 = abs(next_p["price"] - cur_p["price"]) / cur_p["price"] if cur_p["price"] else 0.0
-            if min(leg1, leg2) < min_swing_pct:
-                del seq[i]
-                changed = True
-                break
-            i += 1
-        if changed:
-            seq = _enforce_alternating_pivots(seq)
-    return seq
-
-
-def _label_swings(filtered_pivots: List[Dict], min_swing_pct: float) -> List[Dict]:
-    """Label each swing relative to the previous swing of the SAME type:
-    highs -> HH/LH, lows -> HL/LL (EQH/EQL if within tolerance of the prior
-    same-type swing). Chronological order is preserved."""
-    labeled: List[Dict] = []
-    last_h = last_l = None
-    for p in filtered_pivots:
-        if p["type"] == "H":
-            if last_h:
-                change = (p["price"] - last_h) / last_h
-                label = "HH" if change > min_swing_pct else "LH" if change < -min_swing_pct else "EQH"
-                labeled.append({"type": "H", "label": label, "price": p["price"], "ts": p["ts"]})
-            last_h = p["price"]
-        else:
-            if last_l:
-                change = (p["price"] - last_l) / last_l
-                label = "HL" if change > min_swing_pct else "LL" if change < -min_swing_pct else "EQL"
-                labeled.append({"type": "L", "label": label, "price": p["price"], "ts": p["ts"]})
-            last_l = p["price"]
-    return labeled
-
-
-_STRUCTURE_SWING_SCORE = {"HH": 1, "HL": 1, "LH": -1, "LL": -1, "EQH": 0, "EQL": 0}
-
-
-def _classify_labeled_sequence(labeled: List[Dict], score_threshold: float, min_swings_for_strong: int) -> Dict:
-    """Turn the chronological HH/LH/HL/LL sequence into one structure label.
-
-    - Every swing gets a +1 (HH/HL), -1 (LH/LL) or 0 (EQ*) score.
-    - Each score is weighted by its position (1, 2, 3, ...) so the most
-      recent swings matter most for the CURRENT read while earlier swings
-      still pull the average -- requirement 6.
-    - Structure transitions are checked first: if the trailing swings have
-      flipped sign against an established earlier majority, that's a
-      transition, not a continuation, regardless of the overall average.
-    """
-    if len(labeled) < 2:
-        return {"structure": "UNCLEAR", "weighted_score": 0.0, "bullish_count": 0, "bearish_count": 0}
-
-    scores = [_STRUCTURE_SWING_SCORE[l["label"]] for l in labeled]
-    bullish_count = sum(1 for s in scores if s > 0)
-    bearish_count = sum(1 for s in scores if s < 0)
-    total_directional = bullish_count + bearish_count
-    if total_directional == 0:
-        return {"structure": "RANGE", "weighted_score": 0.0, "bullish_count": 0, "bearish_count": 0}
-
-    n = len(scores)
-    weights = list(range(1, n + 1))
-    weighted_score = sum(s * w for s, w in zip(scores, weights)) / sum(weights)
-
-    tail_n = min(2, n)
-    recent, older = scores[-tail_n:], scores[:-tail_n]
-    recent_nonzero = [s for s in recent if s != 0]
-    recent_all_bull = bool(recent_nonzero) and all(s > 0 for s in recent_nonzero)
-    recent_all_bear = bool(recent_nonzero) and all(s < 0 for s in recent_nonzero)
-    older_bull = sum(1 for s in older if s > 0)
-    older_bear = sum(1 for s in older if s < 0)
-
-    structure = None
-    if recent_all_bear and older and older_bull > older_bear:
-        structure = "BULLISH_TRANSITION"   # was bullish, now breaking bearish
-    elif recent_all_bull and older and older_bear > older_bull:
-        structure = "BEARISH_TRANSITION"   # was bearish, now breaking bullish
-
-    if structure is None:
-        if weighted_score >= score_threshold:
-            unanimous = bearish_count == 0 and bullish_count >= min_swings_for_strong
-            structure = "BULLISH_STRONG" if unanimous else "BULLISH"
-        elif weighted_score <= -score_threshold:
-            unanimous = bullish_count == 0 and bearish_count >= min_swings_for_strong
-            structure = "BEARISH_STRONG" if unanimous else "BEARISH"
-        else:
-            structure = "RANGE"
-
-    return {
-        "structure": structure,
-        "weighted_score": round(weighted_score, 4),
-        "bullish_count": bullish_count,
-        "bearish_count": bearish_count,
-    }
-
-
-def classify_market_structure(
-    candles: List[dict],
-    pivot_strength: int,
-    min_swing_pct: float,
-    score_threshold: float = STRUCTURE_TREND_SCORE_THRESHOLD,
-    min_swings_for_strong: int = STRUCTURE_MIN_SWINGS_FOR_STRONG,
-) -> Dict:
-    """Analyze the full lookback window of completed 5m candles (oldest ->
-    newest), find ALL meaningful swing highs/lows in it, classify each as
-    HH/LH/HL/LL against the prior same-type swing, and return one of:
-    BULLISH_STRONG, BULLISH, BULLISH_TRANSITION, BEARISH_STRONG, BEARISH,
-    BEARISH_TRANSITION, RANGE, or UNCLEAR (not enough candles/swings yet)."""
-    ordered = sorted(candles, key=lambda c: c.get("ts", 0))
-    n = len(ordered)
-    if n < (2 * pivot_strength + 1) + 2:
-        return {
-            "structure": "UNCLEAR",
-            "swing_highs": [],
-            "swing_lows": [],
-            "labeled_swings": [],
-            "weighted_score": 0.0,
-            "bullish_count": 0,
-            "bearish_count": 0,
-        }
-
-    raw_pivots = _find_fractal_pivots(ordered, pivot_strength)
-    alternating = _enforce_alternating_pivots(raw_pivots)
-    filtered = _filter_insignificant_swings(alternating, min_swing_pct)
-    labeled = _label_swings(filtered, min_swing_pct)
-
-    result = _classify_labeled_sequence(labeled, score_threshold, min_swings_for_strong)
-    result["swing_highs"] = [p["price"] for p in filtered if p["type"] == "H"]
-    result["swing_lows"] = [p["price"] for p in filtered if p["type"] == "L"]
-    result["labeled_swings"] = [f'{l["type"]}:{l["label"]}' for l in labeled]
-    return result
-
-
-def _structure_headwind_level(structure: str, opposing_bias: str) -> str:
-    """How much extra caution an exhaustion engine should apply given the
-    current 5m structure. opposing_bias='bullish' is Engine 1 (SHORT fighting
-    a bullish tape); 'bearish' is Engine 3 (LONG fighting a bearish tape).
-    Structure never blocks the trade outright here -- it only raises the
-    pressure/volume bar the existing reversal checks must clear (requirement
-    11: structure is a filter/context signal, not an entry trigger)."""
-    if opposing_bias == "bullish":
-        if structure == "BULLISH_STRONG":
-            return "strong"
-        if structure == "BULLISH":
-            return "moderate"
-        return "none"
-    if opposing_bias == "bearish":
-        if structure == "BEARISH_STRONG":
-            return "strong"
-        if structure == "BEARISH":
-            return "moderate"
-        return "none"
-    return "none"
-
-
 def classify_vwap_zone(distance_pct: float, cfg: "Vwap3StageConfig") -> str:
+    """Buckets `distance_pct` ((price - vwap) / vwap) into the zone that
+    decides which of the three engines (if any) runs this tick:
+
+      "far_above" -> Engine 1 (short exhaustion)   distance_pct >  far_threshold
+      "far_below" -> Engine 3 (long exhaustion)     distance_pct < -far_threshold
+      "near"      -> Engine 2 (continuation battle) |distance_pct| < near_threshold
+      "neutral"   -> no engine runs
+
+    far_threshold is always > near_threshold (enforced nowhere in code,
+    just by sane config values), so there's always a deliberate gap
+    between "near" and "far" that falls through to neutral rather than
+    every price landing in exactly one of the two meaningful zones."""
     if distance_pct > cfg.vwap_far_threshold_pct:
         return "far_above"
     if distance_pct < -cfg.vwap_far_threshold_pct:
@@ -475,42 +323,43 @@ def classify_vwap_zone(distance_pct: float, cfg: "Vwap3StageConfig") -> str:
     return "neutral"
 
 
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+
 @dataclass
 class Vwap3StageConfig:
+    # Same meaning as observation_engine.ObservationConfig's equivalents.
     max_observation_minutes: float = 6.0
-    trend_candle_bar: str = TREND_CANDLE_BAR
+    trend_candle_bar: str = "1m"
     bucket_count: int = 5
-    window_ms: int = WINDOW_MS
-    vwap_window_ms: int = VWAP_WINDOW_MS
+    window_ms: int = 240_000  # recent-trade window for pressure/volume reads (short and reactive, by design)
+    vwap_window_ms: int = 1_800_000  # 30 min -- SEPARATE, longer window the zone-classifying VWAP is computed from.
+    # Must stay meaningfully longer than window_ms: this is what price is compared against to decide if it's
+    # "far" enough for Engine 1/3 to even look. A VWAP built from the same short window as pressure/volume just
+    # tracks current price and can never diverge enough to leave the near-zone -- see vwap_3stage_engine module notes.
     min_data_warmup_sec: float = 45.0
     min_data_trade_count: int = 15
     candle_fetch_buffer: int = 2
     symbol_whitelist: Optional[frozenset] = field(default_factory=lambda: DEFAULT_SYMBOL_WHITELIST)
 
-    vwap_far_threshold_pct: float = 0.005
-    vwap_near_threshold_pct: float = 0.0015
+    # --- VWAP zone thresholds (see classify_vwap_zone) ---
+    vwap_far_threshold_pct: float = 0.005  # 0.5% -- beyond this, Engine 1 (above) / Engine 3 (below)
+    vwap_near_threshold_pct: float = 0.0015  # 0.15% -- within this, Engine 2 (continuation)
+    # Between near and far: NEUTRAL, no engine runs. See module docstring.
 
-    swing_lookback: int = 20
-    swing_proximity_pct: float = 0.002
+    # --- Swing level detection (see get_swing_levels) ---
+    swing_lookback: int = 20  # closed candles looked back for swing high/low
+    swing_proximity_pct: float = 0.002  # 0.2% -- how close price must be to the swing level to count as "reached"
 
-    structure_candle_bar: str = STRUCTURE_CANDLE_BAR
-    structure_lookback_candles: int = STRUCTURE_LOOKBACK_CANDLES
-    structure_pivot_strength: int = STRUCTURE_PIVOT_STRENGTH
-    # Dual-purpose: minimum swing significance filter AND the HH/LH/HL/LL
-    # equality tolerance. Reused rather than adding a second threshold.
-    structure_equal_tolerance_pct: float = STRUCTURE_EQUAL_TOLERANCE_PCT
-    structure_trend_score_threshold: float = STRUCTURE_TREND_SCORE_THRESHOLD
-    structure_min_swings_for_strong: int = STRUCTURE_MIN_SWINGS_FOR_STRONG
-    structure_headwind_min_pressure_pct: float = STRUCTURE_HEADWIND_MIN_PRESSURE_PCT
-    structure_headwind_min_volume_pct: float = STRUCTURE_HEADWIND_MIN_VOLUME_PCT
-    structure_strong_headwind_min_pressure_pct: float = STRUCTURE_STRONG_HEADWIND_MIN_PRESSURE_PCT
-    structure_strong_headwind_min_volume_pct: float = STRUCTURE_STRONG_HEADWIND_MIN_VOLUME_PCT
-
+    # --- Engine 1 / Engine 3: exhaustion/reversal off a swing level ---
     reversal_min_pressure_pct: float = 70.0
     reversal_require_pressure_accelerating: bool = True
     reversal_min_volume_expansion_strength_pct: float = 55.0
     reversal_volume_expansion_multiplier: float = 1.4
 
+    # --- Engine 2: continuation battle at VWAP ---
     continuation_min_trend_strength_pct: float = 65.0
     continuation_min_net_move_pct: float = 0.0015
     continuation_min_pressure_pct: float = 70.0
@@ -519,37 +368,36 @@ class Vwap3StageConfig:
     continuation_volume_expansion_multiplier: float = 1.4
     continuation_require_candle_confirmation: bool = True
 
-    min_entry_trend_strength_pct: float = MIN_ENTRY_TREND_STRENGTH_PCT
-    min_entry_pressure_pct: float = MIN_ENTRY_PRESSURE_PCT
-    min_entry_volume_expansion_pct: float = MIN_ENTRY_VOLUME_EXPANSION_PCT
+
+# ---------------------------------------------------------------------------
+# Candidate state
+# ---------------------------------------------------------------------------
 
 
 @dataclass
 class CandidateObservation:
     symbol: str
-    direction: str = ""
-    status: str = "OBSERVING"
+    direction: str = ""  # "" whenever the current tick has no qualifying engine result; recomputed fresh every tick
+    status: str = "OBSERVING"  # OBSERVING / ACCEPTED / EXPIRED
     started_at: float = field(default_factory=time.time)
     last_checked_at: float = 0.0
 
-    data_ready: bool = False
+    data_ready: bool = False  # False until enough real trade-tape data has accumulated to trust pressure/volume
 
     trend: str = "sideways"
     trend_strength_pct: float = 0.0
 
-    buy_pressure_strength_pct: float = 0.0
+    buy_pressure_strength_pct: float = 0.0  # whichever side the active engine checked -- not always "buy" literally
     volume_strength_pct: float = 0.0
 
     vwap: Optional[float] = None
     vwap_distance_pct: float = 0.0
-    vwap_zone: str = "neutral"
+    vwap_zone: str = "neutral"  # far_above / near / far_below / neutral
 
     swing_high: Optional[float] = None
     swing_low: Optional[float] = None
 
-    market_structure: str = "UNCLEAR"
-
-    engine_used: str = ""
+    engine_used: str = ""  # "" / "engine1_short_exhaustion" / "engine2_continuation" / "engine3_long_exhaustion"
 
     entry_price: float = 0.0
 
@@ -559,6 +407,8 @@ class CandidateObservation:
 
     @property
     def direction_letter(self) -> str:
+        """Single-letter direction ('L'/'S') for compact logging. Returns
+        '?' whenever the current tick has no qualifying direction."""
         return self.direction[0].upper() if self.direction else "?"
 
     def status_line(self) -> str:
@@ -567,8 +417,7 @@ class CandidateObservation:
             f"{self.symbol} status={self.status} zone={self.vwap_zone} "
             f"direction={self.direction.upper() or '-'} elapsed={self.elapsed_sec:.0f}s "
             f"vwap={vwap_text} dist={self.vwap_distance_pct:+.2%} "
-            f"pressure={self.buy_pressure_strength_pct:.0f}% volume={self.volume_strength_pct:.0f}% "
-            f"structure={self.market_structure}"
+            f"pressure={self.buy_pressure_strength_pct:.0f}% volume={self.volume_strength_pct:.0f}%"
         )
         if self.engine_used:
             base += f" engine={self.engine_used}"
@@ -578,6 +427,15 @@ class CandidateObservation:
 
 
 class Vwap3StageEngine(StrategyEngine):
+    """Tracks one CandidateObservation per watchlisted symbol, same as
+    observation_engine.ObservationWindowManager, but every tick classifies
+    price's distance from VWAP into a zone and routes to at most one of
+    three independent engines — see this module's docstring for the full
+    rationale and strategy.base.StrategyEngine for the interface
+    tracker.py talks to.
+
+    Switch to this strategy by setting tracker.py's
+    STRATEGY_NAME = "vwap_3stage_engine"."""
 
     name = "vwap_3stage_engine"
 
@@ -596,6 +454,9 @@ class Vwap3StageEngine(StrategyEngine):
         self._lock = asyncio.Lock()
 
     async def sync_watchlist(self, watchlist_symbols) -> None:
+        """Starts observing any symbol newly present in the watchlist and
+        drops local state for any symbol that fell off it. Same
+        whitelist backstop as observation_engine.py."""
         watchlist_symbols = set(watchlist_symbols)
         whitelist = self.config.symbol_whitelist
         if whitelist:
@@ -623,6 +484,12 @@ class Vwap3StageEngine(StrategyEngine):
             return list(self._candidates.values())
 
     async def evaluate(self, symbol: str) -> Optional[Signal]:
+        """Runs one fresh check for `symbol`: computes VWAP distance,
+        classifies the zone, and routes to at most one engine. Returns a
+        ready-to-open market_data.Signal the moment that engine accepts,
+        else None — including on every tick where the zone doesn't
+        qualify for any engine, or the active engine's own conditions
+        aren't met yet. Nothing is remembered from a prior tick."""
         cfg = self.config
         async with self._lock:
             candidate = self._candidates.get(symbol)
@@ -643,6 +510,9 @@ class Vwap3StageEngine(StrategyEngine):
         price = market["last_price"]
         candidate.entry_price = price
 
+        # Fetch enough closed candles to cover both the trend check
+        # (bucket_count) and swing-level detection (swing_lookback),
+        # whichever needs more, plus the usual forming-candle buffer.
         fetch_count = max(cfg.bucket_count, cfg.swing_lookback) + cfg.candle_fetch_buffer
         try:
             raw_candles = await self._candle_fetcher(symbol, cfg.trend_candle_bar, fetch_count)
@@ -660,23 +530,6 @@ class Vwap3StageEngine(StrategyEngine):
         candidate.swing_high = swing["swing_high"]
         candidate.swing_low = swing["swing_low"]
 
-        structure_fetch_count = cfg.structure_lookback_candles + cfg.candle_fetch_buffer
-        try:
-            structure_candles = await self._candle_fetcher(symbol, cfg.structure_candle_bar, structure_fetch_count)
-        except Exception as exc:
-            log.warning(f"[vwap3stage] {symbol} — could not fetch structure candles: {exc}")
-            return None
-        _, structure_closed = _split_forming_and_closed(structure_candles)
-        structure_result = classify_market_structure(
-            structure_closed[: cfg.structure_lookback_candles],
-            cfg.structure_pivot_strength,
-            cfg.structure_equal_tolerance_pct,
-            cfg.structure_trend_score_threshold,
-            cfg.structure_min_swings_for_strong,
-        )
-        market_structure = structure_result["structure"]
-        candidate.market_structure = market_structure
-
         window_trades = await self._trade_store.get_window(symbol, cfg.window_ms)
         was_ready = candidate.data_ready
         candidate.data_ready = (
@@ -691,6 +544,9 @@ class Vwap3StageEngine(StrategyEngine):
         if not candidate.data_ready:
             return None
 
+        # VWAP is deliberately computed from a much longer, separate window than the pressure/volume
+        # reads above -- using the same short window here would make VWAP just shadow current price
+        # and Engine 1/3 would never see a "far" zone.
         try:
             vwap_trades = await self._trade_store.get_window(symbol, cfg.vwap_window_ms)
         except Exception as exc:
@@ -708,40 +564,40 @@ class Vwap3StageEngine(StrategyEngine):
 
         if zone == "far_above":
             candidate.engine_used = "engine1_short_exhaustion"
-            return await self._evaluate_engine1_short(
-                candidate, price, distance_pct, window_trades, trend_result, market_structure
-            )
+            return await self._evaluate_engine1_short(candidate, price, distance_pct, window_trades)
         if zone == "near":
             candidate.engine_used = "engine2_continuation"
-            return await self._evaluate_engine2_continuation(
-                candidate, price, trend_result, window_trades, support_candle, market_structure
-            )
+            return await self._evaluate_engine2_continuation(candidate, price, trend_result, window_trades, support_candle)
         if zone == "far_below":
             candidate.engine_used = "engine3_long_exhaustion"
-            return await self._evaluate_engine3_long(
-                candidate, price, distance_pct, window_trades, market_structure
-            )
+            return await self._evaluate_engine3_long(candidate, price, distance_pct, window_trades)
 
+        # Neutral -- neither far enough for a reversal read nor close
+        # enough for a continuation read. Sit this tick out.
         candidate.engine_used = ""
         candidate.direction = ""
         return None
 
     async def _evaluate_engine1_short(
-        self,
-        candidate: CandidateObservation,
-        price: float,
-        distance_pct: float,
-        window_trades: List[dict],
-        trend_result: Dict,
-        market_structure: str,
+        self, candidate: CandidateObservation, price: float, distance_pct: float, window_trades: List[dict]
     ) -> Optional[Signal]:
+        """Engine 1: price far above VWAP -> wait for a swing-high
+        resistance retest with sellers visibly taking over before
+        opening SHORT. Never opens LONG here -- chasing an already
+        overextended move is exactly what this engine exists to avoid."""
         cfg = self.config
+        swing_high = candidate.swing_high
+        if not swing_high:
+            candidate.direction = ""
+            return None
 
-        # Compute pressure/volume immediately, before any gate below can
-        # short-circuit. Previously this only ran after the swing/proximity/
-        # structure checks passed, so on every cycle one of those gates
-        # rejected first, the status log kept showing a stale 0%/0% instead
-        # of the real current reading.
+        proximity_pct = abs(price - swing_high) / swing_high
+        if proximity_pct >= cfg.swing_proximity_pct:
+            # Far above VWAP, but not yet at the resistance level --
+            # keep waiting, don't guess early.
+            candidate.direction = ""
+            return None
+
         direction = "short"
         pressure = compute_buy_pressure_strength(window_trades, direction, cfg.bucket_count)
         volume = compute_volume_expansion_strength(
@@ -750,51 +606,12 @@ class Vwap3StageEngine(StrategyEngine):
         candidate.buy_pressure_strength_pct = pressure["strength_pct"]
         candidate.volume_strength_pct = volume["strength_pct"]
 
-        swing_high = candidate.swing_high
-        if not swing_high:
-            candidate.direction = ""
-            return None
-
-        proximity_pct = abs(price - swing_high) / swing_high
-        if proximity_pct >= cfg.swing_proximity_pct:
-            candidate.direction = ""
-            return None
-
-        if market_structure == "UNCLEAR":
-            # Not enough completed 5m candles/swings yet to read structure at
-            # all. That's different from a genuine RANGE read -- "we don't
-            # know" must never silently pass as "no headwind."
-            candidate.direction = ""
-            return None
-
-        # A bullish (or strongly bullish) 5m structure is a headwind for an
-        # exhaustion SHORT: rather than block outright, demand pressure/volume
-        # clear a higher bar than the normal reversal minimums. Once structure
-        # is transitioning bullish-to-bearish (weakening), no extra bar applies
-        # -- that's exactly the read this engine is trying to catch.
-        headwind = _structure_headwind_level(market_structure, "bullish")
-        if headwind == "strong":
-            min_pressure = max(cfg.reversal_min_pressure_pct, cfg.structure_strong_headwind_min_pressure_pct)
-            min_volume = max(cfg.reversal_min_volume_expansion_strength_pct, cfg.structure_strong_headwind_min_volume_pct)
-        elif headwind == "moderate":
-            min_pressure = max(cfg.reversal_min_pressure_pct, cfg.structure_headwind_min_pressure_pct)
-            min_volume = max(cfg.reversal_min_volume_expansion_strength_pct, cfg.structure_headwind_min_volume_pct)
-        else:
-            min_pressure = cfg.reversal_min_pressure_pct
-            min_volume = cfg.reversal_min_volume_expansion_strength_pct
-
-        pressure_ok = pressure["strength_pct"] >= min_pressure
+        pressure_ok = pressure["strength_pct"] >= cfg.reversal_min_pressure_pct
         if cfg.reversal_require_pressure_accelerating:
             pressure_ok = pressure_ok and pressure["accelerating"]
-        volume_ok = volume["expanding"] and volume["strength_pct"] >= min_volume
+        volume_ok = volume["expanding"] and volume["strength_pct"] >= cfg.reversal_min_volume_expansion_strength_pct
 
-        entry_reqs_ok = (
-            trend_result["strength_pct"] >= cfg.min_entry_trend_strength_pct
-            and pressure["strength_pct"] >= cfg.min_entry_pressure_pct
-            and volume["strength_pct"] >= cfg.min_entry_volume_expansion_pct
-        )
-
-        if not (pressure_ok and volume_ok and entry_reqs_ok):
+        if not (pressure_ok and volume_ok):
             candidate.direction = ""
             return None
 
@@ -804,7 +621,6 @@ class Vwap3StageEngine(StrategyEngine):
             f"[vwap3stage] ENGINE 1 ACCEPTED: {symbol}\n"
             f"  Price far above VWAP (distance={distance_pct:+.2%})\n"
             f"  Swing resistance reached (price={price:.6g}, swing_high={swing_high:.6g})\n"
-            f"  Structure={market_structure} (headwind={headwind})\n"
             f"  Seller pressure {pressure['strength_pct']:.0f}%\n"
             f"  Sell volume expanding"
         )
@@ -815,39 +631,25 @@ class Vwap3StageEngine(StrategyEngine):
             direction=direction,
             confidence=1.0,
             entry_price=price,
-            take_profit=price,
+            take_profit=price,  # unused -- execution_engine computes its own TP/SL
             stop_loss=price,
             timestamp=time.time(),
             reasons=[
                 "engine=1_short_exhaustion",
                 f"vwap_distance={distance_pct:+.2%}",
                 f"swing_high={swing_high:.6g}",
-                f"structure={market_structure}",
                 f"seller_pressure={pressure['strength_pct']:.0f}%",
                 f"sell_volume_expansion={volume['strength_pct']:.0f}%",
             ],
         )
 
     async def _evaluate_engine3_long(
-        self,
-        candidate: CandidateObservation,
-        price: float,
-        distance_pct: float,
-        window_trades: List[dict],
-        market_structure: str,
+        self, candidate: CandidateObservation, price: float, distance_pct: float, window_trades: List[dict]
     ) -> Optional[Signal]:
+        """Engine 3: mirror of Engine 1 -- price far below VWAP -> wait
+        for a swing-low support retest with buyers visibly taking over
+        before opening LONG. Never opens SHORT here."""
         cfg = self.config
-
-        # Compute pressure/volume immediately, before any gate below can
-        # short-circuit -- see Engine 1 for the same fix and reasoning.
-        direction = "long"
-        pressure = compute_buy_pressure_strength(window_trades, direction, cfg.bucket_count)
-        volume = compute_volume_expansion_strength(
-            window_trades, direction, cfg.bucket_count, cfg.reversal_volume_expansion_multiplier
-        )
-        candidate.buy_pressure_strength_pct = pressure["strength_pct"]
-        candidate.volume_strength_pct = volume["strength_pct"]
-
         swing_low = candidate.swing_low
         if not swing_low:
             candidate.direction = ""
@@ -858,32 +660,18 @@ class Vwap3StageEngine(StrategyEngine):
             candidate.direction = ""
             return None
 
-        if market_structure == "UNCLEAR":
-            # Same reasoning as Engine 1: insufficient structure data must
-            # never be treated as "no headwind" -- don't trade blind.
-            candidate.direction = ""
-            return None
+        direction = "long"
+        pressure = compute_buy_pressure_strength(window_trades, direction, cfg.bucket_count)
+        volume = compute_volume_expansion_strength(
+            window_trades, direction, cfg.bucket_count, cfg.reversal_volume_expansion_multiplier
+        )
+        candidate.buy_pressure_strength_pct = pressure["strength_pct"]
+        candidate.volume_strength_pct = volume["strength_pct"]
 
-        # A bearish (or strongly bearish) 5m structure is a headwind for an
-        # exhaustion LONG: rather than block outright, demand pressure/volume
-        # clear a higher bar than the normal reversal minimums. Once structure
-        # is transitioning bearish-to-bullish, no extra bar applies -- that's
-        # exactly the possible reversal this engine is trying to catch.
-        headwind = _structure_headwind_level(market_structure, "bearish")
-        if headwind == "strong":
-            min_pressure = max(cfg.reversal_min_pressure_pct, cfg.structure_strong_headwind_min_pressure_pct)
-            min_volume = max(cfg.reversal_min_volume_expansion_strength_pct, cfg.structure_strong_headwind_min_volume_pct)
-        elif headwind == "moderate":
-            min_pressure = max(cfg.reversal_min_pressure_pct, cfg.structure_headwind_min_pressure_pct)
-            min_volume = max(cfg.reversal_min_volume_expansion_strength_pct, cfg.structure_headwind_min_volume_pct)
-        else:
-            min_pressure = cfg.reversal_min_pressure_pct
-            min_volume = cfg.reversal_min_volume_expansion_strength_pct
-
-        pressure_ok = pressure["strength_pct"] >= min_pressure
+        pressure_ok = pressure["strength_pct"] >= cfg.reversal_min_pressure_pct
         if cfg.reversal_require_pressure_accelerating:
             pressure_ok = pressure_ok and pressure["accelerating"]
-        volume_ok = volume["expanding"] and volume["strength_pct"] >= min_volume
+        volume_ok = volume["expanding"] and volume["strength_pct"] >= cfg.reversal_min_volume_expansion_strength_pct
 
         if not (pressure_ok and volume_ok):
             candidate.direction = ""
@@ -895,7 +683,6 @@ class Vwap3StageEngine(StrategyEngine):
             f"[vwap3stage] ENGINE 3 ACCEPTED: {symbol}\n"
             f"  Price far below VWAP (distance={distance_pct:+.2%})\n"
             f"  Swing support reached (price={price:.6g}, swing_low={swing_low:.6g})\n"
-            f"  Structure={market_structure} (headwind={headwind})\n"
             f"  Buyer pressure {pressure['strength_pct']:.0f}%\n"
             f"  Buy volume expanding"
         )
@@ -913,7 +700,6 @@ class Vwap3StageEngine(StrategyEngine):
                 "engine=3_long_exhaustion",
                 f"vwap_distance={distance_pct:+.2%}",
                 f"swing_low={swing_low:.6g}",
-                f"structure={market_structure}",
                 f"buyer_pressure={pressure['strength_pct']:.0f}%",
                 f"buy_volume_expansion={volume['strength_pct']:.0f}%",
             ],
@@ -926,29 +712,15 @@ class Vwap3StageEngine(StrategyEngine):
         trend_result: Dict,
         window_trades: List[dict],
         support_candle: Optional[dict],
-        market_structure: str,
     ) -> Optional[Signal]:
+        """Engine 2: price is retesting VWAP -- checks whether the side
+        the established micro-trend already favors is strong enough to
+        defend it and continue (not whether the OTHER side is reversing
+        it; that's Engine 1/3's job at the swing levels, not here).
+        Bullish trend -> only buyers are checked; bearish trend -> only
+        sellers. A sideways/weak trend has no side to check at all, so
+        nothing fires."""
         cfg = self.config
-        direction = trend_result["direction"]
-
-        # Compute pressure/volume for whichever side the 1m trend currently
-        # favors, before the trend/structure gates below can short-circuit --
-        # same fix as Engine 1/3. A sideways trend has no side to measure (the
-        # helper defaults anything other than "long" to "sell"), so it's left
-        # at 0, which is an honest "no directional signal" rather than stale.
-        if direction in ("long", "short"):
-            pressure = compute_buy_pressure_strength(window_trades, direction, cfg.bucket_count)
-            volume = compute_volume_expansion_strength(
-                window_trades, direction, cfg.bucket_count, cfg.continuation_volume_expansion_multiplier
-            )
-            candidate.buy_pressure_strength_pct = pressure["strength_pct"]
-            candidate.volume_strength_pct = volume["strength_pct"]
-        else:
-            pressure = {"strength_pct": 0.0, "accelerating": False}
-            volume = {"strength_pct": 0.0, "expanding": False}
-            candidate.buy_pressure_strength_pct = 0.0
-            candidate.volume_strength_pct = 0.0
-
         trend_ok = (
             trend_result["direction"] != "sideways"
             and trend_result["strength_pct"] >= cfg.continuation_min_trend_strength_pct
@@ -958,13 +730,13 @@ class Vwap3StageEngine(StrategyEngine):
             candidate.direction = ""
             return None
 
-        structure_ok = (
-            (direction == "long" and market_structure in ("BULLISH", "BULLISH_STRONG"))
-            or (direction == "short" and market_structure in ("BEARISH", "BEARISH_STRONG"))
+        direction = trend_result["direction"]  # "long" continues a bullish trend, "short" continues a bearish one
+        pressure = compute_buy_pressure_strength(window_trades, direction, cfg.bucket_count)
+        volume = compute_volume_expansion_strength(
+            window_trades, direction, cfg.bucket_count, cfg.continuation_volume_expansion_multiplier
         )
-        if not structure_ok:
-            candidate.direction = ""
-            return None
+        candidate.buy_pressure_strength_pct = pressure["strength_pct"]
+        candidate.volume_strength_pct = volume["strength_pct"]
 
         pressure_ok = pressure["strength_pct"] >= cfg.continuation_min_pressure_pct
         if cfg.continuation_require_pressure_accelerating:
@@ -975,13 +747,7 @@ class Vwap3StageEngine(StrategyEngine):
             or _candle_supports_direction(support_candle, direction)
         )
 
-        entry_reqs_ok = (
-            trend_result["strength_pct"] >= cfg.min_entry_trend_strength_pct
-            and pressure["strength_pct"] >= cfg.min_entry_pressure_pct
-            and volume["strength_pct"] >= cfg.min_entry_volume_expansion_pct
-        )
-
-        if not (pressure_ok and volume_ok and candle_ok and entry_reqs_ok):
+        if not (pressure_ok and volume_ok and candle_ok):
             candidate.direction = ""
             return None
 
@@ -993,7 +759,6 @@ class Vwap3StageEngine(StrategyEngine):
             f"[vwap3stage] ENGINE 2 ACCEPTED: {symbol}\n"
             f"  VWAP continuation\n"
             f"  {trend_label} trend ({trend_result['strength_pct']:.0f}% strength)\n"
-            f"  Structure={market_structure}\n"
             f"  {side_label} dominance {pressure['strength_pct']:.0f}%"
         )
         async with self._lock:
@@ -1009,7 +774,6 @@ class Vwap3StageEngine(StrategyEngine):
             reasons=[
                 "engine=2_continuation",
                 f"trend={trend_result['direction']}:{trend_result['strength_pct']:.0f}%",
-                f"structure={market_structure}",
                 f"dominance={pressure['strength_pct']:.0f}%",
                 f"volume_expansion={volume['strength_pct']:.0f}%",
             ],
@@ -1017,5 +781,7 @@ class Vwap3StageEngine(StrategyEngine):
 
 
 def build(ctx: StrategyContext) -> Vwap3StageEngine:
+    """strategy.load_strategy()'s entry point — see strategy/base.py's
+    module docstring for the contract every strategy module follows."""
     cfg = ctx.build_config(Vwap3StageConfig)
     return Vwap3StageEngine(ctx.trade_store, ctx.market_data, ctx.candle_fetcher, config=cfg)
