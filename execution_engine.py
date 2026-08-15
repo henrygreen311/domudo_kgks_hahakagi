@@ -46,7 +46,7 @@ PERMANENTLY_UNTRADEABLE_OKX_CODES = {
 class ExecutionConfig:
     margin_per_trade_usdt: float = 1.0
     requested_leverage: int = 100
-    min_leverage_required: int = 10
+    min_leverage_required: int = 50
     max_open_positions: int = 5
     max_total_trades: int = 10
     target_net_profit_usdt: float = 0.10
@@ -67,7 +67,13 @@ class ExecutionConfig:
 
     fallback_leverage: int = 10
 
-    high_leverage_symbols: frozenset = frozenset({"ETH-USDT-SWAP"})
+    # Symbols in this set use requested_leverage instead of
+    # fallback_leverage -- e.g. frozenset({"SOME-USDT-SWAP"}) to give
+    # that one symbol the higher tier while everything else, including
+    # ETH-USDT-SWAP, stays on fallback_leverage. Empty by default: every
+    # symbol uses fallback_leverage until one is explicitly added here.
+    # See tracker.py's HIGH_LEVERAGE_SYMBOLS for the actual live value.
+    high_leverage_symbols: frozenset = frozenset()
 
     target_stop_loss_usdt: float = 0.9
 
