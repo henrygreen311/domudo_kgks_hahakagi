@@ -1,7 +1,7 @@
 """
 orderflow_bb_scalper_engine.py
 
-Fast ETH-USDT scalping strategy.
+Fast ETH-USDT scalping strategy — tuned for ~20 signals/day.
 
 Different from vwap_3stage_engine:
 - No VWAP
@@ -10,16 +10,16 @@ Different from vwap_3stage_engine:
 
 Indicators used:
 - Bollinger Bands (overextension / snap-back)
-- RSI (overbought / oversold)
+- RSI (overbought / oversold) — relaxed thresholds for frequency
 - ATR (volatility gate)
 - EMA fast/slow (context)
 - Order-flow aggressor imbalance z-score
 
 Signal is only emitted when:
-1. Price is at a Bollinger Band extreme
-2. RSI is oversold/overbought in the bounce direction
-3. Order-flow aggressor imbalance flips strongly in the bounce direction
-4. ATR confirms there is enough volatility for a 0.09% TP
+1. Price is at a Bollinger Band extreme (within 0.15%)
+2. RSI is oversold/overbought in the bounce direction (45/55)
+3. Order-flow aggressor imbalance flips strongly in the bounce direction (≥55%)
+4. ATR confirms there is enough volatility for a 0.09% TP (≥0.05%)
 
 Target example:
   Entry ≈ 1882.60
@@ -252,40 +252,40 @@ def compute_order_flow_imbalance(trades: List[dict], direction: str, bucket_coun
 
 
 # ---------------------------------------------------------------------------
-# Config
+# Config (relaxed for ~20 signals/day)
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class OrderFlowBollingerScalperConfig:
-    max_observation_minutes: float = 4.0
+    max_observation_minutes: float = 15.0   # longer observation window
     trend_candle_bar: str = "1m"
 
     bb_period: int = 20
     bb_std: float = 2.0
-    bb_skin_pct: float = 0.0008  # price must be within 0.08% of band extreme
+    bb_skin_pct: float = 0.0015             # 0.15% proximity to band extreme
 
     rsi_period: int = 14
-    rsi_oversold: float = 35.0
-    rsi_overbought: float = 65.0
+    rsi_oversold: float = 45.0              # relaxed from 35
+    rsi_overbought: float = 55.0            # relaxed from 65
 
     ema_fast_period: int = 9
     ema_slow_period: int = 21
 
     atr_period: int = 14
-    min_atr_pct: float = 0.0009  # need at least ~0.09% average range to hit TP
+    min_atr_pct: float = 0.0005             # 0.05% min volatility
 
-    trade_window_ms: int = 30000  # 30s order-flow window
+    trade_window_ms: int = 60000            # 1-minute order-flow window
     flow_bucket_count: int = 6
-    flow_strength_min: float = 70.0
-    flow_ratio_min: float = 0.60
-    flow_burst_required: bool = True
+    flow_strength_min: float = 55.0         # relaxed from 70
+    flow_ratio_min: float = 0.55            # relaxed from 0.60
+    flow_burst_required: bool = False       # burst not mandatory
 
-    tp_distance_pct: float = 0.0009  # 0.09%
-    sl_distance_pct: float = 0.0006  # 0.06% initial stop
+    tp_distance_pct: float = 0.0009         # 0.09%
+    sl_distance_pct: float = 0.0006         # 0.06% initial stop
 
-    min_data_warmup_sec: float = 20.0
-    min_data_trade_count: int = 25
+    min_data_warmup_sec: float = 10.0       # faster warm-up
+    min_data_trade_count: int = 10          # fewer trades needed
     candle_fetch_buffer: int = 5
 
     # Accept any pair by default — override with a frozenset if you want to restrict.
@@ -351,7 +351,8 @@ class OrderFlowBollingerScalperEngine(StrategyEngine):
     Fast scalping engine using Bollinger Band overextension + RSI exhaustion
     + aggressor order-flow imbalance reversal.
 
-    Designed for ETH-USDT and a very tight TP around 0.09%.
+    Tuned for higher frequency (~20 signals/day) while still requiring
+    price at a band extreme and directional order-flow confirmation.
     """
 
     name = "orderflow_bb_scalper_engine"
