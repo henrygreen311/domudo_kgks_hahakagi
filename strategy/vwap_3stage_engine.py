@@ -70,6 +70,28 @@ log = logging.getLogger("okx_futures.micropulse_ignition")
 CandleFetcher = Callable[[str, str, int], Awaitable[List[dict]]]
 
 
+def _resolve_attr(obj, candidate_names, label: str):
+    """Pulls the first attribute in `candidate_names` that exists (and is
+    not None) on `obj`. Exists because the loader hands this module a
+    StrategyContext instance whose exact field names aren't visible from
+    here -- rather than hardcoding one guess and failing with a bare
+    AttributeError deep in a method call, this fails fast at construction
+    time with a message naming what it looked for and what's actually on
+    the object, so a naming mismatch is a one-line fix instead of a
+    traceback hunt."""
+    for name in candidate_names:
+        if hasattr(obj, name):
+            val = getattr(obj, name)
+            if val is not None:
+                return val
+    available = [a for a in dir(obj) if not a.startswith("_")]
+    raise AttributeError(
+        f"MicroPulseIgnitionEngine: couldn't find a {label} on the strategy context "
+        f"(tried {list(candidate_names)}). Attributes available on context: {available}. "
+        f"Adjust the candidate_names list in build()/__init__ to match your StrategyContext."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Pure signal functions
 # ---------------------------------------------------------------------------
@@ -394,15 +416,26 @@ class MicroPulseIgnitionEngine(StrategyEngine):
     def __init__(
         self,
         context: StrategyContext,
-        trade_store: TradeStore,
-        market_data: MarketDataStore,
-        fetch_candles: CandleFetcher,
         config: Optional[MicroPulseConfig] = None,
+        *,
+        trade_store: Optional[TradeStore] = None,
+        market_data: Optional[MarketDataStore] = None,
+        fetch_candles: Optional[CandleFetcher] = None,
     ):
+        # trade_store / market_data / fetch_candles can be passed explicitly
+        # (handy for tests or if the loader's build(ctx) wants to wire them
+        # itself) but normally get pulled straight off the context, same as
+        # the other engines in this strategy set.
         self.context = context
-        self.trade_store = trade_store
-        self.market_data = market_data
-        self.fetch_candles = fetch_candles
+        self.trade_store = trade_store or _resolve_attr(
+            context, ("trade_store", "trades", "trade_store_v0"), "TradeStore"
+        )
+        self.market_data = market_data or _resolve_attr(
+            context, ("market_data", "market_data_store", "market_store"), "MarketDataStore"
+        )
+        self.fetch_candles = fetch_candles or _resolve_attr(
+            context, ("fetch_candles", "get_candles", "candle_fetcher"), "candle fetch function"
+        )
         self.cfg = config or MicroPulseConfig()
         self._candidates: Dict[str, MicroPulseCandidate] = {}
 
@@ -540,3 +573,19 @@ class MicroPulseIgnitionEngine(StrategyEngine):
             for sig in await self.run_once():
                 await self.context.emit_signal(sig)
             await asyncio.sleep(poll_interval_sec)
+
+
+# ---------------------------------------------------------------------------
+# Loader entry point
+# ---------------------------------------------------------------------------
+
+
+def build(ctx: StrategyContext) -> MicroPulseIgnitionEngine:
+    """Factory function strategy/__init__.py's load_strategy() looks for
+    on every strategy/*.py module -- without this, loading this module by
+    name fails with "has no build(ctx) factory function", the same error
+    you'd get from any strategy file missing it (including the original
+    vwap_3stage_engine.py as pasted -- it was cut off mid-class and never
+    showed one either, so add the equivalent there too if you're loading
+    that one)."""
+    return MicroPulseIgnitionEngine(ctx)
