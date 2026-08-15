@@ -67,7 +67,7 @@ class ExecutionConfig:
 
     fallback_leverage: int = 10
 
-    high_leverage_symbols: frozenset = frozenset({"ETH-USDT-SWAP"})
+    high_leverage_symbols: frozenset = frozenset({"LINK-USDT-SWAP"})
 
     target_stop_loss_usdt: float = 0.9
 
