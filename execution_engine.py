@@ -46,7 +46,7 @@ PERMANENTLY_UNTRADEABLE_OKX_CODES = {
 class ExecutionConfig:
     margin_per_trade_usdt: float = 1.0
     requested_leverage: int = 100
-    min_leverage_required: int = 50
+    min_leverage_required: int = 10
     max_open_positions: int = 5
     max_total_trades: int = 10
     target_net_profit_usdt: float = 0.10
@@ -67,7 +67,7 @@ class ExecutionConfig:
 
     fallback_leverage: int = 10
 
-    high_leverage_symbols: frozenset = frozenset({"LINK-USDT-SWAP"})
+    high_leverage_symbols: frozenset = frozenset({"ETH-USDT-SWAP"})
 
     target_stop_loss_usdt: float = 0.9
 
