@@ -308,7 +308,7 @@ class FlowIgnitionConfig:
     # typical liquidity and ~0.05-0.15%-scale scalp moves specifically,
     # and won't transfer to a thinner or a much more volatile pair
     # unmodified. Widen deliberately, not by default.
-    symbol_whitelist: Optional[frozenset] = field(default_factory=lambda: frozenset({"ETH-USDT"}))
+    symbol_whitelist: Optional[frozenset] = field(default_factory=lambda: frozenset({"ETH-USDT-SWAP"}))
 
     # --- the two trade-tape windows (see module docstring) ---
     baseline_window_ms: int = 180_000  # 3 min -- "normal pace" reference window
