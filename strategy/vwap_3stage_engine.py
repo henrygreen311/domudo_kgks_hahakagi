@@ -144,6 +144,8 @@ def _classify_aggressor(trades: List[dict]) -> List[dict]:
     """
     Classify each trade as buy-aggressor or sell-aggressor using price
     direction, not just the reported side field.
+
+    Preserves the original 'timestamp' field so downstream sorting works.
     """
     ordered = sorted(trades, key=lambda t: t["timestamp"])
     prev_price = None
@@ -160,7 +162,12 @@ def _classify_aggressor(trades: List[dict]) -> List[dict]:
         else:
             aggressor = "sell"
 
-        out.append({"price": price, "qty": qty, "aggressor": aggressor})
+        out.append({
+            "timestamp": t["timestamp"],   # <-- CRITICAL: keep timestamp for sorting later
+            "price": price,
+            "qty": qty,
+            "aggressor": aggressor,
+        })
         prev_price = price
 
     return out
