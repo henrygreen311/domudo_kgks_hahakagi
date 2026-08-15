@@ -281,9 +281,8 @@ class OrderFlowBollingerScalperConfig:
     min_data_trade_count: int = 25
     candle_fetch_buffer: int = 5
 
-    symbol_whitelist: Optional[frozenset] = field(
-        default_factory=lambda: frozenset({"ETH-USDT"})
-    )
+    # Accept any pair by default — override with a frozenset if you want to restrict.
+    symbol_whitelist: Optional[frozenset] = None
 
 
 # ---------------------------------------------------------------------------
