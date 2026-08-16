@@ -145,7 +145,7 @@ def dominant_side_trade_count(ignition_trades: List[dict], direction: str) -> in
 
 @dataclass
 class FlowIgnitionConfig:
-    symbol_whitelist: Optional[frozenset] = field(default_factory=lambda: frozenset({"ETH-USDT"}))
+    symbol_whitelist: Optional[frozenset] = field(default_factory=lambda: frozenset({"ETH-USDT-SWAP"}))
 
     baseline_window_ms: int = 180_000
     ignition_window_ms: int = 8_000
