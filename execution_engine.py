@@ -1,22 +1,12 @@
 """
 Execution engine for OKX Demo Trading (USDT-margined perpetual swaps).
-
-This module replaces the old paper-trading simulator with a real (demo)
-execution path: it opens actual Demo Trading positions through the OKX
-API, waits for the fill, computes a take-profit price from the *actual*
-filled price and *actual* opening fee (never a hardcoded fee assumption),
-and places that take-profit on the exchange as a standalone TP algo order.
-It also tracks how many positions are open so the bot never exceeds the
-configured concurrency cap.
-
-Position mode (net vs. hedge) is configured on the `OKXFuturesClient`
-instance passed in here — see okx_futures_client.py's module docstring.
-It must match whatever the OKX account is actually set to.
-
-`ExecutionEngineBase` exists so a live-trading engine can be added later by
-subclassing and swapping only the parts that differ (e.g. credential
-source, risk limits) while reusing the sizing/TP math and position
-bookkeeping here.
+Opens real Demo Trading positions via the OKX API, waits for the fill,
+computes TP/SL from the actual filled price and fee, and places them as
+algo orders. Tracks open-position count against the concurrency cap.
+Position mode (net vs hedge) is set on OKXFuturesClient, not here — must
+match the account's actual setting. ExecutionEngineBase exists so a
+live-trading engine can subclass and swap only what differs later,
+reusing the sizing/TP/position logic.
 """
 
 import asyncio
@@ -66,96 +56,19 @@ class ExecutionConfig:
     min_liquidation_distance_pct: float = 0.012
 
     fallback_leverage: int = 10
-
-    # Symbols in this set use requested_leverage instead of
-    # fallback_leverage -- e.g. frozenset({"SOME-USDT-SWAP"}) to give
-    # that one symbol the higher tier while everything else, including
-    # ETH-USDT-SWAP, stays on fallback_leverage. Empty by default: every
-    # symbol uses fallback_leverage until one is explicitly added here.
-    # See tracker.py's HIGH_LEVERAGE_SYMBOLS for the actual live value.
-    high_leverage_symbols: frozenset = frozenset()
+    high_leverage_symbols: frozenset = frozenset({"ETH-USDT-SWAP"})
 
     target_stop_loss_usdt: float = 0.9
 
-    # --- Funding-rate guard ---
-    # OKX charges/pays funding periodically (typically every 8h) based on
-    # each open position's side: a POSITIVE funding rate means longs pay
-    # shorts, a NEGATIVE rate means shorts pay longs. A trade that holds
-    # through a settlement on the paying side gets that cost deducted
-    # from realized_pnl regardless of how the TP/SL itself resolved --
-    # real cases seen: a short that hit its stop-loss cleanly still had
-    # -0.38 USDT in funding fees on top, and a short that hit take-profit
-    # for +0.56 gross was left with only +0.06 net after -0.446 USDT in
-    # funding. Both were entirely avoidable: funding direction is known
-    # BEFORE opening, from OKX's own public funding-rate endpoint.
-    #
-    # enable_funding_guard=True checks the current funding rate against
-    # the signal's own direction right before opening (alongside the
-    # liquidation guard) and discards the signal if funding is against
-    # it by more than funding_rate_tolerance -- a long is blocked when
-    # funding_rate > tolerance, a short when funding_rate < -tolerance.
-    # Rates flip sign often and are usually tiny, so most trades are
-    # unaffected either way; this only ever blocks the specific case
-    # where the position would start out already paying to hold.
-    #
-    # Fails OPEN (allows the trade through) if the funding-rate fetch
-    # itself errors, since this is a cost-avoidance heuristic, not a
-    # capital-safety mechanism like the liquidation guard -- an
-    # occasional missed check from an API hiccup isn't worth blocking an
-    # otherwise-valid signal over.
     enable_funding_guard: bool = True
     funding_rate_tolerance: float = 0.0
 
-    # --- Stop-loss slippage cap ---
-    # Take-profit stays a pure, uncapped market order (tpOrdPx="-1")
-    # deliberately -- an uncapped TP can only ever slip into a SMALLER
-    # win (or, occasionally, a bigger one -- market slippage cuts both
-    # ways), never a loss, so there's nothing worth capping there. A
-    # stop-loss is the opposite: its whole job is loss containment, and
-    # an uncapped SL market order can slip into an ARBITRARILY larger
-    # loss during a fast move -- on a small notional with a small
-    # target_stop_loss_usdt, a handful of bad slips a day can wipe out
-    # several good trades' worth of profit.
-    #
-    # sl_limit_slippage_pct caps that: instead of slOrdPx="-1", the SL
-    # leg is placed with an actual limit price this far beyond the
-    # trigger (0.25% by default), so the worst possible fill is bounded
-    # at roughly target_stop_loss_usdt plus this percentage of notional,
-    # not unbounded. The tradeoff: a limit order can go unfilled if price
-    # gaps straight through it, which would otherwise leave the position
-    # exposed with no working protection at all -- monitor_positions
-    # watches for exactly that (mark price has moved past the SL's own
-    # limit price while the position still shows as open) and forces an
-    # uncapped market close the moment it's detected, so a capped SL
-    # price never turns into unbounded exposure TIME, only a bounded
-    # worst-case PRICE before that fail-safe takes over.
     sl_limit_slippage_pct: float = 0.0025
 
-    # --- Trailing profit floor (see tp_tracker.py) ---
-    # Once a position's peak unrealized profit reaches
-    # trailing_tp_activation_usdt, the stop-loss is walked up to lock in
-    # (peak - trailing_tp_lag_usdt) instead of sitting at the original
-    # loss-side stop. Capped at target_net_profit_usdt, which is where
-    # the original take-profit order already fires on its own.
-    #
-    # Set enable_trailing_tp=False to turn this whole feature off without
-    # touching tp_tracker.py itself: maybe_ratchet_stop_loss_for and
-    # _maybe_ratchet_stop_loss both become no-ops, so every position just
-    # rides its original fixed stop-loss/take-profit from open to close,
-    # exactly as if tp_tracker.py didn't exist. See tracker.py's
-    # TP_TRACKER_ENABLED for the single switch that controls this.
     enable_trailing_tp: bool = True
     trailing_tp_activation_usdt: float = 0.20
     trailing_tp_lag_usdt: float = 0.10
 
-    # After each ratchet, read back what OKX actually has resting
-    # (orders-algo-pending) and confirm it locks in the intended profit
-    # within this tolerance -- resubmitting and re-checking, up to
-    # ratchet_verify_max_attempts times, if it doesn't. See
-    # _ratchet_stop_loss's docstring for why this should normally
-    # converge on the first attempt (OKX doesn't silently alter a
-    # submitted trigger price) and what this verification actually does
-    # and doesn't protect against.
     ratchet_verify_tolerance_usdt: float = 0.005
     ratchet_verify_max_attempts: int = 3
 
@@ -182,9 +95,9 @@ class OpenPosition:
     stop_loss_price: float
     tp_order_id: Optional[str]
     price_precision: str
-    stop_loss_is_profit_lock: bool = False  # True once tp_tracker.py's ratchet has moved stop_loss_price above entry (long) / below entry (short) -- see _ratchet_stop_loss and _infer_close_reason_from_exit_price
-    sl_limit_price: Optional[float] = None  # the resting SL leg's actual (capped) order price -- see ExecutionConfig.sl_limit_slippage_pct. None only for a position resumed from a row too old to have this column.
-    sl_breach_failsafe_submitted: bool = False  # True once monitor_positions has already fired the uncapped-market fail-safe close for this position, so it isn't resubmitted every 5s while waiting for the exchange to reflect the close
+    stop_loss_is_profit_lock: bool = False
+    sl_limit_price: Optional[float] = None
+    sl_breach_failsafe_submitted: bool = False
     opened_at: float = field(default_factory=time.time)
     last_alert_level: int = 0
     db_id: Optional[int] = None
@@ -218,19 +131,11 @@ def _decimals_from_step(step_str: str) -> int:
     return max(-exponent, 0) if isinstance(exponent, int) else 0
 
 def _format_price(value: float, step_str: str) -> str:
-    """Format a price as a plain fixed-point decimal string for the OKX
-    API — never scientific notation — with the instrument's own price
-    precision.
-
-    str(float) breaks silently for very small numbers: str(2.931e-06) ==
-    '2.931e-06'. OKX's API rejects that outright (HTTP 400, code=51000,
-    "Parameter tpTriggerPx error") since it expects plain decimal, not
-    scientific notation. This is exactly what happened placing a PEPE
-    take-profit — PEPE's price is small enough (~0.0000029) that
-    Python's default float-to-str flips to exponential form. Python's
-    'f' format spec always produces plain decimal regardless of
-    magnitude, so formatting with an explicit decimal count avoids the
-    bug entirely."""
+    """Formats a price as plain fixed-point decimal, never scientific
+    notation, at the instrument's own precision. str(float) silently
+    breaks for tiny numbers (str(2.931e-06) == '2.931e-06'), which OKX's
+    API rejects outright. Happened for real placing a PEPE take-profit.
+    Python's 'f' format spec avoids this regardless of magnitude."""
     decimals = _decimals_from_step(step_str)
     return f"{value:.{decimals}f}"
 
@@ -276,34 +181,8 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         self._total_opened = 0
         self._lock = asyncio.Lock()
 
-        # One lock per symbol with an open position, guarding the entire
-        # peek->cancel->place->commit ratchet sequence in
-        # _ratchet_stop_loss. Without this, the positions-websocket push
-        # (run_private, fires the instant OKX recalculates -- can be
-        # several times a second during a fast move) and the 5-second
-        # monitor_positions() poll fallback could both see
-        # tp_tracker.peek() return ratchet=True for the same symbol at
-        # nearly the same moment and both start ratcheting concurrently.
-        # The second call would read pos.tp_order_id before the first had
-        # finished replacing it, then try to cancel an order that was
-        # already gone -- exactly the "already filled, canceled or does
-        # not exist" (sCode=51400) errors this was built to eliminate,
-        # and in the worst case two interleaved cancel/place calls could
-        # leave pos.tp_order_id and the exchange's actual resting order
-        # out of sync entirely, which is what produced the follow-on
-        # sCode=51280 rejection and fail-safe flatten.
         self._ratchet_locks: Dict[str, asyncio.Lock] = {}
 
-        # Accepts an externally-constructed tracker so tracker.py's main()
-        # can share ONE instance across every peak-observing source.
-        # Deliberately fed ONLY by OKX's own server-computed
-        # unrealized_pnl (upl) -- run_private's positions-channel push
-        # (primary, arrives the instant OKX recalculates) and this
-        # engine's own 5-second REST poll below (fallback). NOT fed by
-        # MovementTracker's locally price-derived estimate -- see
-        # tracker.py's main() for why that source was deliberately left
-        # out of this tracker's wiring. Falls back to building its own if
-        # none is given, so this class still works standalone.
         self._tp_tracker = tp_tracker or TPTracker(
             TPTrackerConfig(
                 activation_profit_usdt=self.config.trailing_tp_activation_usdt,
@@ -314,11 +193,6 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
 
         self._blacklisted_symbols: Dict[str, OKXAPIError] = {}
 
-        # Repeated per-tick discard/pass logs (liquidation guard, liquidation
-        # history, min order size, etc.) are throttled to at most once per
-        # `config.log_throttle_sec` per (symbol, message-kind) key — the same
-        # symbol can otherwise log the same line dozens of times a minute
-        # while a candidate keeps failing the same check tick after tick.
         self._last_log_ts: Dict[str, float] = {}
 
     @staticmethod
@@ -459,14 +333,6 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
                     f"[execution] {symbol} {direction.upper()} funding guard passed — rate {funding_rate:+.4%}"
                 )
 
-        # Authoritative guard, backed by the exchange itself rather than
-        # only in-memory bookkeeping: never open a second position on a
-        # pair that already has one live on OKX, even if our own
-        # _open_positions dict thinks the pair is free (e.g. after a fill
-        # check timed out and we lost track of an order that actually
-        # went on to fill — see _wait_for_fill's caller below). Waits for
-        # the existing exposure to close before this pair is touched
-        # again, exactly as it should.
         try:
             existing_positions = await self._client.get_position(symbol)
         except OKXAPIError as exc:
@@ -741,19 +607,11 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         return position
 
     async def _cancel_and_verify(self, symbol: str, order_id: str) -> Optional[dict]:
-        """Called only after _wait_for_fill gives up. Cancels the
-        still-outstanding order so it can't rest on the exchange and fill
-        later while the bot has already moved on — that gap is exactly
-        what let multiple real orders stack up on the same pair before.
-
-        OKX rejects cancelling an order that has already filled, so a
-        failed cancel is re-checked against the order's actual state
-        rather than assumed to mean "still safe to ignore": if it turns
-        out the order filled (fully or partially) in the moment between
-        our last poll and the cancel attempt, that fill detail is
-        returned so the caller can protect the real position with TP/SL
-        instead of leaving it unprotected. Returns None only once it's
-        confirmed there is no fill to protect."""
+        """Called after _wait_for_fill gives up. Cancels the still-open
+        order so it can't fill later unnoticed. If cancel fails because
+        it actually filled in that gap, re-checks the order's real state
+        and returns the fill detail so the caller can still protect the
+        position — returns None only once confirmed there's no fill."""
         try:
             await self._client.cancel_order(symbol, order_id)
         except OKXAPIError as exc:
@@ -791,17 +649,11 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         return None
 
     async def _get_opening_fee(self, symbol: str, order_id: str, notional_usdt: float) -> float:
-        """Retrieves the actual fee charged for opening the position. Trading
-        fees vary by pair/VIP level/promotions, so this is always looked up
-        from the exchange rather than assumed.
-
-        The fill's fee record can lag a beat behind the order itself being
-        reported as filled, so this retries a few times before concluding
-        there's genuinely no fee data yet. If it still comes back empty, it
-        falls back to the exchange's *quoted* taker fee rate for this pair
-        (also fetched live, never hardcoded) rather than silently using 0 —
-        a 0 opening fee understates the true cost and makes the take-profit
-        calculated from it too tight to clear fees."""
+        """Retrieves the actual opening fee from the exchange (fees vary
+        by pair/VIP/promo, never assumed). Retries a few times since the
+        fee record can lag behind the fill. Falls back to the live quoted
+        taker rate rather than 0, since a 0 fee would make the computed
+        take-profit too tight to actually clear real costs."""
         fee = await self._fetch_fee_from_trades(symbol, order_id)
         if fee is not None and fee > 0:
             return fee
@@ -847,20 +699,12 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         price_precision: str,
         target_net_profit_usdt: Optional[float] = None,
     ) -> float:
-        """Take profit is derived entirely from real, exchange-reported
-        numbers: the actual filled entry price/size and the actual opening
-        fee (doubled to estimate the matching closing fee), targeting a net
-        realized profit of exactly `target_net_profit_usdt` after both fees
-        — no added cushion. A prior version added a slippage buffer here
-        (0.20% extra required price move), which pushed the TP price out
-        to ~0.30-0.39 USDT of required profit against a $0.07 target,
-        defeating the scalp — removed per explicit instruction.
-
-        `target_net_profit_usdt` defaults to `config.target_net_profit_usdt`
-        (the original behavior, unchanged) but can be overridden with a
-        smaller value — used by _ratchet_stop_loss to price a tighter
-        profit-lock floor with this exact same fee-aware math, instead of
-        duplicating it."""
+        """Derives TP from real filled entry/size and actual opening fee
+        (doubled to estimate closing fee), targeting exactly
+        `target_net_profit_usdt` net after both fees, no cushion.
+        Defaults to config.target_net_profit_usdt but can be overridden
+        smaller — used by _ratchet_stop_loss to price a tighter
+        profit-lock floor with this same fee-aware math."""
         cfg = self.config
         target = target_net_profit_usdt if target_net_profit_usdt is not None else cfg.target_net_profit_usdt
         estimated_total_fees = opening_fee * 2.0
@@ -884,17 +728,11 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         opening_fee: float,
         price_precision: str,
     ) -> float:
-        """Mirrors _compute_take_profit_price above, but for the loss side:
-        derived from the real filled price/size and real opening fee
-        (doubled to estimate the matching closing fee), targeting a net
-        realized LOSS of exactly `target_stop_loss_usdt`. Fees are
-        subtracted from the target here rather than added — the fees
-        themselves already contribute to the loss, so less adverse price
-        movement is needed to reach the same net loss than the raw target
-        alone would suggest. Rounded away from entry (not toward it) in
-        both directions, same conservative-rounding approach as the TP
-        price: a stop-loss placed slightly too close to entry by rounding
-        could trigger prematurely on ordinary noise."""
+        """Mirrors _compute_take_profit_price for the loss side: targets a
+        net LOSS of exactly target_stop_loss_usdt. Fees are subtracted
+        from the target (they already contribute to the loss), so less
+        adverse movement is needed than the raw target implies. Rounded
+        away from entry so it can't trigger prematurely on noise."""
         cfg = self.config
         estimated_total_fees = opening_fee * 2.0
         notional = size_contracts * contract_size * entry_price
@@ -939,18 +777,11 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         attempts: int = 3,
         retry_delay_sec: float = 1.0,
     ) -> tuple:
-        """Places TP and SL together as a single OCO (one-cancels-other)
-        algo order — whichever triggers first automatically cancels the
-        other, so the position can never end up with both legs still live
-        after a close.
-
-        Returns (order_id, sl_limit_price) — order_id is None on failure
-        (retries exhausted), in which case sl_limit_price is also None.
-        sl_limit_price is the real price now resting as the SL leg's own
-        order price (see ExecutionConfig.sl_limit_slippage_pct); callers
-        should store it on OpenPosition.sl_limit_price so
-        monitor_positions' breach fail-safe has something to compare
-        against."""
+        """Places TP and SL as one OCO algo order — whichever triggers
+        first cancels the other. Returns (order_id, sl_limit_price);
+        both None on failure. sl_limit_price is the SL leg's real resting
+        price (see sl_limit_slippage_pct) — store on
+        OpenPosition.sl_limit_price for monitor_positions' breach check."""
 
         close_side = 3 if direction == "long" else 2
 
@@ -987,26 +818,12 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         return (None, None)
 
     async def maybe_ratchet_stop_loss_for(self, symbol: str) -> None:
-        """Public, event-driven counterpart to _maybe_ratchet_stop_loss —
-        call this directly from wherever a fresh OKX-sourced
-        unrealized_pnl was just observed (e.g. tracker.py's run_private,
-        right after the positions-channel push feeds tp_tracker.observe())
-        instead of waiting for the next monitor_positions() poll.
-
-        This is what actually closes most of the profit-floor gap: peak
-        detection became instant once the positions websocket was wired
-        up, but without this, the ACTION of moving the exchange order
-        still only happened on monitor_positions()'s 5-second cadence —
-        meaning the exchange-side stop could lag several seconds behind
-        the true peak. Calling this the moment a new peak is observed
-        collapses that gap to effectively zero. monitor_positions()'s own
-        5-second call into _maybe_ratchet_stop_loss remains as a fallback
-        sweep (harmless and cheap if this already handled it — peek()
-        just returns ratchet=False).
-
-        Skips entirely, with no exchange calls at all, if
-        config.enable_trailing_tp is False — see tracker.py's
-        TP_TRACKER_ENABLED."""
+        """Event-driven counterpart to _maybe_ratchet_stop_loss — call
+        from run_private right after a fresh positions-push feeds
+        tp_tracker.observe(), instead of waiting for the 5s poll. Closes
+        the lag between peak detection and the exchange order actually
+        moving. monitor_positions()'s poll remains a harmless fallback.
+        No-ops if config.enable_trailing_tp is False."""
         if not self.config.enable_trailing_tp:
             return
         async with self._lock:
@@ -1016,18 +833,6 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
 
         lock = self._get_ratchet_lock(symbol)
         if lock.locked():
-            # Another observation of this same symbol (the 5-second poll
-            # fallback, or a second websocket push arriving before the
-            # first finished) is already mid-ratchet. Skip rather than
-            # queue behind it — see this engine's __init__ for why
-            # queuing here was the actual bug. Whatever new peak this
-            # observation represents was already folded into
-            # tp_tracker's running max via observe() below, so the
-            # in-flight ratchet's own next peek() (or the very next call
-            # here once it's done) will pick it up -- the caller's
-            # observe() call already folded this observation's peak into
-            # tp_tracker's running max before this method was reached,
-            # so nothing about the peak itself is lost by skipping here.
             return
 
         async with lock:
@@ -1037,26 +842,11 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
             await self._ratchet_stop_loss(symbol, pos, decision.floor_usdt)
 
     async def _maybe_ratchet_stop_loss(self, symbol: str, pos: OpenPosition, active: dict) -> None:
-        """Feeds the TP tracker (tp_tracker.py) this 5-second REST poll's
-        unrealized_pnl (OKX's own `upl`, from get_position()) as a
-        fallback observation, then checks whether any observation so far
-        — including run_private's positions-channel websocket push,
-        which is the primary source since it arrives the instant OKX
-        recalculates rather than on this poll's 5-second cadence — has
-        produced a new floor that's ready to be acted on. Both sources
-        feeding this tracker are genuinely OKX's own server-computed
-        number; MovementTracker's locally price-derived estimate is
-        deliberately NOT wired into this tracker (see tracker.py's
-        main()). If so, replaces the resting stop-loss leg on the
-        exchange with one at that floor. The take-profit leg
-        (pos.take_profit_price) is never touched here — it stays at the
-        original final target the whole time; see tp_tracker.py's module
-        docstring for why this is functionally a trailing STOP despite
-        "TP" in the module name.
-
-        Skips entirely, with no exchange calls at all, if
-        config.enable_trailing_tp is False — see tracker.py's
-        TP_TRACKER_ENABLED."""
+        """Feeds tp_tracker this poll's OKX unrealized_pnl as a fallback
+        observation (the websocket push is the primary, faster source),
+        then acts on any new floor. Only the stop-loss leg moves; TP
+        stays at the original target — see tp_tracker.py for why this is
+        really a trailing stop. No-ops if enable_trailing_tp is False."""
         if not self.config.enable_trailing_tp:
             return
 
@@ -1070,11 +860,6 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
 
         lock = self._get_ratchet_lock(symbol)
         if lock.locked():
-            # See maybe_ratchet_stop_loss_for's matching check -- the
-            # websocket push handler is almost certainly the one holding
-            # this right now, since it fires far more often. This poll
-            # is only a fallback anyway; skip this cycle rather than
-            # race it.
             return
 
         async with lock:
@@ -1110,26 +895,12 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
 
     async def _ratchet_stop_loss(self, symbol: str, pos: OpenPosition, new_floor_usdt: float) -> None:
         """Moves the resting stop-loss to lock in new_floor_usdt, then
-        verifies the change against what OKX actually confirms is resting
-        (via get_pending_algo_order — the live pending-order book, not
-        the lagging history endpoint), resubmitting up to
-        config.ratchet_verify_max_attempts times if the OKX-confirmed
-        price doesn't translate back to new_floor_usdt within
-        config.ratchet_verify_tolerance_usdt.
-
-        Worth being precise about what this can and can't catch: OKX's
-        algo-order API validates a submitted trigger price and either
-        accepts it exactly or rejects the order outright (sCode/sMsg) —
-        it does not silently substitute a different price. So this loop
-        should converge on the first attempt under normal operation; its
-        real value is (a) turning "we assume the price is right" into "we
-        confirmed the price OKX actually has on file", which catches a
-        genuine local rounding/precision bug if one ever exists, and (b)
-        making that confirmation observable in the logs rather than
-        assumed. It will NOT catch or correct slippage between a stop's
-        trigger firing and its resulting market order actually filling —
-        that happens after this whole exchange, at a moment this code
-        isn't running, and no price verification here changes it."""
+        verifies against OKX's live pending-order book, resubmitting up
+        to ratchet_verify_max_attempts times if it doesn't match within
+        ratchet_verify_tolerance_usdt. Converges on the first attempt
+        normally; value is catching a genuine local rounding bug and
+        making it observable. Does NOT catch fill slippage after the
+        stop actually triggers — that happens later, outside this code."""
         cfg = self.config
         target_floor = new_floor_usdt
 
@@ -1144,11 +915,6 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
                 target_net_profit_usdt=target_floor,
             )
             if new_sl_price == pos.stop_loss_price:
-                # Rounds to the same exchange price as what's already
-                # resting (price-tick precision) -- no exchange action
-                # needed, but still commit so peek() doesn't keep
-                # re-suggesting this same no-op ratchet every cycle until
-                # a larger move produces an actually-different price.
                 await self._tp_tracker.commit(symbol, new_floor_usdt)
                 return
 
@@ -1156,13 +922,6 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
             try:
                 await self._client.cancel_algo_order(symbol, old_algo_id)
             except OKXAPIError as exc:
-                # Most likely the previous order already triggered (price
-                # hit the prior floor right as this ratchet was about to
-                # run) or was already cancelled some other way. Either
-                # way, leave it alone here rather than treat it as a hard
-                # failure — the normal close-detection in
-                # monitor_positions will sort out what actually happened
-                # on its own next tick.
                 log.warning(
                     f"[execution] {symbol} — could not cancel the existing TP/SL order while "
                     f"ratcheting the profit floor to {target_floor:.4f} USDT ({exc}); leaving "
@@ -1173,7 +932,7 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
             new_algo_id, new_sl_limit_price = await self._place_tp_sl(
                 symbol=symbol,
                 direction=pos.direction,
-                take_profit_price=pos.take_profit_price,  # unchanged -- see module docstring in tp_tracker.py
+                take_profit_price=pos.take_profit_price,
                 stop_loss_price=new_sl_price,
                 size_contracts=pos.size_contracts,
                 price_precision=pos.price_precision,
@@ -1201,10 +960,8 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
             pos.tp_order_id = new_algo_id
             pos.stop_loss_price = new_sl_price
             pos.sl_limit_price = new_sl_limit_price
-            pos.stop_loss_is_profit_lock = True  # from this point on, this position's SL leg sits in profit territory, not loss territory -- see _infer_close_reason_from_exit_price
+            pos.stop_loss_is_profit_lock = True
 
-            # --- Verify what OKX actually has resting, rather than
-            # trusting the just-submitted price. ---
             try:
                 pending = await self._client.get_pending_algo_order(symbol, new_algo_id)
             except OKXAPIError as exc:
@@ -1217,9 +974,6 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
 
             confirmed_sl_raw = pending.get("sl_trigger_price") if pending else None
             if not confirmed_sl_raw:
-                # Most likely it already triggered in the instant between
-                # being placed and this check running -- nothing left to
-                # verify or correct; let normal close-detection handle it.
                 log.info(
                     f"[execution] {symbol} — ratcheted SL order {new_algo_id} not found pending "
                     f"(likely already triggered) -- skipping verification"
@@ -1253,7 +1007,7 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
                 f"stop-loss at {confirmed_sl_price}, which locks {actual_locked_profit:.4f} USDT net, but "
                 f"target was {new_floor_usdt:.4f} (off by {deviation:+.4f}); resubmitting a corrected price"
             )
-            target_floor = new_floor_usdt - deviation  # nudge the next attempt's target in the corrective direction
+            target_floor = new_floor_usdt - deviation
 
         log.error(
             f"[execution] {symbol} — profit-floor ratchet did not converge to within "
@@ -1263,36 +1017,13 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         await self._tp_tracker.commit(symbol, new_floor_usdt)
 
     async def monitor_positions(self) -> None:
-        """Checks each tracked position against the exchange. A position with
-        zero remaining size has been closed by its take-profit order, its
-        stop-loss order, or by exchange liquidation — either way, we free
-        the slot. There is no bot-side close/timeout decision here: OKX's
-        own algo orders and liquidation engine are the only things that
-        can end a position. The one exception is the profit-floor ratchet
-        (see _maybe_ratchet_stop_loss / tp_tracker.py) — that only ever
-        moves the resting stop-loss trigger up as profit builds, it never
-        force-closes a position directly except as a fail-safe if a
-        ratchet's replacement order can't be placed.
-
-        While a position stays open, it's also checked for a significant
-        price move (see `_check_price_alert`) so a trade running against —
-        or in favor of — us gets surfaced without flooding the log.
-
-        A position is only eligible to be declared closed once it's been
-        open at least `_MIN_AGE_BEFORE_CLOSE_CHECK_SEC`, and even then only
-        after a SECOND "not found" reading a moment later confirms the
-        first one. Both guards exist because of a real incident: two
-        LINK-USDT-SWAP trades were marked closed (reason=unknown, no exit
-        price, no realized_pnl at all) only 5-8 seconds after opening,
-        with no closing trade findable anywhere — in positions-history,
-        the TP algo order, or a fills scan. The only explanation that fits
-        is that OKX's own position endpoint hadn't yet reflected the
-        brand-new position on that single read (an exchange-side
-        propagation gap), and a single empty reading was trusted as an
-        authoritative close. Both positions were almost certainly still
-        genuinely open and simply got orphaned from our tracking — dropped
-        from `_open_positions` while still live (and still exposed) on
-        the real exchange."""
+        """Checks each tracked position against the exchange; zero size
+        means TP/SL/liquidation closed it, so the slot is freed. Only
+        OKX's own orders/liquidation end a position (ratchet fail-safe
+        is the one exception). Declares a close only after
+        _MIN_AGE_BEFORE_CLOSE_CHECK_SEC AND a second confirming read —
+        two LINK trades once got wrongly marked closed within seconds
+        from a single stale exchange read, orphaning live positions."""
         async with self._lock:
             tracked = {s: p for s, p in self._open_positions.items() if p is not None}
 
@@ -1339,37 +1070,15 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
             await self._maybe_ratchet_stop_loss(symbol, pos, active)
 
     async def reconcile_from_store(self, position_store) -> None:
-        """Run once at startup, BEFORE the bot opens any new trades — see
-        tracker.py's main(). For every position_history row still marked
-        status="open" (meaning the previous bot process exited — crash,
-        redeploy, manual stop — while that trade was live):
-
-          - If OKX still shows the symbol open -> re-registers it into
-            this engine's own tracking (open_positions, tp_tracker,
-            movement_tracker) so monitor_positions(), the profit-floor
-            ratchet, and price alerts all resume on it, instead of
-            silently abandoning a position that still has real money and
-            a resting TP/SL order on the exchange.
-
-          - If OKX no longer shows it open -> pulls the real close
-            details from OKX's own positions-history (the exact same
-            lookup a normal close already uses, via _get_close_details)
-            and marks the DB row closed with real numbers, instead of
-            leaving it stuck at status="open" in the DB forever.
-
-        Also reseeds self._total_opened from the store's total row count
-        (open + closed, all-time), so config.max_total_trades is actually
-        respected across restarts rather than resetting to 0 every time
-        the process restarts.
-
-        Known limitation for the "still open" case: tp_tracker's
-        peak-profit tracking and movement_tracker's price-movement
-        history (MFE/MAE/highest_price) both restart fresh from this
-        moment — neither can be reconstructed for whatever happened
-        before the restart, since that history wasn't persisted
-        tick-by-tick. The trailing floor only ratchets against NEW peaks
-        reached from here forward; a peak that happened pre-restart is
-        not retroactively protected."""
+        """Runs once at startup before any new trades open. For every
+        position_history row still marked "open" from a prior process:
+        if OKX still shows it open, re-registers it into tracking so
+        monitoring/ratchet/alerts resume; if OKX shows it closed, pulls
+        real close details and marks the DB row closed instead of
+        leaving it stuck. Also reseeds self._total_opened from the
+        store's full row count so max_total_trades survives restarts.
+        Limitation: tp_tracker/movement_tracker history for a resumed
+        position restarts fresh — nothing pre-restart is reconstructed."""
         if position_store is None:
             return
 
@@ -1382,24 +1091,6 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
 
         log.info(f"[startup] reconciling {len(rows)} open position_history row(s) against OKX (lifetime trades so far: {self._total_opened})...")
 
-        # More than one row marked status="open" for the SAME symbol
-        # means either (a) a genuine bug wrote position_history twice for
-        # one real trade, or (b) two bot processes really did each open
-        # their own real position on the same pair around the same time
-        # (e.g. overlapping runs of this bot, both passing the exchange-
-        # level pre-open check in _open_position because neither one's
-        # order had filled yet when the other one checked). Either way,
-        # OKX itself only ever shows ONE net position per symbol, so this
-        # engine can only actively track one OpenPosition per symbol too
-        # -- silently letting the loop below process both, one after the
-        # other, would just overwrite _open_positions[symbol] with
-        # whichever row came last while leaving BOTH database rows stuck
-        # at status="open" forever (since only _resume_open_row /
-        # _backfill_closed_row change that, and only for the row they
-        # were actually called with). That silent overwrite, with no
-        # trace left behind, is what made two identical-looking "open"
-        # cards show up on the dashboard even though only one was truly
-        # still being managed. Surface it loudly instead.
         rows_by_symbol: Dict[str, List[dict]] = {}
         for row in rows:
             rows_by_symbol.setdefault(row.get("symbol"), []).append(row)
@@ -1449,8 +1140,6 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         if not raw:
             return time.time()
         try:
-            # Supabase returns timestamps as ISO 8601 strings (matching
-            # position_store._iso's format at insert time).
             return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
         except (ValueError, TypeError):
             log.warning(f"[startup] could not parse stored opened_at={raw!r} — using current time instead")
@@ -1489,15 +1178,6 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         stop_loss_is_profit_lock = self._infer_stop_loss_is_profit_lock(direction, entry_price, stop_loss_price)
         liq_price_raw = row.get("liq_price")
 
-        # position_history doesn't persist the SL leg's actual resting
-        # limit price (see ExecutionConfig.sl_limit_slippage_pct), so
-        # it's recomputed the same way _place_tp_sl derives it rather
-        # than left unprotected here -- if this row predates the SL cap
-        # feature and the real resting order on the exchange is still an
-        # uncapped market SL, the only consequence is the breach
-        # fail-safe below can fire a little earlier than strictly
-        # necessary, which is harmless (it only ever forces a prompt,
-        # uncapped market close, same or better than waiting).
         sl_limit_price = (
             self._compute_sl_limit_price(direction, stop_loss_price, price_precision)
             if stop_loss_price
@@ -1551,10 +1231,6 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
 
         opened_at = self._parse_stored_opened_at(row)
 
-        # Duck-typed stand-in for the OpenPosition _get_close_details (and
-        # its _infer_close_reason_from_exit_price /
-        # _get_close_details_from_fills fallback) actually read from —
-        # only these five attributes are ever touched by that whole path.
         stand_in = SimpleNamespace(
             symbol=symbol,
             direction=direction,
@@ -1593,15 +1269,6 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
             f"net_pnl={net_pnl}, reason={close_reason}) and marked closed"
         )
 
-        # This row closed entirely before this bot process started, so it
-        # was never registered with MovementTracker via start_tracking
-        # (unlike _resume_open_row's still-open case above) — meaning
-        # stop_tracking would otherwise silently no-op (nothing tracked
-        # for this symbol) and trade_snapshots would never get a row for
-        # it. Feed it through a start/stop pair here purely so the final
-        # summary gets written; there's no live price history to replay,
-        # so movement stats (MFE/MAE/timeline) reflect this single
-        # backfilled data point rather than the trade's real path.
         if self._movement_tracker is not None:
             try:
                 mt_stand_in = SimpleNamespace(
@@ -1676,42 +1343,13 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
             )
 
     async def _get_close_details(self, symbol: str, closed: OpenPosition):
-        """Looks up the exchange's own closed-position record to get the
-        real exit price, realized PnL, closing fee, and net PnL — never
-        estimated when OKX provides the real figure.
-
-        This reads /api/v5/account/positions-history (via
-        get_closed_position()), which is the endpoint OKX actually
-        populates with a genuine realized-PnL field for closed swap
-        positions, plus a `close_type` that says exactly how it closed,
-        plus its own fully-netted `realizedPnl` (returned here as
-        net_pnl — see get_closed_position()'s docstring for why this is
-        preferred over reconstructing it from realized_pnl/fees locally:
-        that reconstruction silently drops any liquidation penalty).
-        The record can lag a beat behind the position showing as closed
-        in monitor_positions(), so this retries a few times first.
-
-        The previous version of this method sourced these numbers from
-        /trade/fills instead, reading a `pnl` field from each fill —
-        but OKX's /trade/fills response simply has no realized-PnL field
-        for swaps, so that always evaluated to 0 regardless of whether
-        the trade actually won or lost. That fallback is kept below only
-        for the rare case positions-history hasn't produced a row yet,
-        in which case exit_price/closing_fee can still be recovered from
-        fills, but realized_pnl and net_pnl will (as before) come back
-        as 0/None there — logged clearly so it isn't mistaken for a real
-        zero-PnL trade.
-
-        Retry budget: a real incident showed OKX can take longer than a
-        few seconds to index a liquidation into positions-history — two
-        LINK-USDT-SWAP positions were liquidated within the same second
-        they opened (confirmed after the fact in the exchange's own UI:
-        real liq price, real -0.02 fee, real -1.13/-1.06 realized PnL —
-        all of it), but this method exhausted its old, shorter retry
-        budget before that record became queryable and gave up with
-        close_reason="unknown" and every number null. The position really
-        was closed; we just stopped looking too early. Budget widened
-        accordingly below."""
+        """Looks up OKX's positions-history for real exit price, realized
+        PnL, closing fee, and net PnL — never estimated. Retries since
+        the record can lag behind monitor_positions() seeing the close.
+        Falls back to /trade/fills for exit_price/closing_fee only (no
+        real realized-PnL field there for swaps). Retry budget is wide:
+        two LINK positions once got liquidated within a second of
+        opening and the old shorter budget gave up too early."""
         opened_at_ms = closed.opened_at * 1000.0
 
         history_row = None
@@ -1803,50 +1441,16 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         return exit_price, realized_pnl, closing_fee, close_reason, None
 
     def _infer_close_reason_from_exit_price(self, closed: OpenPosition, exit_price: float) -> str:
-        """Distinguishes a take-profit fill from a stop-loss fill by
-        comparing the real exit price against the position's own
-        take_profit_price/stop_loss_price — the values that were actually
-        set on the exchange at open time (see _place_tp_sl) — rather than
-        asking OKX which algo order triggered.
-
-        This replaces the previous approach (querying
-        /api/v5/trade/orders-algo-history for closed.tp_order_id and
-        treating "found and effective" as take_profit, "not found" as
-        liquidated), which broke in two ways once TP and SL started being
-        submitted together as a single OCO order:
-
-        1. The lookup was querying with ordType="conditional" while the
-           order was actually placed with ordType="oco" — OKX filters
-           this endpoint by ordType server-side, so it returned
-           code=51603 "Order does not exist" for every single close, even
-           genuine take-profit fills (confirmed in production: real
-           trades closed exactly at take_profit_price were logged as
-           reason="liquidated" because the lookup could never find them).
-        2. Even with the right ordType, TP and SL now share one algoId on
-           an OCO order — "effective" only says the order triggered, not
-           which leg did, so there was no way to ever report
-           close_reason="stop_loss" at all; a real stop-loss fill would
-           have been mislabeled take_profit once the ordType above was
-           fixed.
-
-        Whichever of take_profit_price/stop_loss_price the real exit
-        price landed closer to is treated as what fired. This only runs
-        for closes OKX itself didn't already flag as a real liquidation
-        (close_type 3-6, checked by the caller first and always
-        authoritative) — a coincidental exit near the SL price during an
-        actual liquidation cascade is still reported as "liquidated".
-
-        IMPORTANT: once tp_tracker.py's ratchet has moved stop_loss_price
-        into profit territory (closed.stop_loss_is_profit_lock — see
-        _ratchet_stop_loss), a fill closer to that price is no longer a
-        real stop-loss and must not be reported as one — it's a real,
-        positive-net-pnl exit, and "stop_loss" would misrepresent a
-        winning trade as a loss in position_history/trade_snapshots.
-        Reported as "trailing_stop" instead in that case. (If either
-        table has a CHECK constraint restricting close_reason to a fixed
-        set of values, "trailing_stop" needs to be added to it before
-        this will write successfully — same caveat position_store.py
-        already notes for net_pnl.)"""
+        """Infers TP vs SL by comparing real exit price against the
+        position's own take_profit_price/stop_loss_price, rather than
+        asking OKX which algo leg fired — the old orders-algo-history
+        lookup broke once TP/SL became one OCO order (wrong ordType
+        filter, and one shared algoId can't say which leg triggered).
+        Only runs for closes OKX didn't already flag as liquidation.
+        If the ratchet moved stop_loss_price into profit territory
+        (stop_loss_is_profit_lock), a fill there is reported
+        "trailing_stop", not "stop_loss" — needs adding to any DB CHECK
+        constraint on close_reason."""
         if exit_price is None or exit_price <= 0:
             return "unknown"
         tp = closed.take_profit_price
@@ -1883,31 +1487,14 @@ class DemoFuturesExecutionEngine(ExecutionEngineBase):
         return None
 
     async def _check_sl_breach(self, symbol: str, pos: OpenPosition, active: dict) -> None:
-        """Fail-safe counterpart to ExecutionConfig.sl_limit_slippage_pct:
-        since the SL leg is placed as a capped LIMIT order (not a true
-        market order) once triggered, it can go unfilled if price gaps
-        straight through it during a fast move — leaving the position
-        open with no working stop at all. This is the check that catches
-        that: if the mark price has moved past pos.sl_limit_price (the
-        real, capped price resting on the exchange) by more than a small
-        confirmation buffer WHILE the position still shows as open, the
-        capped limit clearly isn't going to fill on its own, so this
-        cancels it and submits an uncapped market close instead — the
-        exact protection an uncapped SL would have given, just arriving
-        a poll cycle (monitor_positions runs every
-        config's caller interval) later than an uncapped order would
-        have. A capped SL price only ever bounds the worst-case FILL
-        PRICE; this bounds the worst-case EXPOSURE TIME on top of it, so
-        the combination is never worse than a plain uncapped SL, only
-        sometimes slightly slower to resolve.
-
-        No-ops entirely for a position with no sl_limit_price recorded
-        (an uncapped SL, or one resumed from a database row too old to
-        have this column — see OpenPosition.sl_limit_price), and only
-        ever submits the fail-safe close once per position
-        (sl_breach_failsafe_submitted), so a position already being
-        flattened isn't resubmitted every 5 seconds while OKX catches up
-        to reflect the close."""
+        """Fail-safe for sl_limit_slippage_pct: the capped SL leg is a
+        LIMIT order, so it can go unfilled if price gaps through it. If
+        mark price has passed pos.sl_limit_price by more than a small
+        buffer while the position is still open, cancels the stuck order
+        and fires an uncapped market close — same protection an uncapped
+        SL gives, just up to one poll cycle later. No-ops if
+        sl_limit_price is unset, and fires at most once per position
+        (sl_breach_failsafe_submitted)."""
         if pos.sl_limit_price is None or pos.sl_breach_failsafe_submitted:
             return
 
