@@ -1,14 +1,13 @@
 """
 Common interface every strategy module implements, so tracker.py can
-swap between them (strategy.observation_engine, strategy.vwap_stg,
-strategy.ema_stg, ...) purely by name — see tracker.py's STRATEGY_NAME —
-without any other code in tracker.py needing to change.
+swap between them purely by name — see tracker.py's STRATEGY_NAME —
+without any other code in tracker.py needing to change, even across
+hundreds of different strategy files being tried over time.
 
 A strategy module (a .py file living in this `strategy/` package) must
 expose:
 
-  - A config dataclass, all fields defaulted (e.g. observation_engine's
-    ObservationConfig, vwap_stg's VwapConfig) — every field needs a
+  - A config dataclass, all fields defaulted — every field needs a
     sensible default since StrategyContext.build_config() may construct
     it with zero kwargs.
 
@@ -18,10 +17,20 @@ expose:
   - A free function `build(ctx: StrategyContext) -> StrategyEngine` that
     tracker.py's main() calls once at startup. It's a free function
     rather than a fixed constructor signature because different
-    strategies need different inputs — e.g. ema_stg only reads candles
-    and never touches ctx.trade_store, while vwap_stg needs trade_store
-    but never touches ctx.candle_fetcher. Each strategy's build() just
-    takes what it needs off ctx and ignores the rest.
+    strategies need different inputs — e.g. one strategy might only read
+    candles and never touch ctx.trade_store, while another needs
+    trade_store but never touches ctx.candle_fetcher. Each strategy's
+    build() just takes what it needs off ctx and ignores the rest.
+
+  - OPTIONALLY, a module-level `REQUIRED_TRADE_WINDOW_MS: int` constant —
+    the single largest window_ms value this strategy will ever pass to
+    trade_store.get_window(). tracker.py reads this automatically via
+    strategy.discover_trade_window_ms(STRATEGY_NAME) *before* building
+    TradeStore, so TradeStore always retains enough history for whichever
+    strategy is currently selected — no per-strategy dict to maintain in
+    tracker.py, and no silent data-starvation if a strategy needs more
+    than the base 5-second retention. Omit this constant entirely if the
+    strategy never touches ctx.trade_store at all.
 
 Nothing here enforces the internal shape of a "candidate" — only that
 whatever evaluate() decides is ready gets turned into a market_data.Signal
