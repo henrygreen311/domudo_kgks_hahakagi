@@ -8,7 +8,7 @@ on:
 jobs:
   run-monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 355
+    timeout-minutes: 360
 
     steps:
       - name: Checkout repository
@@ -28,5 +28,5 @@ jobs:
           PYTHONUNBUFFERED: "1"
           PYTHONIOENCODING: "utf-8"
         run: |
-          timeout 355m python3 -u tracker.py || true
+          timeout 358m python3 -u tracker.py || true
           
