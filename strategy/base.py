@@ -72,6 +72,19 @@ class StrategyContext:
     # Kept as a dict rather than a config instance so tracker.py never
     # needs to import any individual strategy's config class.
     config_overrides: Dict[str, Any] = field(default_factory=dict)
+    # Real execution-side numbers, straight from tracker.py's own
+    # constants — purely informational. A strategy MAY read these to
+    # estimate the execution engine's real fee-aware TP/SL distance
+    # ahead of actually opening a trade (e.g. a support/resistance
+    # strategy checking whether its target is reachable before the next
+    # opposing level). Never authoritative: execution_engine.py always
+    # computes the REAL TP/SL from the actual fill regardless of
+    # anything estimated here. All None by default, so strategies that
+    # don't need this are completely unaffected.
+    margin_per_trade_usdt: Optional[float] = None
+    default_leverage: Optional[int] = None
+    target_net_profit_usdt: Optional[float] = None
+    target_stop_loss_usdt: Optional[float] = None
 
     def build_config(self, config_cls):
         """Instantiates `config_cls` with self.config_overrides applied

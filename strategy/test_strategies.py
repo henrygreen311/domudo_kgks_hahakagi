@@ -1,244 +1,392 @@
 """
-Flow Ignition Engine — order-flow burst detection for ETH-USDT scalping.
+Support & Resistance Engine — simple, deterministic zone rejection.
 
-Where vwap_3stage_engine.py routes off WHERE price sits relative to
-VWAP, this engine ignores location and instead watches HOW the trade
-tape is behaving right now against its own recent pace. Every tick
-pulls a baseline_window_ms trade-tape window (default 3 min) and tests
-its most recent ignition_window_ms slice (default 8 sec) against six
-gates: cooldown/daily cap, a realized-range regime filter, an ignition
-z-score (the slice's signed buy/sell delta vs. the baseline's own
-empirical distribution of same-length-slice deltas), tape acceleration
-(trades/sec vs. baseline pace), price displacement (the burst must be
-moving price, not just absorbing volume), and dominant-side trade count
-(blocks a single block print from faking a burst). All six must pass
-for evaluate() to return a Signal.
+Finds swing-based support/resistance zones from 5-minute candles, waits
+for a completed candle to test one and reject back through it, and only
+fires a Signal if the execution engine's real fee-aware TP target can be
+reached before the next opposing zone. No RSI/MACD/VWAP/z-score/moving
+averages — the whole read is swing geometry plus one completed candle.
 
-No VWAP, swing levels, candles, or classical indicators — at this scalp
-scale the trade tape itself reacts faster than anything candle-based.
+Candles only, via ctx.candle_fetcher (okx_futures_client.get_candles) —
+no ctx.trade_store use at all, so no REQUIRED_TRADE_WINDOW_MS is
+declared (see strategy/base.py's module docstring for that convention).
 
-The only state remembered tick-to-tick is last_signal_at per symbol,
-purely for cooldown_sec. max_signals_per_day is a hard daily ceiling on
-top of that.
+THE FLOW (see evaluate())
 
-Same Signal/StrategyEngine/TradeStore/MarketDataStore contract as
-vwap_3stage_engine.py, including its take_profit=price/stop_loss=price
-placeholder pattern — execution_engine computes the real TP/SL from
-tracker.py's target_net_profit_usdt/target_stop_loss_usdt, not from the
-strategy module. Switch to this strategy with tracker.py's
-STRATEGY_NAME = "flow_ignition_engine".
+  1. Fetch ~lookback_hours of closed 5m candles.
+  2. Find swing highs/lows (a candle whose high/low is the extreme among
+     its swing_fractal_width neighbors on each side) and cluster nearby
+     swing prices into zones (zone_tolerance_pct). Zones need at least
+     minimum_level_touches swing points to count.
+  3. The most recently CLOSED candle is the only one ever checked for a
+     setup — a still-forming candle is never used (see
+     _split_forming_and_closed).
+  4. LONG: that candle's low must have tested a support zone and its
+     close must be back above it, green. SHORT: mirrors this off a
+     resistance zone, red candle, close back below.
+  5. TP FEASIBILITY (the critical gate): using ctx.margin_per_trade_usdt,
+     ctx.default_leverage, ctx.target_net_profit_usdt, and a live-quoted
+     taker fee rate, this replicates execution_engine.py's own fee-aware
+     TP price math (see estimate_tp_sl_prices) — never a separate,
+     invented target. If that estimated TP would sit at or beyond the
+     next opposing zone's own boundary (no buffer — strict inequality
+     only), the setup is rejected: tp_blocked_by_resistance /
+     tp_blocked_by_support. The
+     same math's SL price is sanity-checked against the zone's far edge,
+     and the ratio of remaining room-to-zone vs that fixed SL distance
+     must clear minimum_risk_reward.
+  6. Only entry_price/take_profit/stop_loss placeholders go on the
+     returned Signal, exactly like every other strategy here —
+     execution_engine.py always computes the REAL TP/SL from the actual
+     fill; this strategy's own TP/SL math above exists purely to decide
+     WHETHER to trade, never to set the real order prices.
+
+Cooldown + "no repeat signal off the same candle" (section 20 of the
+spec this was built from) mirrors flow_ignition_engine.py's
+last_signal_at pattern — the only state remembered between ticks.
 """
 
 import asyncio
-import calendar
 import logging
-import statistics
 import time
 from dataclasses import dataclass, field
-from typing import Awaitable, Callable, Dict, List, Optional
+from typing import Awaitable, Callable, Dict, List, Optional, Tuple
 
-from market_data import MarketDataStore, TradeStore, Signal
+from market_data import MarketDataStore, Signal, DEFAULT_SYMBOL_WHITELIST
 from .base import StrategyContext, StrategyEngine
 
-log = logging.getLogger("okx_futures.flowignition")
+log = logging.getLogger("okx_futures.supportresistance")
 
 CandleFetcher = Callable[[str, str, int], Awaitable[List[dict]]]
 
-REQUIRED_TRADE_WINDOW_MS = 180_000
+
+# ---------------------------------------------------------------------------
+# Pure functions: candle housekeeping, swing detection, zone clustering,
+# fee-aware TP/SL estimation. Nothing here talks to the network or holds
+# state — evaluate() is what wires these together per tick.
+# ---------------------------------------------------------------------------
 
 
-def compute_vwap(trades: List[dict]) -> Optional[float]:
-    """Volume-weighted average price across `trades`."""
-    total_qty = sum(t["qty"] for t in trades)
-    if total_qty <= 0:
-        return None
-    return sum(t["price"] * t["qty"] for t in trades) / total_qty
+def split_forming_and_closed(candles: List[dict]) -> Tuple[Optional[dict], List[dict]]:
+    """Splits `candles` (any order) into (forming_or_None,
+    closed_oldest_first). OKX's confirm flag: "0" = still forming,
+    anything else (including missing/unknown) is treated as closed —
+    conservative, never mistakes a live candle for a closed one."""
+    forming = None
+    closed: List[dict] = []
+    for c in sorted(candles, key=lambda c: c.get("ts", 0)):
+        if forming is None and str(c.get("confirm")) == "0":
+            forming = c
+        else:
+            closed.append(c)
+    return forming, closed
 
 
-def _bucketize_by_time(trades: List[dict], bucket_count: int) -> List[List[dict]]:
-    """Splits `trades` into `bucket_count` equal-duration chronological slices."""
-    if not trades or bucket_count < 1:
-        return [[] for _ in range(max(bucket_count, 1))]
-    ordered = sorted(trades, key=lambda t: t["timestamp"])
-    start, end = ordered[0]["timestamp"], ordered[-1]["timestamp"]
-    span = end - start
-    buckets: List[List[dict]] = [[] for _ in range(bucket_count)]
-    if span <= 0:
-        buckets[-1] = ordered
-        return buckets
-    bucket_span = span / bucket_count
-    for t in ordered:
-        idx = min(int((t["timestamp"] - start) / bucket_span), bucket_count - 1)
-        buckets[idx].append(t)
-    return buckets
+def find_swing_prices(closed_candles: List[dict], width: int) -> Tuple[List[float], List[float]]:
+    """Classic fractal swing detection: candle i is a swing high if its
+    high is the max among the `width` candles on each side of it (swing
+    low mirrors this on lows). `closed_candles` must be oldest-first.
+    Returns (swing_highs, swing_lows) as plain price lists — order/count
+    only, no candle references kept."""
+    n = len(closed_candles)
+    swing_highs: List[float] = []
+    swing_lows: List[float] = []
+    if n < 2 * width + 1:
+        return swing_highs, swing_lows
 
-
-def _signed_delta(trades: List[dict]) -> float:
-    buy = sum(t["qty"] for t in trades if t["side"] == "buy")
-    sell = sum(t["qty"] for t in trades if t["side"] == "sell")
-    return buy - sell
-
-
-def compute_realized_range_pct(baseline_trades: List[dict]) -> float:
-    """(max_price - min_price) / mean_price across `baseline_trades`."""
-    if not baseline_trades:
-        return 0.0
-    prices = [t["price"] for t in baseline_trades]
-    mean_price = sum(prices) / len(prices)
-    if mean_price <= 0:
-        return 0.0
-    return (max(prices) - min(prices)) / mean_price
-
-
-def compute_baseline_delta_stats(baseline_trades: List[dict], slice_count: int) -> Dict:
-    """Mean/stdev of signed delta across `slice_count` equal-duration slices of `baseline_trades`."""
-    buckets = _bucketize_by_time(baseline_trades, slice_count)
-    deltas = [_signed_delta(b) for b in buckets if b]
-    if len(deltas) < 8:
-        return {"mean": 0.0, "stdev": 0.0, "slice_count_used": len(deltas)}
-    mean = statistics.fmean(deltas)
-    stdev = statistics.pstdev(deltas, mu=mean)
-    return {"mean": mean, "stdev": stdev, "slice_count_used": len(deltas)}
-
-
-def compute_ignition_zscore(ignition_trades: List[dict], baseline_stats: Dict) -> Dict:
-    """Z-scores the ignition window's signed delta against `baseline_stats`."""
-    delta = _signed_delta(ignition_trades)
-    stdev = baseline_stats["stdev"]
-    if stdev <= 0:
-        return {"delta": delta, "zscore": 0.0}
-    return {"delta": delta, "zscore": (delta - baseline_stats["mean"]) / stdev}
-
-
-def compute_tape_acceleration(
-    ignition_trades: List[dict], baseline_trades: List[dict], ignition_window_ms: int, baseline_window_ms: int
-) -> Dict:
-    """Ignition trades/sec vs. baseline trades/sec."""
-    ignition_rate = len(ignition_trades) / max(ignition_window_ms / 1000.0, 1e-9)
-    baseline_rate = len(baseline_trades) / max(baseline_window_ms / 1000.0, 1e-9)
-    multiplier = (ignition_rate / baseline_rate) if baseline_rate > 0 else 0.0
-    return {
-        "ignition_rate": round(ignition_rate, 3),
-        "baseline_rate": round(baseline_rate, 3),
-        "multiplier": round(multiplier, 3),
-    }
-
-
-def compute_micro_displacement(ignition_trades: List[dict]) -> Dict:
-    """Price displacement from the older half to the newer half of the ignition window, by VWAP."""
-    if len(ignition_trades) < 4:
-        return {"displacement_pct": 0.0, "direction": "flat"}
-    ordered = sorted(ignition_trades, key=lambda t: t["timestamp"])
-    mid = len(ordered) // 2
-    early_vwap = compute_vwap(ordered[:mid])
-    late_vwap = compute_vwap(ordered[mid:])
-    if not early_vwap or not late_vwap:
-        return {"displacement_pct": 0.0, "direction": "flat"}
-    displacement_pct = (late_vwap - early_vwap) / early_vwap
-    direction = "up" if displacement_pct > 0 else ("down" if displacement_pct < 0 else "flat")
-    return {"displacement_pct": round(displacement_pct, 6), "direction": direction}
-
-
-def dominant_side_trade_count(ignition_trades: List[dict], direction: str) -> int:
-    """Count of ignition trades on `direction`'s side."""
-    side = "buy" if direction == "long" else "sell"
-    return sum(1 for t in ignition_trades if t["side"] == side)
+    for i in range(width, n - width):
+        window = closed_candles[i - width : i + width + 1]
+        high_i = closed_candles[i]["high"]
+        low_i = closed_candles[i]["low"]
+        if high_i >= max(c["high"] for c in window):
+            swing_highs.append(high_i)
+        if low_i <= min(c["low"] for c in window):
+            swing_lows.append(low_i)
+    return swing_highs, swing_lows
 
 
 @dataclass
-class FlowIgnitionConfig:
-    symbol_whitelist: Optional[frozenset] = field(default_factory=lambda: frozenset({"ETH-USDT-SWAP"}))
+class Zone:
+    low: float
+    high: float
+    touches: int
 
-    baseline_window_ms: int = 180_000
-    ignition_window_ms: int = 8_000
-    min_baseline_trade_count: int = 40
-    min_ignition_trade_count: int = 6
+    @property
+    def mid(self) -> float:
+        return (self.low + self.high) / 2.0
 
-    min_regime_range_pct: float = 0.0006
-    max_regime_range_pct: float = 0.006
 
-    ignition_min_zscore: float = 2.5
-    tape_min_acceleration: float = 1.8
-    min_displacement_pct: float = 0.00025
-    min_dominant_trade_count: int = 4
+def cluster_into_zones(prices: List[float], tolerance_pct: float) -> List[Zone]:
+    """Greedily merges swing prices within tolerance_pct of a growing
+    zone's own running average into one zone, rather than treating every
+    swing price as its own level. Simple single-pass clustering, not a
+    scoring system: sort ascending, extend the current zone while the
+    next price is close enough to its running mean, otherwise start a
+    new zone."""
+    if not prices:
+        return []
+    ordered = sorted(prices)
+    zones: List[Zone] = []
+    bucket = [ordered[0]]
+
+    def flush(b: List[float]) -> Zone:
+        return Zone(low=min(b), high=max(b), touches=len(b))
+
+    for price in ordered[1:]:
+        running_mean = sum(bucket) / len(bucket)
+        if abs(price - running_mean) / running_mean <= tolerance_pct:
+            bucket.append(price)
+        else:
+            zones.append(flush(bucket))
+            bucket = [price]
+    zones.append(flush(bucket))
+    return zones
+
+
+def nearest_zone_below(zones: List[Zone], price: float) -> Optional[Zone]:
+    candidates = [z for z in zones if z.high <= price]
+    return max(candidates, key=lambda z: z.high) if candidates else None
+
+
+def nearest_zone_above(zones: List[Zone], price: float) -> Optional[Zone]:
+    candidates = [z for z in zones if z.low >= price]
+    return min(candidates, key=lambda z: z.low) if candidates else None
+
+
+def zone_being_tested(zones: List[Zone], price: float, tolerance_pct: float) -> Optional[Zone]:
+    """The zone `price` is actively testing: either price sits inside
+    the zone's [low, high] range, or is within tolerance_pct of its
+    nearest edge (a brief wick through/near the level still counts as a
+    test). Picks the closest qualifying zone if more than one is close
+    enough."""
+    best: Optional[Zone] = None
+    best_dist = None
+    for z in zones:
+        if z.low <= price <= z.high:
+            dist = 0.0
+        else:
+            dist = min(abs(price - z.low), abs(price - z.high))
+            if dist / z.mid > tolerance_pct:
+                continue
+        if best_dist is None or dist < best_dist:
+            best, best_dist = z, dist
+    return best
+
+
+def next_opposing_resistance(zones: List[Zone], entry_price: float) -> Optional[Zone]:
+    """The FIRST meaningful resistance above the actual entry: closest
+    zone whose LOW is strictly above entry_price. A zone whose low sits
+    at or below entry overlaps (or is on the wrong side of) the entry
+    and is never eligible, no matter how "near" it is in the full zone
+    list."""
+    candidates = [z for z in zones if z.low > entry_price]
+    return min(candidates, key=lambda z: z.low) if candidates else None
+
+
+def next_opposing_support(zones: List[Zone], entry_price: float) -> Optional[Zone]:
+    """Mirror of next_opposing_resistance for SHORTs: closest zone whose
+    HIGH is strictly below entry_price."""
+    candidates = [z for z in zones if z.high < entry_price]
+    return max(candidates, key=lambda z: z.high) if candidates else None
+
+
+def check_tp_and_risk_reward(
+    direction: str,
+    entry_price: float,
+    est_tp: float,
+    est_sl: float,
+    tested_zone: Zone,
+    opposing_zone: Zone,
+    minimum_risk_reward: float,
+) -> Tuple[bool, str, float, float]:
+    """Pure decision core called by evaluate() once the opposing zone
+    and estimated TP/SL are known. No safety buffer: TP must clear the
+    opposing zone's own boundary with strict inequality (TP resting
+    exactly on the boundary is a reject, per spec). Risk/reward is
+    measured off that same boundary, not off the estimated TP, and
+    must clear minimum_risk_reward. Returns
+    (accepted, reject_reason, reward_room, risk_room); reject_reason is
+    "" when accepted."""
+    if direction == "long":
+        tp_ok = est_tp < opposing_zone.low
+        reward_room = opposing_zone.low - entry_price
+        risk_room = entry_price - est_sl
+        sl_ok = est_sl < tested_zone.low
+        blocked_reason = "tp_blocked_by_resistance"
+    else:
+        tp_ok = est_tp > opposing_zone.high
+        reward_room = entry_price - opposing_zone.high
+        risk_room = est_sl - entry_price
+        sl_ok = est_sl > tested_zone.high
+        blocked_reason = "tp_blocked_by_support"
+
+    if not tp_ok:
+        return False, blocked_reason, reward_room, risk_room
+    if not sl_ok:
+        return False, "sl_inside_opposing_zone", reward_room, risk_room
+    if risk_room <= 0 or (reward_room / risk_room) < minimum_risk_reward:
+        return False, "insufficient_risk_reward", reward_room, risk_room
+    return True, "", reward_room, risk_room
+
+
+def estimate_tp_sl_prices(
+    direction: str,
+    entry_price: float,
+    margin_usdt: float,
+    leverage: float,
+    target_net_profit_usdt: float,
+    target_stop_loss_usdt: float,
+    taker_fee_rate: float,
+) -> Tuple[Optional[float], Optional[float]]:
+    """Mirrors execution_engine.py's _compute_take_profit_price /
+    _compute_stop_loss_price math exactly (same fee-aware formula), but
+    with ESTIMATED inputs since no fill exists yet — purely for this
+    strategy's own pre-trade feasibility gate. The real TP/SL are always
+    computed later by execution_engine.py from the actual fill; nothing
+    here ever overrides that. Returns (None, None) if margin/leverage
+    don't give a usable notional."""
+    notional = margin_usdt * leverage
+    if notional <= 0:
+        return None, None
+
+    estimated_opening_fee = taker_fee_rate * notional
+    estimated_total_fees = estimated_opening_fee * 2.0
+
+    tp_price_move_frac = (target_net_profit_usdt + estimated_total_fees) / notional
+    sl_required_gross_loss = max(target_stop_loss_usdt - estimated_total_fees, 0.0)
+    sl_price_move_frac = sl_required_gross_loss / notional
+
+    if direction == "long":
+        tp_price = entry_price * (1 + tp_price_move_frac)
+        sl_price = entry_price * (1 - sl_price_move_frac)
+    else:
+        tp_price = entry_price * (1 - tp_price_move_frac)
+        sl_price = entry_price * (1 + sl_price_move_frac)
+    return tp_price, sl_price
+
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class SupportResistanceConfig:
+    candle_bar: str = "5m"
+    lookback_hours: float = 5.0
+    candle_fetch_buffer: int = 5
+
+    swing_fractal_width: int = 2
+    zone_tolerance_pct: float = 0.0015
+    minimum_level_touches: int = 2
+    # Only exactly 1 is implemented today (see module docstring) -- kept
+    # as a config field per spec rather than hardcoded, for whenever a
+    # multi-candle confirmation variant gets built.
+    confirmation_candle_count: int = 1
+
+    minimum_risk_reward: float = 2.0
 
     cooldown_sec: float = 180.0
-    max_signals_per_day: int = 20
+
+    # Fallbacks used only if StrategyContext didn't supply the real
+    # execution-side numbers (see estimate_tp_sl_prices) -- normally
+    # tracker.py always provides these, so these rarely if ever apply.
+    fallback_margin_usdt: float = 5.0
+    fallback_leverage: int = 10
+    fallback_target_net_profit_usdt: float = 0.5
+    fallback_target_stop_loss_usdt: float = 0.9
+    fallback_taker_fee_rate: float = 0.0005
+
+    symbol_whitelist: Optional[frozenset] = field(default_factory=lambda: DEFAULT_SYMBOL_WHITELIST)
 
 
 @dataclass
-class SymbolFlowState:
+class SymbolSRState:
     symbol: str
+    direction: str = ""
+    support: Optional[Zone] = None
+    resistance: Optional[Zone] = None
+    last_price: float = 0.0
     last_signal_at: float = 0.0
-    last_checked_at: float = 0.0
-
-    last_zscore: float = 0.0
-    last_acceleration: float = 0.0
-    last_displacement_pct: float = 0.0
-    last_regime_range_pct: float = 0.0
+    last_signal_candle_ts: Optional[int] = None
     last_reject_reason: str = ""
 
     def status_line(self) -> str:
-        return (
-            f"{self.symbol} z={self.last_zscore:+.2f} accel={self.last_acceleration:.2f}x "
-            f"disp={self.last_displacement_pct:+.3%} regime={self.last_regime_range_pct:.3%} "
-            f"reject={self.last_reject_reason or '-'}"
+        sup = f"{self.support.low:.6g}-{self.support.high:.6g}" if self.support else "-"
+        res = f"{self.resistance.low:.6g}-{self.resistance.high:.6g}" if self.resistance else "-"
+        base = (
+            f"{self.symbol} price={self.last_price:.6g} support={sup} resistance={res} "
+            f"direction={self.direction or '-'}"
         )
+        if self.last_reject_reason:
+            base += f" reject={self.last_reject_reason}"
+        return base
 
 
-class FlowIgnitionEngine(StrategyEngine):
-    """Tracks one SymbolFlowState per watchlisted symbol and tests its trade tape for an order-flow ignition each tick."""
+class SupportResistanceEngine(StrategyEngine):
+    """Implements strategy.base.StrategyEngine — see this module's
+    docstring for the full flow. Switch to this strategy by setting
+    tracker.py's STRATEGY_NAME = "support_resistance_engine"."""
 
-    name = "flow_ignition_engine"
+    name = "support_resistance_engine"
 
     def __init__(
         self,
-        trade_store: TradeStore,
         market_data: MarketDataStore,
         candle_fetcher: CandleFetcher,
-        config: Optional[FlowIgnitionConfig] = None,
+        okx_client=None,
+        config: Optional[SupportResistanceConfig] = None,
+        margin_per_trade_usdt: Optional[float] = None,
+        default_leverage: Optional[int] = None,
+        target_net_profit_usdt: Optional[float] = None,
+        target_stop_loss_usdt: Optional[float] = None,
     ) -> None:
-        self._trade_store = trade_store
         self._market_data = market_data
         self._candle_fetcher = candle_fetcher
-        self.config = config or FlowIgnitionConfig()
-        self._states: Dict[str, SymbolFlowState] = {}
+        self._okx_client = okx_client
+        self.config = config or SupportResistanceConfig()
+        self._margin_usdt = margin_per_trade_usdt if margin_per_trade_usdt is not None else self.config.fallback_margin_usdt
+        self._leverage = default_leverage if default_leverage is not None else self.config.fallback_leverage
+        self._target_net_profit_usdt = (
+            target_net_profit_usdt if target_net_profit_usdt is not None else self.config.fallback_target_net_profit_usdt
+        )
+        self._target_stop_loss_usdt = (
+            target_stop_loss_usdt if target_stop_loss_usdt is not None else self.config.fallback_target_stop_loss_usdt
+        )
+        self._states: Dict[str, SymbolSRState] = {}
+        self._fee_rate_cache: Dict[str, float] = {}
         self._lock = asyncio.Lock()
-        self._signals_today = 0
-        self._day_started_at = self._utc_day_start()
-
-    @staticmethod
-    def _utc_day_start(ts: Optional[float] = None) -> float:
-        t = time.gmtime(ts if ts is not None else time.time())
-        return float(calendar.timegm((t.tm_year, t.tm_mon, t.tm_mday, 0, 0, 0, 0, 0, 0)))
-
-    def _roll_day_if_needed(self, now: float) -> None:
-        if now >= self._day_started_at + 86_400:
-            if self._signals_today:
-                log.info(f"[flow_ignition] day rollover — {self._signals_today} signal(s) fired in the prior 24h")
-            self._signals_today = 0
-            self._day_started_at = self._utc_day_start(now)
 
     async def sync_watchlist(self, watchlist_symbols) -> None:
         watchlist_symbols = set(watchlist_symbols)
         whitelist = self.config.symbol_whitelist
         if whitelist:
-            rejected = watchlist_symbols - whitelist
             watchlist_symbols &= whitelist
-            if rejected:
-                log.debug(f"[flow_ignition] ignoring {len(rejected)} non-whitelisted symbol(s): {sorted(rejected)}")
         async with self._lock:
             for symbol in watchlist_symbols:
                 if symbol not in self._states:
-                    self._states[symbol] = SymbolFlowState(symbol=symbol)
-                    log.info(f"[flow_ignition] {symbol} added — watching trade tape for order-flow ignitions")
-            dropped = [s for s in self._states if s not in watchlist_symbols]
-            for symbol in dropped:
+                    self._states[symbol] = SymbolSRState(symbol=symbol)
+                    log.info(f"[support_resistance] {symbol} added — watching for S/R zone rejections")
+            for symbol in [s for s in self._states if s not in watchlist_symbols]:
                 del self._states[symbol]
+                self._fee_rate_cache.pop(symbol, None)
 
-    async def snapshot(self) -> List[SymbolFlowState]:
+    async def snapshot(self) -> List[SymbolSRState]:
         async with self._lock:
             return list(self._states.values())
+
+    async def _get_fee_rate(self, symbol: str) -> float:
+        if symbol in self._fee_rate_cache:
+            return self._fee_rate_cache[symbol]
+        rate = self.config.fallback_taker_fee_rate
+        if self._okx_client is not None:
+            try:
+                info = await self._okx_client.get_trade_fee_rate(symbol)
+                rate = float(info.get("taker_fee_rate", rate))
+            except Exception as exc:
+                log.debug(f"[support_resistance] {symbol} — could not fetch live fee rate, using fallback: {exc}")
+        self._fee_rate_cache[symbol] = rate
+        return rate
 
     async def evaluate(self, symbol: str) -> Optional[Signal]:
         cfg = self.config
@@ -247,106 +395,153 @@ class FlowIgnitionEngine(StrategyEngine):
         if state is None:
             return None
 
-        now = time.time()
-        self._roll_day_if_needed(now)
-        state.last_checked_at = now
-
-        if self._signals_today >= cfg.max_signals_per_day:
-            state.last_reject_reason = "daily_cap_reached"
+        market = await self._market_data.get(symbol)
+        if not market:
             return None
+        price = market["last_price"]
+        state.last_price = price
+
+        limit = int((cfg.lookback_hours * 3600) / 300) + cfg.candle_fetch_buffer
+        try:
+            raw_candles = await self._candle_fetcher(symbol, cfg.candle_bar, limit)
+        except Exception as exc:
+            log.warning(f"[support_resistance] {symbol} — could not fetch candles: {exc}")
+            return None
+
+        _, closed = split_forming_and_closed(raw_candles)
+        if len(closed) < 2 * cfg.swing_fractal_width + 2:
+            state.last_reject_reason = "not_enough_candles"
+            return None
+
+        swing_highs, swing_lows = find_swing_prices(closed, cfg.swing_fractal_width)
+        resistance_zones = [z for z in cluster_into_zones(swing_highs, cfg.zone_tolerance_pct) if z.touches >= cfg.minimum_level_touches]
+        support_zones = [z for z in cluster_into_zones(swing_lows, cfg.zone_tolerance_pct) if z.touches >= cfg.minimum_level_touches]
+
+        signal_candle = closed[-1]
+
+        direction: str = ""
+        tested_zone: Optional[Zone] = None
+        opposing_zones: List[Zone] = []
+
+        support = zone_being_tested(support_zones, signal_candle["low"], cfg.zone_tolerance_pct)
+        resistance = zone_being_tested(resistance_zones, signal_candle["high"], cfg.zone_tolerance_pct)
+
+        is_green = signal_candle["close"] > signal_candle["open"]
+        is_red = signal_candle["close"] < signal_candle["open"]
+
+        if support is not None and is_green and signal_candle["close"] > support.high:
+            direction = "long"
+            tested_zone = support
+            opposing_zones = resistance_zones
+        elif resistance is not None and is_red and signal_candle["close"] < resistance.low:
+            direction = "short"
+            tested_zone = resistance
+            opposing_zones = support_zones
+
+        state.support = support if support is not None else nearest_zone_below(support_zones, signal_candle["close"])
+        state.resistance = resistance if resistance is not None else nearest_zone_above(resistance_zones, signal_candle["close"])
+
+        if not direction:
+            state.direction = ""
+            state.last_reject_reason = "no_price_rejection"
+            return None
+
+        candle_ts = signal_candle.get("ts")
+        if state.last_signal_candle_ts == candle_ts:
+            state.last_reject_reason = "already_signaled_this_candle"
+            return None
+        now = time.time()
         if now - state.last_signal_at < cfg.cooldown_sec:
             state.last_reject_reason = "cooldown"
             return None
 
-        try:
-            baseline_trades = await self._trade_store.get_window(symbol, cfg.baseline_window_ms)
-        except Exception as exc:
-            log.warning(f"[flow_ignition] {symbol} — could not fetch baseline window: {exc}")
-            return None
-        if len(baseline_trades) < cfg.min_baseline_trade_count:
-            state.last_reject_reason = "baseline_too_thin"
+        opposing = next_opposing_resistance(opposing_zones, price) if direction == "long" else next_opposing_support(opposing_zones, price)
+        if opposing is None:
+            state.last_reject_reason = "no_next_resistance" if direction == "long" else "no_next_support"
             return None
 
-        ignition_cutoff_ms = now * 1000.0 - cfg.ignition_window_ms
-        ignition_trades = [t for t in baseline_trades if t["timestamp"] >= ignition_cutoff_ms]
-        if len(ignition_trades) < cfg.min_ignition_trade_count:
-            state.last_reject_reason = "ignition_too_thin"
-            return None
-
-        regime_range_pct = compute_realized_range_pct(baseline_trades)
-        state.last_regime_range_pct = regime_range_pct
-        if not (cfg.min_regime_range_pct <= regime_range_pct <= cfg.max_regime_range_pct):
-            state.last_reject_reason = "regime_out_of_band"
-            return None
-
-        slice_count = max(3, cfg.baseline_window_ms // cfg.ignition_window_ms)
-        baseline_stats = compute_baseline_delta_stats(baseline_trades, slice_count)
-        z = compute_ignition_zscore(ignition_trades, baseline_stats)
-        state.last_zscore = z["zscore"]
-        if abs(z["zscore"]) < cfg.ignition_min_zscore:
-            state.last_reject_reason = "zscore_below_threshold"
-            return None
-
-        direction = "long" if z["zscore"] > 0 else "short"
-
-        accel = compute_tape_acceleration(ignition_trades, baseline_trades, cfg.ignition_window_ms, cfg.baseline_window_ms)
-        state.last_acceleration = accel["multiplier"]
-        if accel["multiplier"] < cfg.tape_min_acceleration:
-            state.last_reject_reason = "tape_not_accelerating"
-            return None
-
-        disp = compute_micro_displacement(ignition_trades)
-        state.last_displacement_pct = disp["displacement_pct"]
-        wants_up = direction == "long"
-        displacement_ok = (
-            (wants_up and disp["displacement_pct"] >= cfg.min_displacement_pct)
-            or (not wants_up and disp["displacement_pct"] <= -cfg.min_displacement_pct)
+        fee_rate = await self._get_fee_rate(symbol)
+        est_tp, est_sl = estimate_tp_sl_prices(
+            direction=direction,
+            entry_price=price,
+            margin_usdt=self._margin_usdt,
+            leverage=self._leverage,
+            target_net_profit_usdt=self._target_net_profit_usdt,
+            target_stop_loss_usdt=self._target_stop_loss_usdt,
+            taker_fee_rate=fee_rate,
         )
-        if not displacement_ok:
-            state.last_reject_reason = "no_price_confirmation"
+        if est_tp is None or est_sl is None:
+            state.last_reject_reason = "no_notional"
             return None
 
-        dominant_count = dominant_side_trade_count(ignition_trades, direction)
-        if dominant_count < cfg.min_dominant_trade_count:
-            state.last_reject_reason = "single_print_burst"
+        accepted, reject_reason, reward_room, risk_room = check_tp_and_risk_reward(
+            direction=direction,
+            entry_price=price,
+            est_tp=est_tp,
+            est_sl=est_sl,
+            tested_zone=tested_zone,
+            opposing_zone=opposing,
+            minimum_risk_reward=cfg.minimum_risk_reward,
+        )
+        if not accepted:
+            state.last_reject_reason = reject_reason
             return None
 
-        market = await self._market_data.get(symbol)
-        if not market:
-            state.last_reject_reason = "no_market_data"
-            return None
-        price = market["last_price"]
-
-        state.last_reject_reason = ""
+        state.direction = direction
         state.last_signal_at = now
-        self._signals_today += 1
+        state.last_signal_candle_ts = candle_ts
+        state.last_reject_reason = ""
 
-        log.info(
-            f"[flow_ignition] SIGNAL: {symbol} {direction.upper()} (#{self._signals_today}/{cfg.max_signals_per_day} today)\n"
-            f"  entry={price:.6g}\n"
-            f"  zscore={z['zscore']:+.2f} acceleration={accel['multiplier']:.2f}x "
-            f"displacement={disp['displacement_pct']:+.3%} regime={regime_range_pct:.3%} "
-            f"dominant_trades={dominant_count}"
-        )
+        risk_reward = reward_room / risk_room
+        if direction == "long":
+            confirmation = "green_5m_rejection"
+            reasons = [
+                "engine=support_resistance",
+                f"support={tested_zone.low:.6g}-{tested_zone.high:.6g}",
+                f"next_resistance={opposing.low:.6g}-{opposing.high:.6g}",
+                f"entry={price:.6g}",
+                f"confirmation={confirmation}",
+                f"tp={est_tp:.6g}",
+                f"sl={est_sl:.6g}",
+                f"risk_reward={risk_reward:.2f}",
+            ]
+        else:
+            confirmation = "red_5m_rejection"
+            reasons = [
+                "engine=support_resistance",
+                f"resistance={tested_zone.low:.6g}-{tested_zone.high:.6g}",
+                f"next_support={opposing.low:.6g}-{opposing.high:.6g}",
+                f"entry={price:.6g}",
+                f"confirmation={confirmation}",
+                f"tp={est_tp:.6g}",
+                f"sl={est_sl:.6g}",
+                f"risk_reward={risk_reward:.2f}",
+            ]
+
+        log.info(f"[support_resistance] ACCEPTED {symbol} {direction.upper()} — {'; '.join(reasons)}")
         return Signal(
             symbol=symbol,
             direction=direction,
             confidence=1.0,
             entry_price=price,
-            take_profit=price,
+            take_profit=price,  # unused — execution_engine computes its own TP/SL from the real fill
             stop_loss=price,
             timestamp=now,
-            reasons=[
-                "engine=flow_ignition",
-                f"zscore={z['zscore']:+.2f}",
-                f"tape_acceleration={accel['multiplier']:.2f}x",
-                f"displacement={disp['displacement_pct']:+.3%}",
-                f"regime_range={regime_range_pct:.3%}",
-                f"dominant_trades={dominant_count}",
-            ],
+            reasons=reasons,
         )
 
 
-def build(ctx: StrategyContext) -> FlowIgnitionEngine:
-    cfg = ctx.build_config(FlowIgnitionConfig)
-    return FlowIgnitionEngine(ctx.trade_store, ctx.market_data, ctx.candle_fetcher, config=cfg)
+def build(ctx: StrategyContext) -> SupportResistanceEngine:
+    """strategy.load_strategy()'s entry point — see strategy/base.py's
+    module docstring for the contract every strategy module follows."""
+    cfg = ctx.build_config(SupportResistanceConfig)
+    return SupportResistanceEngine(
+        ctx.market_data,
+        ctx.candle_fetcher,
+        okx_client=ctx.okx_client,
+        config=cfg,
+        margin_per_trade_usdt=ctx.margin_per_trade_usdt,
+        default_leverage=ctx.default_leverage,
+        target_net_profit_usdt=ctx.target_net_profit_usdt,
+        target_stop_loss_usdt=ctx.target_stop_loss_usdt,
+    )
